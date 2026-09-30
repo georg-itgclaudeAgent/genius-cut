@@ -12,6 +12,8 @@
 import json
 import os
 
+import anthropic
+
 from geniuscut import secrets
 
 MODEL = os.environ.get("GENIUSCUT_CLAUDE_MODEL", "claude-opus-5-5")
@@ -23,9 +25,16 @@ class ClaudeError(RuntimeError):
 
 
 def default_client():
-    import anthropic
-
     return anthropic.Anthropic(api_key=secrets.anthropic_api_key())
+
+
+def _api_message(e) -> str:
+    body = getattr(e, "body", None)
+    if isinstance(body, dict):
+        msg = (body.get("error") or {}).get("message")
+        if msg:
+            return msg
+    return str(e)
 
 
 def _call(prompt: str, *, system: str | None, client, output_config: dict, max_tokens: int):
@@ -40,7 +49,16 @@ def _call(prompt: str, *, system: str | None, client, output_config: dict, max_t
     )
     if system:
         kwargs["system"] = system
-    response = client.beta.messages.create(**kwargs)
+    try:
+        response = client.beta.messages.create(**kwargs)
+    except anthropic.AuthenticationError as e:
+        raise ClaudeError(f"The Anthropic API key was rejected: {_api_message(e)}") from e
+    except anthropic.RateLimitError as e:
+        raise ClaudeError(f"Anthropic is rate-limiting requests; try again shortly. {_api_message(e)}") from e
+    except anthropic.APIStatusError as e:
+        raise ClaudeError(f"Anthropic API error {e.status_code}: {_api_message(e)}") from e
+    except anthropic.APIConnectionError as e:
+        raise ClaudeError("Couldn't reach the Anthropic API. Check the internet connection.") from e
     if response.stop_reason == "refusal":
         details = getattr(response, "stop_details", None)
         raise ClaudeError(f"Claude declined the request ({getattr(details, 'category', None) or 'no category'}).")

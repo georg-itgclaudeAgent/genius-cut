@@ -131,3 +131,24 @@ def test_missing_key_says_how_to_fix_it(monkeypatch):
     with pytest.raises(secrets.MissingKeyError) as e:
         secrets.anthropic_api_key(run=run, gcloud="gcloud")
     assert "ANTHROPIC_API_KEY" in str(e.value) and "gcloud auth login" in str(e.value)
+
+
+def _raising_client(exc):
+    def create(**kwargs):
+        raise exc
+    return SimpleNamespace(beta=SimpleNamespace(messages=SimpleNamespace(create=create)))
+
+
+def test_api_errors_become_readable_claude_errors():
+    import anthropic
+    import httpx
+
+    req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    body = {"type": "error", "error": {"type": "invalid_request_error",
+                                       "message": "Your credit balance is too low to access the Anthropic API."}}
+    billing = anthropic.BadRequestError("400", response=httpx.Response(400, request=req, json=body), body=body)
+    with pytest.raises(claude.ClaudeError, match="credit balance is too low"):
+        claude.ask_json("hi", {}, client=_raising_client(billing))
+
+    with pytest.raises(claude.ClaudeError, match="reach"):
+        claude.ask_json("hi", {}, client=_raising_client(anthropic.APIConnectionError(request=req)))

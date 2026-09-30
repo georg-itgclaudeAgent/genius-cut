@@ -57,6 +57,8 @@ export interface ClipInfo {
   name: string;
   mediaPath: string;
   trackIndex: number;
+  /** Exact timeline start in ticks: how the host finds this clip again (names repeat). */
+  startTicks: string;
   inS: number;
   outS: number;
   startS: number;

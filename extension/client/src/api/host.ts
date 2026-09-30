@@ -1,13 +1,13 @@
 /**
- * The ExtendScript side: find the clip, apply the cuts, restore. The gcut* functions
- * arrive in Phase C (Tasks 9-11). Until then every call reports HostUnavailable, and the
- * panel says so instead of pretending.
+ * The ExtendScript side (extension/host/index.jsx): find the clip, apply the cuts, close
+ * the gap, restore. HostUnavailable means the gcut* functions aren't loaded in Premiere
+ * (an old install, or a host script that failed to load), not a failed edit.
  */
 import type { ClipInfo, Span } from "./types";
 
 export class HostUnavailable extends Error {
   constructor() {
-    super("Timeline actions arrive with the Premiere script (Phase C). Finding clips and applying cuts isn't wired up yet.");
+    super("Genius Cut's Premiere script isn't loaded. Reinstall Genius Cut, or restart Premiere.");
     this.name = "HostUnavailable";
   }
 }
@@ -44,8 +44,8 @@ export function cepHost(evalScript: (s: string) => Promise<string>): Host {
   }
   return {
     findClip: (name) => call("gcutFindClip", name ?? ""),
-    applyCuts: (clip, spans) => call("gcutApplyCuts", { trackIndex: clip.trackIndex, name: clip.name, spans }),
-    closeGap: (clip) => call("gcutCloseTrailingGap", { trackIndex: clip.trackIndex, name: clip.name }),
-    restoreOriginal: (clip) => call("gcutRestoreOriginal", { trackIndex: clip.trackIndex, name: clip.name }),
+    applyCuts: (clip, spans) => call("gcutApplyCuts", { trackIndex: clip.trackIndex, startTicks: clip.startTicks, spans }),
+    closeGap: (clip) => call("gcutCloseTrailingGap", { trackIndex: clip.trackIndex, startTicks: clip.startTicks }),
+    restoreOriginal: (clip) => call("gcutRestoreOriginal", { trackIndex: clip.trackIndex, startTicks: clip.startTicks }),
   };
 }

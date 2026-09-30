@@ -18,7 +18,7 @@ const WORDS: Word[] = [
 
 const CLIP: ClipInfo = {
   found: true, name: "interview_take3.mp4", mediaPath: "D:/Footage/EP114/interview_take3.mp4",
-  trackIndex: 0, inS: 12.0, outS: 21.2, startS: 95.5, fps: 23.976, matchCount: 1, selectedUsed: true, speed: 1,
+  trackIndex: 0, startTicks: String(95.5 * 254016000000), inS: 12.0, outS: 21.2, startS: 95.5, fps: 23.976, matchCount: 1, selectedUsed: true, speed: 1,
 };
 
 function cutsFor(clip: ClipInfo): SequenceCut[] {

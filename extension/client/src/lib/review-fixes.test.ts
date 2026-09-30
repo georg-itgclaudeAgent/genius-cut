@@ -20,7 +20,7 @@ describe("C1: round3 matches Python round(x, 3)", () => {
 });
 
 const CLIP: ClipInfo = {
-  found: true, name: "a.mp4", mediaPath: "C:/a.mp4", trackIndex: 0, inS: 0, outS: 5, startS: 0,
+  found: true, name: "a.mp4", mediaPath: "C:/a.mp4", trackIndex: 0, startTicks: "0", inS: 0, outS: 5, startS: 0,
   fps: 23.976, matchCount: 1, selectedUsed: true, speed: 1,
 };
 

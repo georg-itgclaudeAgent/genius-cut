@@ -1,0 +1,62 @@
+name: Release Genius Cut
+
+# Tag vX.Y.Z → build the panel, package it, publish a release Genius Installer Manager can
+# install. Until Task 17 bundles a Python runtime into backend/, releases are published as
+# pre-releases: the installer ignores those, so a build that can't run on a clean machine
+# never reaches an editor's Install button.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: extension/client/package-lock.json
+
+      - name: Install, test and build the panel
+        working-directory: extension/client
+        run: |
+          npm ci
+          npm test
+          npm run build
+
+      - name: Resolve version
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Package (checks bundle id and manifest version)
+        id: pkg
+        run: python3 scripts/package.py "${{ steps.ver.outputs.version }}" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Compute SHA256
+        id: sha
+        run: echo "sha256=$(sha256sum "${{ steps.pkg.outputs.zip }}" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PRE=""
+          NOTE=""
+          if [ "${{ steps.pkg.outputs.bundled_runtime }}" != "true" ]; then
+            PRE="--prerelease"
+            NOTE="Pre-release: no bundled Python runtime yet (Task 17), so Genius Installer Manager won't offer it."
+          fi
+          gh release create "${GITHUB_REF_NAME}" "${{ steps.pkg.outputs.zip }}" \
+            --title "Genius Cut ${{ steps.ver.outputs.version }}" \
+            $PRE \
+            --notes "$(printf 'SHA256: %s\n\n%s\n' '${{ steps.sha.outputs.sha256 }}' "$NOTE")"

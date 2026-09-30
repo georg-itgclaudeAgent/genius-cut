@@ -3,3 +3,11 @@ dist/
 *.log
 .env
 .superpowers/
+backend/.venv/
+backend/**/__pycache__/
+__pycache__/
+.pytest_cache/
+extension/client/dist/
+*.wav
+!backend/tests/fixtures/*.wav
+*.zip

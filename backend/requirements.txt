@@ -1,7 +1,7 @@
 fastapi>=0.115
 uvicorn[standard]>=0.30
 faster-whisper>=1.1
-anthropic>=0.40
+anthropic[vertex]>=1.9
 pydantic>=2.8
 numpy>=2
 # CUDA 12 + cuDNN 9 runtime for CTranslate2, kept inside the venv (see geniuscut/stt.py)

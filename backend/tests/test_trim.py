@@ -80,7 +80,7 @@ def api(tmp_path, transcriber=None):
     app = create_app(token=token, stt_device=lambda: "cuda", transcriber=lambda: transcriber,
                      library_dir=tmp_path / "library",
                      propose=lambda w, f, i: CUTS, extract=fake_extract, llm=lambda p: "- Cut fillers.")
-    return TestClient(app), {"Authorization": f"Bearer {token}"}
+    return TestClient(app, base_url="http://127.0.0.1:8791"), {"Authorization": f"Bearer {token}"}
 
 
 def test_trim_endpoint_returns_words_cuts_and_kept_spans(tmp_path):
@@ -121,6 +121,6 @@ def test_missing_api_key_is_a_clear_error_not_a_500(tmp_path):
     token = get_or_create_token(tmp_path)
     app = create_app(token=token, stt_device=lambda: "cuda", transcriber=lambda: FakeTranscriber(),
                      library_dir=tmp_path / "library", propose=no_key, extract=fake_extract)
-    r = TestClient(app).post("/trim", json=REQ.model_dump(), headers={"Authorization": f"Bearer {token}"})
+    r = TestClient(app, base_url="http://127.0.0.1:8791").post("/trim", json=REQ.model_dump(), headers={"Authorization": f"Bearer {token}"})
     assert r.status_code == 503
     assert "ANTHROPIC_API_KEY" in r.json()["detail"]

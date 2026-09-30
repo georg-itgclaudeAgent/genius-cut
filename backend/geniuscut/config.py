@@ -25,10 +25,15 @@ def get_or_create_token(directory: Path | None = None) -> str:
     directory = directory or data_dir()
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "token"
-    if path.exists():
+    token = secrets.token_urlsafe(32)
+    try:
+        # Exclusive create: two backends starting at once must agree on one token.
+        with open(path, "x", encoding="utf-8") as f:
+            f.write(token)
+        return token
+    except FileExistsError:
         existing = path.read_text(encoding="utf-8").strip()
         if existing:
             return existing
-    token = secrets.token_urlsafe(32)
-    path.write_text(token, encoding="utf-8")
+    path.write_text(token, encoding="utf-8")  # empty file left by a crash mid-write
     return token

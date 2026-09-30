@@ -6,7 +6,7 @@ from server import create_app
 
 def client(tmp_path, stt_device="cuda"):
     token = get_or_create_token(tmp_path)
-    return TestClient(create_app(token=token, stt_device=lambda: stt_device)), token
+    return TestClient(create_app(token=token, stt_device=lambda: stt_device), base_url="http://127.0.0.1:8791"), token
 
 
 def test_health_needs_no_token_and_reports_device(tmp_path):

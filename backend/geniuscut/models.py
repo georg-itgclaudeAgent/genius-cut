@@ -6,7 +6,7 @@ Two clocks appear in this project and must never be mixed:
 Field names carry the clock where it matters (`*_source_s`, `*_seq_s`).
 """
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class Word(BaseModel):
@@ -33,9 +33,16 @@ class Span(BaseModel):
 
 class ClipRef(BaseModel):
     media_path: str
-    in_s: float = Field(description="Clip in point, source time")
-    out_s: float = Field(description="Clip out point, source time")
-    clip_start_s: float = Field(description="Where the clip starts on the timeline, sequence time")
+    in_s: float = Field(ge=0, allow_inf_nan=False, description="Clip in point, source time")
+    out_s: float = Field(ge=0, allow_inf_nan=False, description="Clip out point, source time")
+    clip_start_s: float = Field(ge=0, allow_inf_nan=False,
+                                description="Where the clip starts on the timeline, sequence time")
+
+    @model_validator(mode="after")
+    def _span_not_empty(self):
+        if self.out_s <= self.in_s:
+            raise ValueError(f"out_s ({self.out_s}) must be after in_s ({self.in_s})")
+        return self
 
 
 class TrimRequest(ClipRef):
@@ -54,6 +61,8 @@ class TrimResponse(BaseModel):
     cuts: list[SequenceCut]
     kept_spans_source: list[Span] = Field(description="What the host re-lays, in source time")
     stt_device: str
+    cut_fraction: float = 0.0
+    warning: str | None = None
 
 
 class RemovedSpan(BaseModel):

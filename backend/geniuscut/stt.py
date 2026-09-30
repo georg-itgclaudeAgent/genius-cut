@@ -85,6 +85,7 @@ class FasterWhisperTranscriber:
         warm_up: bool = True,
     ):
         self.model_name = model_name
+        self._factory = model_factory
         self.cuda_error: str | None = None
         self.device = "cpu"
         self._model = None
@@ -111,7 +112,20 @@ class FasterWhisperTranscriber:
     def transcribe(self, wav: Path) -> list[Word]:
         # Samples, not a path: faster-whisper 1.2.1 decodes files through PyAV with an
         # argument PyAV 19 removed. Our WAVs always come from audio.extract_span.
-        segments, _ = self._model.transcribe(read_wav_16k_mono(wav), word_timestamps=True, vad_filter=True)
+        samples = read_wav_16k_mono(wav)
+        try:
+            return self._words(samples)
+        except Exception as e:  # noqa: BLE001
+            if self.device != "cuda":
+                raise
+            # e.g. out of GPU memory while Premiere is using the same card.
+            self.cuda_error = str(e)
+            self._model = self._factory(self.model_name, device="cpu", compute_type="int8")
+            self.device = "cpu"
+            return self._words(samples)
+
+    def _words(self, samples) -> list[Word]:
+        segments, _ = self._model.transcribe(samples, word_timestamps=True, vad_filter=True)
         words: list[Word] = []
         for seg in segments:
             for w in seg.words or []:

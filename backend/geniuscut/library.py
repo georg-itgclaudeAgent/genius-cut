@@ -10,14 +10,17 @@ text — the editor only ever supplies the two transcripts.
 """
 
 import difflib
+import logging
 import re
 import string
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
 from geniuscut.models import RemovedSpan, StyleExample, Word
+
+log = logging.getLogger(__name__)
 
 SUMMARY_FILE = "style-summary.md"
 SUMMARY_THRESHOLD = 12   # at this many examples, switch to summary + recent
@@ -80,9 +83,21 @@ def list_examples(library_dir: Path) -> list[StyleExample]:
     examples_dir = Path(library_dir) / "examples"
     if not examples_dir.is_dir():
         return []
-    examples = [StyleExample.model_validate_json(p.read_text(encoding="utf-8"))
-                for p in examples_dir.glob("*.json")]
-    return sorted(examples, key=lambda e: datetime.fromisoformat(e.created), reverse=True)
+    examples = []
+    for path in examples_dir.glob("*.json"):
+        try:
+            examples.append(StyleExample.model_validate_json(path.read_text(encoding="utf-8")))
+        except Exception as e:  # noqa: BLE001 — one bad file must not break every trim
+            log.warning("Skipping unreadable style example %s: %s", path.name, e)
+    return sorted(examples, key=lambda e: _when(e.created), reverse=True)
+
+
+def _when(created: str) -> datetime:
+    try:
+        dt = datetime.fromisoformat(created)
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    return dt if dt.tzinfo else dt.astimezone()  # naive → treat as local time
 
 
 def load_summary(library_dir: Path) -> str | None:

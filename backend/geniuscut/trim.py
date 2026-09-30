@@ -16,6 +16,13 @@ from geniuscut.models import CutSpan, SequenceCut, Span, TrimRequest, TrimRespon
 from geniuscut.stt import Transcriber
 
 
+HEAVY_CUT_FRACTION = 0.5
+
+
+class TrimRefused(ValueError):
+    """The proposal can't be applied safely; nothing should reach the timeline."""
+
+
 def _ms(x: float) -> float:
     return round(x, 3)
 
@@ -48,12 +55,22 @@ def run_trim(
         shutil.rmtree(work, ignore_errors=True)
     cut_spans = propose(words, library.build_fewshot(library_dir), req.prompt)
     duration = req.out_s - req.in_s
+    kept = kept_spans(cut_spans, duration)
+    if not kept:
+        raise TrimRefused("The proposal would remove the whole clip, so nothing was changed. "
+                          "Try again, or trim this clip by hand.")
+    cut_fraction = 1 - sum(s.end - s.start for s in kept) / duration
+    warning = None
+    if cut_fraction > HEAVY_CUT_FRACTION:
+        warning = (f"These cuts remove {round(cut_fraction * 100)}% of the clip. "
+                   "Check them carefully before applying.")
     return TrimResponse(
         words=words,
         cuts=[SequenceCut(**c.model_dump(),
                           start_seq_s=_ms(req.clip_start_s + c.start),
                           end_seq_s=_ms(req.clip_start_s + c.end)) for c in cut_spans],
-        kept_spans_source=[Span(start=_ms(req.in_s + s.start), end=_ms(req.in_s + s.end))
-                           for s in kept_spans(cut_spans, duration)],
+        kept_spans_source=[Span(start=_ms(req.in_s + s.start), end=_ms(req.in_s + s.end)) for s in kept],
         stt_device=transcriber.device,
+        cut_fraction=round(cut_fraction, 4),
+        warning=warning,
     )

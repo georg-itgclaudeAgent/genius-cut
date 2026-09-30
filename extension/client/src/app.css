@@ -125,8 +125,7 @@ textarea.field { width: 100%; min-height: 64px; resize: vertical; }
 .tele .det { margin-left: auto; font-family: var(--mono); font-size: 9.5px; color: var(--text-faint); }
 
 .summary { display: flex; align-items: flex-end; gap: 12px; }
-.big { font-size: 28px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; position: relative; padding: 4px 6px; }
-.big svg { position: absolute; inset: -7px -10px; width: calc(100% + 20px); height: calc(100% + 14px); overflow: visible; pointer-events: none; }
+.big { font-size: 28px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
 .cap { font-size: 11px; color: var(--text-dim); padding-bottom: 2px; }
 .cap b { color: var(--text); font-weight: 600; }
 .durline { display: flex; align-items: center; gap: 7px; margin-top: 9px; font-family: var(--mono); font-size: 10.5px; color: var(--text-faint); }

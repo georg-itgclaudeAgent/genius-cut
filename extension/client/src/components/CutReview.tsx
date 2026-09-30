@@ -2,16 +2,6 @@ import type { ClipInfo, TrimResponse } from "../api/types";
 import { reviewSummary } from "../lib/review";
 import { formatDuration, formatTimecode } from "../lib/timecode";
 
-/** The coral hand-drawn ellipse (brand "Scribble Markup"), used once: on the reclaimed figure. */
-function Scribble() {
-  return (
-    <svg viewBox="0 0 100 50" preserveAspectRatio="none" aria-hidden="true">
-      <path d="M8 27 C 6 10, 60 3, 88 12 C 102 17, 98 38, 64 44 C 32 49, 4 42, 7 25 C 9 14, 40 8, 70 9"
-        fill="none" stroke="#FF7A51" strokeWidth="1.6" strokeLinecap="round" vectorEffect="non-scaling-stroke" />
-    </svg>
-  );
-}
-
 interface Props {
   clip: ClipInfo;
   res: TrimResponse;
@@ -40,7 +30,7 @@ export function CutReview({ clip, res, checked, onToggle, onToggleAll, onApply, 
     <>
       <div className="sec">
         <div className="summary">
-          <span className="big">{s.reclaimedS.toFixed(1)}s<Scribble /></span>
+          <span className="big">{s.reclaimedS.toFixed(1)}s</span>
           <span className="cap">reclaimed from <b>{s.count} {s.count === 1 ? "cut" : "cuts"}</b><br />
             across {formatDuration(duration)} of footage</span>
         </div>

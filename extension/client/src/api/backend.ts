@@ -52,6 +52,7 @@ export function createBackend({ transport, token }: { transport: Transport; toke
     addExample: (raw_words: Word[], final_text: string, source_clip: string) =>
       call<StyleExample>("POST", "/library/examples", { body: { raw_words, final_text, source_clip } }),
     summarize: () => call<{ summary: string }>("POST", "/library/summarize", { timeoutMs: 5 * 60_000 }),
+    reload: () => call<{ status: string }>("POST", "/reload", { timeoutMs: 2000 }),
   };
 }
 

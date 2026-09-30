@@ -149,3 +149,14 @@ def test_i7_corrupt_or_naive_examples_are_skipped(tmp_path):
     assert ids == [good.id, "naive"]
     c, auth = app(tmp_path)
     assert c.post("/trim", json=REQ, headers=auth).status_code == 200
+
+
+# ── panel review I4: Retry must be able to recover a failed load ───
+
+def test_reload_triggers_a_model_retry(tmp_path):
+    retries = []
+    c, auth = app(tmp_path, transcriber=lambda: None,
+                  load_error=lambda: "network blip", retry_load=lambda: retries.append(1))
+    assert c.post("/reload").status_code == 401
+    r = c.post("/reload", headers=auth)
+    assert r.status_code == 202 and retries == [1]

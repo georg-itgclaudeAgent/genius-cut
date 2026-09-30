@@ -3,7 +3,7 @@ import { cepHost, HostUnavailable } from "./host";
 
 describe("cepHost", () => {
   it("a missing gcut* function (Phase C not installed) is HostUnavailable", async () => {
-    const host = cepHost(async () => "EvalScript error.");
+    const host = cepHost(async () => "__GCUT_MISSING__");
     await expect(host.findClip("take3")).rejects.toBeInstanceOf(HostUnavailable);
   });
 
@@ -21,7 +21,7 @@ describe("cepHost", () => {
     let script = "";
     const host = cepHost(async (s) => { script = s; return "{}"; });
     await host.findClip('he said "cut"\\ok');
-    const arg = script.slice("gcutFindClip(".length, -1);
+    const arg = script.slice(script.indexOf("gcutFindClip(", 30) + "gcutFindClip(".length, script.lastIndexOf(") :"));
     expect(JSON.parse(JSON.parse(arg))).toBe('he said "cut"\\ok');
   });
 });

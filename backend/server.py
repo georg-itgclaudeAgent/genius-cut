@@ -90,6 +90,11 @@ def create_app(
         except (secrets.MissingKeyError, claude.ClaudeError) as e:
             raise claude_errors(e) from e
 
+    @app.post("/reload", dependencies=auth, status_code=202)
+    def post_reload() -> dict:
+        retry_load()
+        return {"status": "reloading"}
+
     @app.get("/library", dependencies=auth)
     def get_library() -> dict:
         return {"examples": [e.model_dump() for e in library.list_examples(lib_dir)],

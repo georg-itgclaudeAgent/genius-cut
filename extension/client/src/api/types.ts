@@ -63,4 +63,6 @@ export interface ClipInfo {
   fps: number;
   matchCount: number;
   selectedUsed: boolean;
+  /** Playback speed: 1 = 100%, negative = reversed. Phase 1 only trims 1. */
+  speed: number;
 }

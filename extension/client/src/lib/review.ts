@@ -5,7 +5,20 @@
 import type { SequenceCut, Span } from "../api/types";
 
 const EPS = 1e-6;
-const ms = (x: number) => Math.round(x * 1000) / 1000;
+
+/**
+ * Python's round(x, 3): correctly rounded from the exact binary value, exact ties to even.
+ * toFixed also works from the exact value but breaks ties upward, so ties are handled here.
+ */
+export function round3(x: number): number {
+  const exact = x.toFixed(20);
+  const tie = exact.match(/^(-?\d+\.\d{3})50*$/);
+  if (!tie) return Number(x.toFixed(3));
+  const down = Number(tie[1]);
+  const lastDigit = Number(tie[1].slice(-1));
+  return lastDigit % 2 === 0 ? down : Number((down + Math.sign(x) * 0.001).toFixed(3));
+}
+const ms = round3;
 
 /** Complement of the ticked cuts over [0, duration], span-relative. */
 function keptRelative(cuts: SequenceCut[], checked: boolean[], duration: number): Span[] {

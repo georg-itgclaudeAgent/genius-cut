@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { runtime } from "../api/runtime";
 import { HostUnavailable, type ApplyResult } from "../api/host";
 import type { ClipInfo, Health, TrimResponse } from "../api/types";
+import { clipProblem } from "../lib/clip";
 import { parseClipName } from "../lib/prompt";
 import { keptSpansSource } from "../lib/review";
 import { formatDuration } from "../lib/timecode";
@@ -13,10 +14,12 @@ type Phase =
   | { k: "analysing"; clip: ClipInfo }
   | { k: "review"; clip: ClipInfo; res: TrimResponse; checked: boolean[] }
   | { k: "applying"; clip: ClipInfo; res: TrimResponse; checked: boolean[] }
-  | { k: "applied"; clip: ClipInfo; res: TrimResponse; result: ApplyResult; gapClosed: boolean }
-  | { k: "error"; message: string; clip?: ClipInfo };
+  | { k: "applied"; clip: ClipInfo; res: TrimResponse; result: ApplyResult; gapClosed: boolean; busy: boolean }
+  | { k: "error"; message: string; clip?: ClipInfo; notYet?: boolean; restorable?: boolean };
 
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
+const errorPhase = (e: unknown, clip?: ClipInfo, restorable = false): Phase =>
+  ({ k: "error", message: errMsg(e), clip, notYet: e instanceof HostUnavailable, restorable });
 
 function Telemetry({ device }: { device: string }) {
   const gpu = device === "cuda";
@@ -40,16 +43,21 @@ export function CutTab({ health, ready, onTrimmed }: {
 }) {
   const [instruction, setInstruction] = useState("trim the selected clip");
   const [phase, setPhase] = useState<Phase>({ k: "idle" });
+  // Bumped on every phase change we start; a host call that returns after the user
+  // has moved on (Done, Analyse again) must not resurrect the old phase.
+  const epoch = useRef(0);
+  const go = (p: Phase) => { epoch.current++; setPhase(p); };
   const clip = "clip" in phase ? phase.clip : undefined;
 
   async function analyse() {
-    setPhase({ k: "finding" });
+    go({ k: "finding" });
     let found: ClipInfo;
     try {
       found = await runtime.host.findClip(parseClipName(instruction));
-      if (!found.found) throw new Error("No matching clip on the active sequence. Select one, or type its name.");
+      const problem = clipProblem(found);
+      if (problem) throw new Error(problem);
     } catch (e) {
-      setPhase({ k: "error", message: errMsg(e) });
+      go(errorPhase(e));
       return;
     }
     setPhase({ k: "analysing", clip: found });
@@ -61,7 +69,7 @@ export function CutTab({ health, ready, onTrimmed }: {
       setPhase({ k: "review", clip: found, res, checked });
       onTrimmed(found, res, checked);
     } catch (e) {
-      setPhase({ k: "error", message: errMsg(e), clip: found });
+      go(errorPhase(e, found));
     }
   }
 
@@ -83,31 +91,43 @@ export function CutTab({ health, ready, onTrimmed }: {
   async function apply() {
     if (phase.k !== "review") return;
     const { clip: c, res, checked } = phase;
-    setPhase({ k: "applying", clip: c, res, checked });
+    go({ k: "applying", clip: c, res, checked });
     try {
       const result = await runtime.host.applyCuts(c, keptSpansSource(res.cuts, checked, { in_s: c.inS, out_s: c.outS }));
       if (!result.ok) {
-        setPhase({ k: "error", clip: c, message: result.message ||
+        go({ k: "error", clip: c, restorable: true, message: result.message ||
           `The rebuilt clip is ${result.actualDuration.toFixed(2)} s, expected ${result.expectedDuration.toFixed(2)} s. ` +
-          "Nothing was hidden: check the timeline, or use Restore original." });
+          "Nothing was hidden: check the timeline, or restore the original." });
         return;
       }
-      setPhase({ k: "applied", clip: c, res, result, gapClosed: false });
+      go({ k: "applied", clip: c, res, result, gapClosed: false, busy: false });
     } catch (e) {
-      setPhase({ k: "error", clip: c, message: errMsg(e) });
+      // A throw mid-rebuild can leave the timeline half-changed, so offer the restore.
+      go(errorPhase(e, c, !(e instanceof HostUnavailable)));
     }
   }
 
   async function closeGap() {
-    if (phase.k !== "applied") return;
-    try { await runtime.host.closeGap(phase.clip); setPhase({ ...phase, gapClosed: true }); }
-    catch (e) { setPhase({ k: "error", clip: phase.clip, message: errMsg(e) }); }
+    if (phase.k !== "applied" || phase.busy) return;
+    const start = phase, mine = ++epoch.current;
+    setPhase({ ...start, busy: true });
+    try {
+      await runtime.host.closeGap(start.clip);
+      if (epoch.current === mine) setPhase({ ...start, gapClosed: true, busy: false });
+    } catch (e) {
+      if (epoch.current === mine) go(errorPhase(e, start.clip, true));
+    }
   }
 
-  async function restore() {
-    if (phase.k !== "applied") return;
-    try { await runtime.host.restoreOriginal(phase.clip); setPhase({ k: "idle" }); }
-    catch (e) { setPhase({ k: "error", clip: phase.clip, message: errMsg(e) }); }
+  async function restore(c: ClipInfo) {
+    const mine = ++epoch.current;
+    if (phase.k === "applied") setPhase({ ...phase, busy: true });
+    try {
+      await runtime.host.restoreOriginal(c);
+      if (epoch.current === mine) go({ k: "idle" });
+    } catch (e) {
+      if (epoch.current === mine) go(errorPhase(e, c, true));
+    }
   }
 
   const working = phase.k === "finding" || phase.k === "analysing";
@@ -135,7 +155,8 @@ export function CutTab({ health, ready, onTrimmed }: {
         <div className="sec-hd"><span className="lbl">Instruction</span></div>
         <form className="prompt" onSubmit={(e) => { e.preventDefault(); analyse(); }}>
           <input value={instruction} onChange={(e) => setInstruction(e.target.value)} aria-label="Instruction" />
-          <button className="btn btn-p" type="submit" disabled={!ready || working || phase.k === "applying"}>Analyse</button>
+          <button className="btn btn-p" type="submit"
+            disabled={!ready || working || phase.k === "applying" || phase.k === "applied"}>Analyse</button>
         </form>
       </div>
 
@@ -151,16 +172,21 @@ export function CutTab({ health, ready, onTrimmed }: {
 
       {phase.k === "error" && (
         <div className="sec">
-          <div className={`note ${phase.message.includes("Phase C") ? "" : "bad"}`}>
+          <div className={`note ${phase.notYet ? "" : "bad"}`}>
             {phase.message}
-            <div className="actions-row"><button className="btn btn-g" onClick={() => setPhase({ k: "idle" })}>Dismiss</button></div>
+            <div className="actions-row">
+              {phase.restorable && phase.clip && (
+                <button className="btn btn-g" onClick={() => restore(phase.clip!)}>Restore original</button>
+              )}
+              <button className="btn btn-g" onClick={() => go({ k: "idle" })}>Dismiss</button>
+            </div>
           </div>
         </div>
       )}
 
       {(phase.k === "review" || phase.k === "applying") && (
         <CutReview clip={phase.clip} res={phase.res} checked={phase.checked} busy={phase.k === "applying"}
-          onToggle={toggle} onToggleAll={toggleAll} onApply={apply} onDiscard={() => setPhase({ k: "idle" })} />
+          onToggle={toggle} onToggleAll={toggleAll} onApply={apply} onDiscard={() => go({ k: "idle" })} />
       )}
 
       {phase.k === "applied" && (
@@ -178,13 +204,13 @@ export function CutTab({ health, ready, onTrimmed }: {
               <div className="note">
                 {phase.gapClosed ? <b>Gap closed.</b> : <><b>{phase.result.trailingGapS.toFixed(1)}s of reclaimed time</b> is sitting
                   as a gap after the clip, so nothing on other tracks moved.</>}
-                {!phase.gapClosed && <div className="actions-row"><button className="btn btn-g" onClick={closeGap}>Close gap</button></div>}
+                {!phase.gapClosed && <div className="actions-row"><button className="btn btn-g" onClick={closeGap} disabled={phase.busy}>Close gap</button></div>}
               </div>
             </div>
           )}
           <div className="actions">
-            <button className="btn btn-g" onClick={restore}>Restore original</button>
-            <button className="btn btn-p" onClick={() => setPhase({ k: "idle" })}>Done</button>
+            <button className="btn btn-g" onClick={() => restore(phase.clip)} disabled={phase.busy}>Restore original</button>
+            <button className="btn btn-p" onClick={() => go({ k: "idle" })} disabled={phase.busy}>Done</button>
           </div>
         </>
       )}

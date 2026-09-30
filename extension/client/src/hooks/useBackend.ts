@@ -27,5 +27,11 @@ export function useBackend() {
     return () => { alive.current = false; };
   }, [connect]);
 
-  return { state, retry: connect };
+  const retry = useCallback(async () => {
+    // A failed model load stays failed until the backend is told to try again.
+    try { await runtime.backend.reload(); } catch { /* not running or no token yet: connect() handles it */ }
+    await connect();
+  }, [connect]);
+
+  return { state, retry };
 }

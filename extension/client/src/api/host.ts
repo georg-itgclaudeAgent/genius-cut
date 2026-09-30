@@ -28,11 +28,17 @@ export interface Host {
   restoreOriginal(clip: ClipInfo): Promise<void>;
 }
 
+const MISSING = "__GCUT_MISSING__";
+
 export function cepHost(evalScript: (s: string) => Promise<string>): Host {
   async function call(fn: string, ...args: unknown[]): Promise<any> {
-    const script = `${fn}(${args.map((a) => JSON.stringify(JSON.stringify(a))).join(",")})`;
+    const argList = args.map((a) => JSON.stringify(JSON.stringify(a))).join(",");
+    // Probe first: "EvalScript error." is what CEP returns for ANY uncaught ExtendScript
+    // exception, so it can't tell "function missing" apart from "function failed".
+    const script = `typeof ${fn} === "function" ? ${fn}(${argList}) : "${MISSING}"`;
     const out = await evalScript(script);
-    if (!out || out === "EvalScript error." || /is (undefined|not a function)/i.test(out)) throw new HostUnavailable();
+    if (out === MISSING) throw new HostUnavailable();
+    if (!out || out === "EvalScript error.") throw new Error(`The Premiere script failed in ${fn}. Nothing further was changed.`);
     if (out.startsWith("Error:")) throw new Error(out.slice(6).trim());
     return JSON.parse(out);
   }

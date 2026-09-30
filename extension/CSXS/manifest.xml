@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ExtensionBundleId must stay exactly "com.attract.genius-cut": Genius Installer Manager
+  refuses any release zip whose manifest names a different bundle. Keep
+  ExtensionBundleVersion in sync with the release tag (vX.Y.Z); the installer reads it
+  to detect the installed version.
+-->
+<ExtensionManifest Version="7.0" ExtensionBundleId="com.attract.genius-cut" ExtensionBundleVersion="0.1.0" ExtensionBundleName="Genius Cut">
+  <ExtensionList>
+    <Extension Id="com.attract.genius-cut.panel" Version="0.1.0" />
+  </ExtensionList>
+
+  <ExecutionEnvironment>
+    <HostList>
+      <Host Name="PPRO" Version="[24.0,99.9]" />
+    </HostList>
+    <LocaleList>
+      <Locale Code="All" />
+    </LocaleList>
+    <RequiredRuntimeList>
+      <RequiredRuntime Name="CSXS" Version="12.0" />
+    </RequiredRuntimeList>
+  </ExecutionEnvironment>
+
+  <DispatchInfoList>
+    <Extension Id="com.attract.genius-cut.panel">
+      <DispatchInfo>
+        <Resources>
+          <MainPath>./client/dist/index.html</MainPath>
+          <ScriptPath>./host/index.jsx</ScriptPath>
+          <CEFCommandLine>
+            <Parameter>--allow-file-access-from-files</Parameter>
+            <!-- Both required: the panel spawns the local backend and calls it through Node's http. -->
+            <Parameter>--enable-nodejs</Parameter>
+            <Parameter>--mixed-context</Parameter>
+          </CEFCommandLine>
+        </Resources>
+        <Lifecycle>
+          <AutoVisible>true</AutoVisible>
+        </Lifecycle>
+        <UI>
+          <Type>Panel</Type>
+          <Menu>Genius Cut</Menu>
+          <Geometry>
+            <Size>
+              <Height>680</Height>
+              <Width>372</Width>
+            </Size>
+            <MinSize>
+              <Height>320</Height>
+              <Width>280</Width>
+            </MinSize>
+            <MaxSize>
+              <Height>2000</Height>
+              <Width>900</Width>
+            </MaxSize>
+          </Geometry>
+        </UI>
+      </DispatchInfo>
+    </Extension>
+  </DispatchInfoList>
+</ExtensionManifest>

@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { ClipInfo, TrimResponse } from "../api/types";
 import { reviewSummary } from "../lib/review";
 import { formatDuration, formatTimecode } from "../lib/timecode";
@@ -17,6 +18,8 @@ export function CutReview({ clip, res, checked, onToggle, onToggleAll, onApply, 
   const duration = clip.outS - clip.inS;
   const s = reviewSummary(res.cuts, checked, duration);
   const unticked = checked.length - s.count;
+  const effects = clip.effects ?? [];
+  const [ack, setAck] = useState(false);
 
   if (res.cuts.length === 0) {
     return (
@@ -68,9 +71,22 @@ export function CutReview({ clip, res, checked, onToggle, onToggleAll, onApply, 
           </label>
         ))}
       </div>
+      <div className="sec">
+        <div className={`note${effects.length ? " warn" : ""}`}>
+          Genius Cut rebuilds this clip from the source, so effects, grades, keyframes and audio gain on it
+          aren't kept. Trim first, then grade.
+          {effects.length > 0 && (
+            <label className="ack">
+              <input type="checkbox" checked={ack} onChange={(e) => setAck(e.target.checked)} />
+              <span>Remove <b>{effects.join(", ")}</b> from this clip and apply</span>
+            </label>
+          )}
+        </div>
+      </div>
       <div className="actions">
         <button className="btn btn-g" onClick={onDiscard} disabled={busy}>Discard</button>
-        <button className="btn btn-p" onClick={onApply} disabled={busy || s.count === 0 || s.keepsNothing}>Apply to timeline</button>
+        <button className="btn btn-p" onClick={onApply}
+          disabled={busy || s.count === 0 || s.keepsNothing || (effects.length > 0 && !ack)}>Apply to timeline</button>
       </div>
     </>
   );

@@ -13,6 +13,11 @@ on:
 permissions:
   contents: write
 
+# bash with pipefail: a failing guard must fail its step, even inside a pipeline.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
@@ -40,11 +45,20 @@ jobs:
 
       - name: Package (checks bundle id and manifest version)
         id: pkg
-        run: python3 scripts/package.py "${{ steps.ver.outputs.version }}" | tee -a "$GITHUB_OUTPUT"
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          python3 scripts/package.py "$VERSION" > package.out
+          cat package.out
+          cat package.out >> "$GITHUB_OUTPUT"
 
       - name: Compute SHA256
         id: sha
-        run: echo "sha256=$(sha256sum "${{ steps.pkg.outputs.zip }}" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+        env:
+          ZIP: ${{ steps.pkg.outputs.zip }}
+        run: |
+          test -f "$ZIP"
+          echo "sha256=$(sha256sum "$ZIP" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         env:

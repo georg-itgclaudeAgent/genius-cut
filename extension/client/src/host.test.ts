@@ -3,9 +3,11 @@
  * simulated Premiere object model. The sandbox has NO native JSON, like ExtendScript.
  *
  * This proves the host's logic against our model of the Premiere API, not against Premiere
- * itself: Checkpoint B checks the real thing. Where the docs are silent or contradictory
- * (setInPoint units, where overwriteClip puts linked audio) the model is configurable, so
- * the host's fallbacks and checks are exercised both ways.
+ * itself: Checkpoint B checks the real thing. The model is deliberately NOT kind:
+ *   - overwriteClip really overwrites: it trims, splits or removes whatever it lands on;
+ *   - placements snap to the sequence frame grid;
+ *   - behaviours the docs don't pin down are switches (setInPoint units, where linked audio
+ *     lands, whether remove/move also act on linked partners, locked tracks, in > out).
  */
 import { describe, it, expect, beforeEach } from "vitest";
 import { readFileSync } from "fs";
@@ -13,28 +15,42 @@ import { resolve } from "path";
 import vm from "vm";
 
 const TICKS = 254016000000;
+// 25 fps: the scene's whole-second positions are on the frame grid, as real clips always are.
+const FPS = 25;
+const TPF = TICKS / FPS;
 const HOST_SRC = readFileSync(resolve(__dirname, "../../host/index.jsx"), "utf8");
 
 class Time {
-  private t = 0;
+  t = 0;
   get seconds() { return this.t / TICKS; }
   set seconds(s: number) { this.t = Math.round(s * TICKS); }
   get ticks() { return String(this.t); }
   set ticks(v: string) { this.t = Number(v); }
   static s(sec: number) { const x = new Time(); x.seconds = sec; return x; }
+  static k(ticks: number) { const x = new Time(); x.t = ticks; return x; }
 }
 
 type Unit = "seconds" | "ticks";
+const snap = (ticks: number) => Math.round(ticks / TPF) * TPF;
 
 class ProjectItem {
   inS = 0; outS: number;
+  rejectInAfterOut = false;
   constructor(public name: string, public nodeId: string, public durationS: number, public unit: Unit = "seconds", public hasAudio = true) {
     this.outS = durationS;
   }
   getMediaPath() { return `D:/Footage/${this.name}`; }
   private toSeconds(v: any) { return this.unit === "seconds" ? Number(v) : Number(v) / TICKS; }
-  setInPoint(v: any, _media: number) { this.inS = this.toSeconds(v); return 0; }
-  setOutPoint(v: any, _media: number) { this.outS = this.toSeconds(v); return 0; }
+  setInPoint(v: any, _m: number) {
+    const s = this.toSeconds(v);
+    if (this.rejectInAfterOut && s >= this.outS) throw new Error("In point after out point");
+    this.inS = s; return 0;
+  }
+  setOutPoint(v: any, _m: number) {
+    const s = this.toSeconds(v);
+    if (this.rejectInAfterOut && s <= this.inS) throw new Error("Out point before in point");
+    this.outS = s; return 0;
+  }
   getInPoint() { return Time.s(this.inS); }
   getOutPoint() { return Time.s(this.outS); }
 }
@@ -42,61 +58,99 @@ class ProjectItem {
 class TrackItem {
   start: Time; end: Time; inPoint: Time; outPoint: Time;
   selected = false; speed = 1; reversed = 0;
-  constructor(public track: Track, public projectItem: ProjectItem, startS: number, inS: number, outS: number, public mediaType: string) {
-    this.start = Time.s(startS); this.end = Time.s(startS + (outS - inS));
-    this.inPoint = Time.s(inS); this.outPoint = Time.s(outS);
+  linked: TrackItem[] = [];
+  components: any;
+  constructor(public track: Track, public projectItem: ProjectItem, startT: number, inS: number, durT: number, public mediaType: string) {
+    this.start = Time.k(startT); this.end = Time.k(startT + durT);
+    this.inPoint = Time.s(inS); this.outPoint = Time.s(inS + durT / TICKS);
+    const names = mediaType === "Video" ? ["Opacity", "Motion"] : ["Volume", "Channel Volume", "Panner"];
+    this.components = Object.assign(names.map((displayName) => ({ displayName })), { numItems: names.length });
   }
   get name() { return this.projectItem.name; }
   isSelected() { return this.selected; }
   getSpeed() { return this.speed; }
   isSpeedReversed() { return this.reversed; }
-  remove(_ripple: boolean, _align: boolean) { this.track.items = this.track.items.filter((i) => i !== this); return 0; }
+  addEffect(name: string) { this.components.push({ displayName: name }); this.components.numItems++; }
+  remove(_r: boolean, _a: boolean) {
+    const seq = this.track.seq;
+    const all = seq.removeLinked ? [this, ...this.linked] : [this];
+    for (const it of all) it.track.items = it.track.items.filter((i) => i !== it);
+    return 0;
+  }
   move(offset: Time) {
-    const d = offset.seconds;
-    this.start = Time.s(this.start.seconds + d); this.end = Time.s(this.end.seconds + d);
+    if (this.track.locked) throw new Error("Track is locked");
+    const all = this.track.seq.moveLinked ? [this, ...this.linked] : [this];
+    for (const it of all) { it.start = Time.k(it.start.t + offset.t); it.end = Time.k(it.end.t + offset.t); }
     return 0;
   }
 }
 
 class Track {
   items: TrackItem[] = [];
+  locked = false;
   constructor(public seq: Seq, public kind: "video" | "audio", public index: number) {}
   get clips() {
-    const arr: any = [...this.items].sort((a, b) => a.start.seconds - b.start.seconds);
+    const arr: any = [...this.items].sort((a, b) => a.start.t - b.start.t);
     arr.numItems = arr.length;
     return arr;
   }
+  isLocked() { return this.locked; }
   add(pi: ProjectItem, startS: number, inS: number, outS: number) {
-    const it = new TrackItem(this, pi, startS, inS, outS, this.kind === "video" ? "Video" : "Audio");
+    return this.place(pi, Math.round(startS * TICKS), inS, Math.round((outS - inS) * TICKS));
+  }
+  /** Lay an item at [startT, startT+durT), overwriting (trimming/splitting/removing) whatever is there. */
+  place(pi: ProjectItem, startT: number, inS: number, durT: number) {
+    const endT = startT + durT;
+    for (const o of [...this.items]) {
+      const os = o.start.t, oe = o.end.t;
+      if (oe <= startT || os >= endT) continue;
+      if (os >= startT && oe <= endT) { this.items = this.items.filter((i) => i !== o); continue; }
+      if (os < startT && oe > endT) { // split: keep left, add right remainder
+        const right = new TrackItem(this, o.projectItem, endT, o.inPoint.seconds + (endT - os) / TICKS, oe - endT, o.mediaType);
+        this.items.push(right);
+        o.end = Time.k(startT); o.outPoint = Time.s(o.inPoint.seconds + (startT - os) / TICKS);
+        continue;
+      }
+      if (os < startT) { o.end = Time.k(startT); o.outPoint = Time.s(o.inPoint.seconds + (startT - os) / TICKS); }
+      else { o.inPoint = Time.s(o.inPoint.seconds + (endT - os) / TICKS); o.start = Time.k(endT); }
+    }
+    const it = new TrackItem(this, pi, startT, inS, durT, this.kind === "video" ? "Video" : "Audio");
     this.items.push(it);
     return it;
   }
-  /** Overwrite: lays the bin item's current in/out at `ticks`, plus linked audio. */
+  /** Overwrite edit: bin item's current in/out, snapped to frames, plus linked audio. */
   overwriteClip(pi: ProjectItem, ticks: string) {
-    const startS = Number(ticks) / TICKS;
-    this.seq.overwriteHook(this, pi, startS);
+    this.seq.overwriteHook(this, pi, Number(ticks));
     return true;
   }
 }
 
 class Seq {
   videoTracks: any; audioTracks: any;
-  timebase = String(Math.round(TICKS / 23.976));
-  /** Where linked audio lands: same index as the video track by default. */
+  timebase = String(TPF);
   audioTrackFor = (videoIndex: number) => videoIndex;
   dropSpanIndex = -1;
+  ignoreInOut = false;
+  removeLinked = false;
+  moveLinked = false;
   private placements = 0;
-  constructor(nV = 2, nA = 2) {
+  constructor(nV = 2, nA = 3) {
     const v = Array.from({ length: nV }, (_, i) => new Track(this, "video", i));
     const a = Array.from({ length: nA }, (_, i) => new Track(this, "audio", i));
     this.videoTracks = Object.assign(v, { numTracks: nV });
     this.audioTracks = Object.assign(a, { numTracks: nA });
   }
-  overwriteHook(track: Track, pi: ProjectItem, startS: number) {
+  overwriteHook(track: Track, pi: ProjectItem, startT: number) {
     const n = this.placements++;
-    if (n === this.dropSpanIndex) return; // simulate Premiere silently not placing a span
-    track.add(pi, startS, pi.inS, pi.outS);
-    if (track.kind === "video" && pi.hasAudio) this.audioTracks[this.audioTrackFor(track.index)].add(pi, startS, pi.inS, pi.outS);
+    if (n === this.dropSpanIndex) return;
+    const inS = this.ignoreInOut ? 0 : pi.inS;
+    const outS = this.ignoreInOut ? pi.durationS : pi.outS;
+    const s = snap(startT), durT = snap(Math.round((outS - inS) * TICKS));
+    const v = track.place(pi, s, inS, durT);
+    if (track.kind === "video" && pi.hasAudio) {
+      const a = this.audioTracks[this.audioTrackFor(track.index)].place(pi, s, inS, durT);
+      v.linked = [a]; a.linked = [v];
+    }
   }
 }
 
@@ -106,83 +160,94 @@ function load(seq: Seq) {
   vm.runInContext("delete this.JSON;", ctx); // ExtendScript has no JSON
   vm.runInContext(HOST_SRC, ctx);
   const call = (fn: string, arg: unknown) => {
-    const out: string = (ctx as any)[fn]((ctx as any).gcutStringify(arg));
+    const out: string = (ctx as any)[fn](JSON.stringify(arg));
     if (out.startsWith("Error:")) throw new Error(out.slice(6).trim());
-    return (ctx as any).gcutParse(out);
+    return JSON.parse(out); // the panel parses with native JSON, so the tests do too
   };
   return { ctx, call };
 }
 
-/** One interview clip on V1 + A1: source 10–20 s, placed at 100 s on the timeline. */
+/** One interview clip on V1 + A1: source 10–20 s, placed at 100 s. Bin marks 2–58 s. */
 function scene(unit: Unit = "seconds") {
   const seq = new Seq();
   const pi = new ProjectItem("interview_take3.mp4", "node-1", 60, unit);
-  pi.inS = 2; pi.outS = 58; // the bin item's own in/out, which must be left as found
   const v = seq.videoTracks[0].add(pi, 100, 10, 20);
-  seq.audioTracks[0].add(pi, 100, 10, 20);
+  const a = seq.audioTracks[0].add(pi, 100, 10, 20);
+  v.linked = [a]; a.linked = [v];
+  pi.inS = 2; pi.outS = 58;
   v.selected = true;
-  return { seq, pi, v, host: load(seq) };
+  return { seq, pi, v, a, host: load(seq) };
 }
 
+const START = String(100 * TICKS);
 const spans = [{ start: 10, end: 12 }, { start: 13, end: 17 }, { start: 18, end: 20 }]; // keeps 8 of 10 s
+const apply = (s: ReturnType<typeof scene>, sp: unknown = spans) => s.host.call("gcutApplyCuts", { trackIndex: 0, startTicks: START, spans: sp });
+const restore = (s: ReturnType<typeof scene>) => s.host.call("gcutRestoreOriginal", { trackIndex: 0, startTicks: START });
+const closeGap = (s: ReturnType<typeof scene>) => s.host.call("gcutCloseTrailingGap", { trackIndex: 0, startTicks: START });
+const layout = (t: Track) => t.clips.map((i: TrackItem) => [+(i.start.seconds).toFixed(3), +(i.end.seconds).toFixed(3)]);
 
 describe("JSON without native JSON", () => {
-  it("round-trips awkward strings", () => {
+  it("round-trips awkward strings, and drops undefined like JSON.stringify", () => {
     const { ctx } = scene().host;
     const s = 'he said "cut" \\ \n tab\t é \u2028';
-    expect((ctx as any).gcutParse((ctx as any).gcutStringify({ s, n: [1, 2.5, null, true] }))).toEqual({ s, n: [1, 2.5, null, true] });
+    expect(JSON.parse((ctx as any).gcutStringify({ s, n: [1, 2.5, null, true], gone: undefined }))).toEqual({ s, n: [1, 2.5, null, true] });
   });
   it("refuses anything that isn't JSON", () => {
-    const { ctx } = scene().host;
-    expect(() => (ctx as any).gcutParse("app.quit()")).toThrow();
+    expect(() => (scene().host.ctx as any).gcutParse("app.quit()")).toThrow();
   });
 });
 
 describe("gcutFindClip", () => {
   it("uses the selected clip when no name is given", () => {
-    const { host } = scene();
-    const c = host.call("gcutFindClip", "");
+    const c = scene().host.call("gcutFindClip", "");
     expect(c).toMatchObject({ found: true, name: "interview_take3.mp4", trackIndex: 0, inS: 10, outS: 20, startS: 100,
-      matchCount: 1, selectedUsed: true, speed: 1, mediaPath: "D:/Footage/interview_take3.mp4" });
-    expect(c.fps).toBeCloseTo(23.976, 2);
-    expect(c.startTicks).toBe(String(100 * TICKS));
+      matchCount: 1, selectedUsed: true, speed: 1, effects: [], startTicks: START });
+    expect(c.fps).toBe(25);
   });
   it("matches by name with or without the extension, any case", () => {
-    const { host, v } = scene();
-    v.selected = false;
-    expect(host.call("gcutFindClip", "INTERVIEW_TAKE3").found).toBe(true);
+    const s = scene(); s.v.selected = false;
+    expect(s.host.call("gcutFindClip", "INTERVIEW_TAKE3").found).toBe(true);
   });
   it("reports not found rather than guessing", () => {
-    const { host } = scene();
-    expect(host.call("gcutFindClip", "b-roll")).toMatchObject({ found: false });
+    expect(scene().host.call("gcutFindClip", "b-roll")).toMatchObject({ found: false });
   });
   it("reports speed, including reversed", () => {
-    const { host, v } = scene();
-    v.speed = 1.5; expect(host.call("gcutFindClip", "").speed).toBe(1.5);
-    v.reversed = 1; expect(host.call("gcutFindClip", "").speed).toBe(-1.5);
+    const s = scene();
+    s.v.speed = 1.5; expect(s.host.call("gcutFindClip", "").speed).toBe(1.5);
+    s.v.reversed = 1; expect(s.host.call("gcutFindClip", "").speed).toBe(-1.5);
   });
   it("prefers the selected one of several matches and says how many there were", () => {
-    const { seq, pi, host, v } = scene();
-    v.selected = false;
-    const second = seq.videoTracks[1].add(pi, 300, 0, 5);
-    second.selected = true;
-    expect(host.call("gcutFindClip", "interview_take3")).toMatchObject({ trackIndex: 1, matchCount: 2, selectedUsed: true });
+    const s = scene(); s.v.selected = false;
+    s.seq.videoTracks[1].add(s.pi, 300, 0, 5).selected = true;
+    expect(s.host.call("gcutFindClip", "interview_take3")).toMatchObject({ trackIndex: 1, matchCount: 2, selectedUsed: true });
+  });
+  it("names effects that the rebuild would remove (C2)", () => {
+    const s = scene();
+    s.v.addEffect("Lumetri Color");
+    s.a.addEffect("Parametric Equalizer");
+    expect(s.host.call("gcutFindClip", "").effects).toEqual(["Lumetri Color", "Parametric Equalizer"]);
   });
 });
 
 describe("gcutApplyCuts", () => {
-  const apply = (s: ReturnType<typeof scene>, sp = spans) =>
-    s.host.call("gcutApplyCuts", { trackIndex: 0, startTicks: String(100 * TICKS), spans: sp });
-
-  it("rebuilds the kept spans back to back from the original start, video and audio", () => {
+  it("rebuilds the kept spans back to back, on the frame grid, video and audio", () => {
     const s = scene();
     const r = apply(s);
     expect(r).toMatchObject({ ok: true, appliedCount: 3 });
-    expect(r.expectedDuration).toBeCloseTo(8);
-    expect(r.trailingGapS).toBeCloseTo(2);
-    const v = s.seq.videoTracks[0].clips, a = s.seq.audioTracks[0].clips;
-    expect(v.map((i: TrackItem) => [i.start.seconds, i.inPoint.seconds, i.outPoint.seconds])).toEqual([[100, 10, 12], [102, 13, 17], [106, 18, 20]]);
-    expect(a.numItems).toBe(3);
+    expect(r.trailingGapS).toBeCloseTo(2, 1);
+    const v = s.seq.videoTracks[0].clips;
+    expect(v.map((i: TrackItem) => +(i.inPoint.seconds).toFixed(2))).toEqual([10, 13, 18]);
+    for (let i = 1; i < v.numItems; i++) expect(v[i].start.t).toBe(v[i - 1].end.t); // no gaps, no overlaps
+    expect(s.seq.audioTracks[0].clips.numItems).toBe(3);
+  });
+
+  it("I1: spans that aren't on frames still land back to back with no gaps or overlaps", () => {
+    const s = scene();
+    const r = apply(s, [{ start: 10.013, end: 11.271 }, { start: 12.5021, end: 14.0417 }, { start: 15.33, end: 19.98 }]);
+    expect(r.ok).toBe(true);
+    const v = s.seq.videoTracks[0].clips;
+    for (let i = 0; i < v.numItems; i++) expect(v[i].start.t % TPF).toBe(0);
+    for (let i = 1; i < v.numItems; i++) expect(v[i].start.t).toBe(v[i - 1].end.t);
   });
 
   it("leaves the bin item's own in/out exactly as it found them", () => {
@@ -194,23 +259,78 @@ describe("gcutApplyCuts", () => {
   it("works when this Premiere build wants ticks instead of seconds", () => {
     const s = scene("ticks");
     expect(apply(s).ok).toBe(true);
-    expect(s.seq.videoTracks[0].clips[1].inPoint.seconds).toBeCloseTo(13);
+    expect(s.seq.videoTracks[0].clips[1].inPoint.seconds).toBeCloseTo(13, 2);
   });
 
-  it("reports ok:false (never success) when a span silently fails to land", () => {
+  it("I3: works when the bin's marks sit outside the spans and Premiere rejects in > out", () => {
+    const s = scene();
+    s.pi.inS = 0; s.pi.outS = 1; s.pi.rejectInAfterOut = true;
+    expect(apply(s).ok).toBe(true);
+    expect([s.pi.inS, s.pi.outS]).toEqual([0, 1]);
+  });
+
+  it("I2: stops at the first span that lands wrong, and says rollback wasn't possible", () => {
+    const s = scene();
+    s.seq.ignoreInOut = true; // overwriteClip lays the whole source instead of the span
+    const r = apply(s);
+    expect(r.ok).toBe(false);
+    expect(r.message).toMatch(/didn't land/);
+    // A world where overwriteClip ignores in/out can't be rolled back honestly either.
+    expect(r.rolledBack).toBe(false);
+    expect(r.message).toMatch(/Undo/);
+  });
+
+  it("C1: a failure part-way rolls back to the original clip and restores the bin", () => {
     const s = scene();
     s.seq.dropSpanIndex = 1;
     const r = apply(s);
-    expect(r.ok).toBe(false);
-    expect(r.message).toMatch(/doesn't match/);
+    expect(r).toMatchObject({ ok: false, rolledBack: true });
+    expect(layout(s.seq.videoTracks[0])).toEqual([[100, 110]]);
+    expect(layout(s.seq.audioTracks[0])).toEqual([[100, 110]]);
+    expect([s.pi.inS, s.pi.outS]).toEqual([2, 58]);
   });
 
-  it("reports ok:false when the linked audio lands on a different track", () => {
+  it("C1: a throw part-way (Premiere rejecting a point) also rolls back", () => {
     const s = scene();
-    s.seq.audioTrackFor = () => 1;
+    const orig = s.pi.setInPoint.bind(s.pi);
+    let calls = 0;
+    s.pi.setInPoint = (v: any, m: number) => { if (++calls === 3) throw new Error("boom"); return orig(v, m); };
+    const r = apply(s);
+    expect(r).toMatchObject({ ok: false, rolledBack: true });
+    expect(layout(s.seq.videoTracks[0])).toEqual([[100, 110]]);
+    expect([s.pi.inS, s.pi.outS]).toEqual([2, 58]);
+  });
+
+  it("C3: refuses when audio landing elsewhere would overwrite other audio — and reports it", () => {
+    const s = scene();
+    const music = new ProjectItem("music.wav", "node-9", 300);
+    s.seq.audioTracks[1].add(music, 90, 0, 40);
+    s.seq.audioTrackFor = () => 1; // Premiere puts the rebuilt audio on A2, over the music
     const r = apply(s);
     expect(r.ok).toBe(false);
-    expect(r.message).toMatch(/A1/);
+    expect(r.message).toMatch(/A2/);
+  });
+
+  it("C3: refuses a J/L cut (linked audio extends past the video) before changing anything", () => {
+    const s = scene();
+    s.a.end = Time.s(112); s.a.outPoint = Time.s(22);
+    expect(() => apply(s)).toThrow(/J\/L|split or extended/);
+    expect(s.seq.videoTracks[0].clips.numItems).toBe(1);
+  });
+
+  it("C3: refuses a video-only clip whose source has audio, before changing anything", () => {
+    const s = scene();
+    s.seq.audioTracks[0].items = []; // scratch audio deleted in favour of a separate recording
+    const lav = new ProjectItem("lav.wav", "node-7", 300);
+    s.seq.audioTracks[0].add(lav, 100, 50, 60);
+    expect(() => apply(s)).toThrow(/audio isn't linked/);
+    expect(layout(s.seq.audioTracks[0])).toEqual([[100, 110]]);
+  });
+
+  it("I5: works when Premiere's remove also removes the linked audio", () => {
+    const s = scene();
+    s.seq.removeLinked = true;
+    expect(apply(s).ok).toBe(true);
   });
 
   it.each([
@@ -218,16 +338,16 @@ describe("gcutApplyCuts", () => {
     ["spans outside the clip", { spans: [{ start: 5, end: 12 }] }, /outside the clip/],
     ["overlapping spans", { spans: [{ start: 10, end: 14 }, { start: 13, end: 15 }] }, /overlap/],
     ["nothing kept", { spans: [] }, /nothing to keep/i],
+    ["a span shorter than a frame", { spans: [{ start: 10, end: 10.01 }] }, /shorter than a frame/],
   ])("refuses when %s, and changes nothing", (_label, patch, msg) => {
     const s = scene();
-    expect(() => s.host.call("gcutApplyCuts", { trackIndex: 0, startTicks: String(100 * TICKS), spans, ...patch })).toThrow(msg);
+    expect(() => s.host.call("gcutApplyCuts", { trackIndex: 0, startTicks: START, spans, ...patch })).toThrow(msg);
     expect(s.seq.videoTracks[0].clips.numItems).toBe(1);
     expect(s.seq.audioTracks[0].clips.numItems).toBe(1);
   });
 
   it("refuses a retimed clip, and changes nothing", () => {
-    const s = scene();
-    s.v.speed = 2;
+    const s = scene(); s.v.speed = 2;
     expect(() => apply(s)).toThrow(/100% speed/);
     expect(s.seq.videoTracks[0].clips.numItems).toBe(1);
   });
@@ -236,16 +356,21 @@ describe("gcutApplyCuts", () => {
 describe("gcutRestoreOriginal", () => {
   it("puts the original clip back exactly, audio included, and the bin untouched", () => {
     const s = scene();
-    s.host.call("gcutApplyCuts", { trackIndex: 0, startTicks: String(100 * TICKS), spans });
-    expect(s.host.call("gcutRestoreOriginal", { trackIndex: 0, startTicks: String(100 * TICKS) })).toEqual({ ok: true });
-    const v = s.seq.videoTracks[0].clips;
-    expect(v.map((i: TrackItem) => [i.start.seconds, i.end.seconds, i.inPoint.seconds, i.outPoint.seconds])).toEqual([[100, 110, 10, 20]]);
-    expect(s.seq.audioTracks[0].clips.numItems).toBe(1);
+    apply(s);
+    expect(restore(s)).toMatchObject({ ok: true });
+    expect(s.seq.videoTracks[0].clips.map((i: TrackItem) => [i.start.seconds, i.end.seconds, i.inPoint.seconds, i.outPoint.seconds]))
+      .toEqual([[100, 110, 10, 20]]);
+    expect(layout(s.seq.audioTracks[0])).toEqual([[100, 110]]);
     expect([s.pi.inS, s.pi.outS]).toEqual([2, 58]);
   });
   it("without a Genius Cut edit this session, points at Premiere's Undo", () => {
+    expect(() => restore(scene())).toThrow(/Undo/);
+  });
+  it("refuses if something was dropped into the gap since, rather than overwrite it", () => {
     const s = scene();
-    expect(() => s.host.call("gcutRestoreOriginal", { trackIndex: 0, startTicks: String(100 * TICKS) })).toThrow(/Undo/);
+    apply(s);
+    s.seq.videoTracks[0].add(new ProjectItem("logo.png", "node-5", 5), 109, 0, 0.5);
+    expect(() => restore(s)).toThrow(/gap/);
   });
 });
 
@@ -254,26 +379,40 @@ describe("gcutCloseTrailingGap", () => {
   beforeEach(() => {
     s = scene();
     const later = new ProjectItem("b-roll.mp4", "node-2", 30);
-    s.seq.videoTracks[0].add(later, 110, 0, 5);   // right after the original clip on V1
-    s.seq.audioTracks[1].add(later, 112, 0, 3);   // and something later on A2
-    s.host.call("gcutApplyCuts", { trackIndex: 0, startTicks: String(100 * TICKS), spans });
+    const lv = s.seq.videoTracks[0].add(later, 110, 0, 5);
+    const la = s.seq.audioTracks[0].add(later, 110, 0, 5);
+    lv.linked = [la]; la.linked = [lv];
+    s.seq.audioTracks[2].add(new ProjectItem("sfx.wav", "node-4", 10), 112, 0, 3);
+    apply(s);
   });
 
   it("ripples everything after the gap left by the gap, on every track", () => {
-    expect(s.host.call("gcutCloseTrailingGap", { trackIndex: 0, startTicks: String(100 * TICKS) })).toMatchObject({ ok: true, movedCount: 2 });
-    const bRoll = s.seq.videoTracks[0].clips.find((i: TrackItem) => i.name === "b-roll.mp4");
-    expect(bRoll.start.seconds).toBeCloseTo(108);
-    expect(s.seq.audioTracks[1].clips[0].start.seconds).toBeCloseTo(110);
+    expect(closeGap(s)).toMatchObject({ ok: true });
+    const v = s.seq.videoTracks[0].clips;
+    expect(v[v.numItems - 1].start.seconds).toBeCloseTo(108, 1);
+    expect(s.seq.audioTracks[2].clips[0].start.seconds).toBeCloseTo(110, 1);
+  });
+
+  it("I5: moves linked audio once, even if Premiere's move also moves linked partners", () => {
+    s.seq.moveLinked = true;
+    expect(closeGap(s).ok).toBe(true);
+    const a = s.seq.audioTracks[0].clips;
+    expect(a[a.numItems - 1].start.seconds).toBeCloseTo(108, 1);
   });
 
   it("refuses if anything on another track sits inside the gap", () => {
-    const blocker = new ProjectItem("music.wav", "node-3", 60);
-    s.seq.audioTracks[1].add(blocker, 109, 0, 0.5);
-    expect(() => s.host.call("gcutCloseTrailingGap", { trackIndex: 0, startTicks: String(100 * TICKS) })).toThrow(/A2 sits inside the gap/);
+    s.seq.audioTracks[1].add(new ProjectItem("music.wav", "node-3", 60), 109, 0, 0.5);
+    expect(() => closeGap(s)).toThrow(/A2 sits inside the gap/);
+  });
+
+  it("I4: refuses on a locked track before moving anything", () => {
+    s.seq.audioTracks[2].locked = true;
+    expect(() => closeGap(s)).toThrow(/locked/);
+    expect(s.seq.audioTracks[2].clips[0].start.seconds).toBeCloseTo(112, 1);
   });
 
   it("after the gap is closed, restore refuses and points at Undo", () => {
-    s.host.call("gcutCloseTrailingGap", { trackIndex: 0, startTicks: String(100 * TICKS) });
-    expect(() => s.host.call("gcutRestoreOriginal", { trackIndex: 0, startTicks: String(100 * TICKS) })).toThrow(/Undo/);
+    closeGap(s);
+    expect(() => restore(s)).toThrow(/Undo/);
   });
 });

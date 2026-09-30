@@ -67,4 +67,6 @@ export interface ClipInfo {
   selectedUsed: boolean;
   /** Playback speed: 1 = 100%, negative = reversed. Phase 1 only trims 1. */
   speed: number;
+  /** Effects on the clip (beyond Motion/Opacity/Volume…). The rebuild does NOT keep them. */
+  effects: string[];
 }

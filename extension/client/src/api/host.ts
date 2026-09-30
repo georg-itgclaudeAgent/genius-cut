@@ -18,6 +18,8 @@ export interface ApplyResult {
   expectedDuration: number;
   actualDuration: number;
   trailingGapS: number;
+  /** On failure: true if the host already put the original clip back. */
+  rolledBack?: boolean;
   message?: string;
 }
 

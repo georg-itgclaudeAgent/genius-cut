@@ -95,7 +95,7 @@ export function CutTab({ health, ready, onTrimmed }: {
     try {
       const result = await runtime.host.applyCuts(c, keptSpansSource(res.cuts, checked, { in_s: c.inS, out_s: c.outS }));
       if (!result.ok) {
-        go({ k: "error", clip: c, restorable: true, message: result.message ||
+        go({ k: "error", clip: c, restorable: !result.rolledBack, message: result.message ||
           `The rebuilt clip is ${result.actualDuration.toFixed(2)} s, expected ${result.expectedDuration.toFixed(2)} s. ` +
           "Nothing was hidden: check the timeline, or restore the original." });
         return;
@@ -185,7 +185,7 @@ export function CutTab({ health, ready, onTrimmed }: {
       )}
 
       {(phase.k === "review" || phase.k === "applying") && (
-        <CutReview clip={phase.clip} res={phase.res} checked={phase.checked} busy={phase.k === "applying"}
+        <CutReview key={`${phase.clip.trackIndex}@${phase.clip.startTicks}`} clip={phase.clip} res={phase.res} checked={phase.checked} busy={phase.k === "applying"}
           onToggle={toggle} onToggleAll={toggleAll} onApply={apply} onDiscard={() => go({ k: "idle" })} />
       )}
 

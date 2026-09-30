@@ -1,0 +1,121 @@
+"""Word-level speech-to-text, on the local GPU when it can be, the CPU when it can't.
+
+CTranslate2 4.x needs the CUDA 12 + cuDNN 9 runtime DLLs. They ship inside this
+venv as NVIDIA's pip wheels (nvidia-cublas-cu12, nvidia-cudnn-cu12,
+nvidia-cuda-runtime-cu12), so nothing is installed system-wide. A missing cuDNN can
+hard-crash the process on first inference rather than raise, so the GPU is only
+tried after the DLLs have been proven loadable, and a warm-up run surfaces any
+remaining failure at startup instead of mid-request.
+"""
+
+import ctypes
+import os
+import sys
+from pathlib import Path
+from typing import Callable, Protocol
+
+from geniuscut.models import Word
+
+DEFAULT_MODEL = os.environ.get("GENIUSCUT_WHISPER_MODEL", "large-v3")
+_REQUIRED_DLLS = ("cudart64_12.dll", "cublas64_12.dll", "cudnn64_9.dll", "cudnn_ops64_9.dll")
+
+
+def _register_nvidia_dlls() -> None:
+    """Make the venv's nvidia/*/bin folders visible to CTranslate2's DLL loader."""
+    root = Path(sys.prefix) / "Lib" / "site-packages" / "nvidia"
+    if not root.is_dir():
+        return
+    for bin_dir in sorted(root.glob("*/bin")):
+        os.add_dll_directory(str(bin_dir))
+        os.environ["PATH"] = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
+
+
+_register_nvidia_dlls()
+
+
+def cuda_runtime_available() -> bool:
+    try:
+        for dll in _REQUIRED_DLLS:
+            ctypes.WinDLL(dll)
+    except (OSError, AttributeError):  # AttributeError: WinDLL doesn't exist off Windows
+        return False
+    try:
+        import ctranslate2
+
+        return ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        return False
+
+
+def read_wav_16k_mono(path: Path):
+    """16-bit PCM, 16 kHz, mono WAV → float32 samples in [-1, 1]."""
+    import wave
+
+    import numpy as np
+
+    with wave.open(str(path), "rb") as w:
+        if (w.getframerate(), w.getnchannels(), w.getsampwidth()) != (16000, 1, 2):
+            raise ValueError(
+                f"{path}: expected 16 kHz mono 16-bit PCM, got {w.getframerate()} Hz, "
+                f"{w.getnchannels()} ch, {8 * w.getsampwidth()}-bit")
+        pcm = w.readframes(w.getnframes())
+    return np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+
+
+class Transcriber(Protocol):
+    device: str
+
+    def transcribe(self, wav: Path) -> list[Word]: ...
+
+
+def _whisper_model(name: str, device: str, compute_type: str):
+    from faster_whisper import WhisperModel
+
+    return WhisperModel(name, device=device, compute_type=compute_type)
+
+
+class FasterWhisperTranscriber:
+    """Load once at process start (first load downloads the model); reuse for every request."""
+
+    def __init__(
+        self,
+        model_name: str = DEFAULT_MODEL,
+        model_factory: Callable = _whisper_model,
+        cuda_ready: Callable[[], bool] = cuda_runtime_available,
+        warm_up: bool = True,
+    ):
+        self.model_name = model_name
+        self.cuda_error: str | None = None
+        self.device = "cpu"
+        self._model = None
+        if cuda_ready():
+            try:
+                self._model = model_factory(model_name, device="cuda", compute_type="float16")
+                if warm_up:
+                    self._warm_up()
+                self.device = "cuda"
+            except Exception as e:  # noqa: BLE001 — any GPU failure means "use the CPU"
+                self.cuda_error = str(e)
+                self._model = None
+        else:
+            self.cuda_error = "CUDA 12 / cuDNN 9 runtime not available"
+        if self._model is None:
+            self._model = model_factory(model_name, device="cpu", compute_type="int8")
+
+    def _warm_up(self) -> None:
+        import numpy as np
+
+        segments, _ = self._model.transcribe(np.zeros(16000, dtype=np.float32), language="en")
+        list(segments)
+
+    def transcribe(self, wav: Path) -> list[Word]:
+        # Samples, not a path: faster-whisper 1.2.1 decodes files through PyAV with an
+        # argument PyAV 19 removed. Our WAVs always come from audio.extract_span.
+        segments, _ = self._model.transcribe(read_wav_16k_mono(wav), word_timestamps=True, vad_filter=True)
+        words: list[Word] = []
+        for seg in segments:
+            for w in seg.words or []:
+                text = w.word.strip()
+                if text and w.end > w.start:
+                    words.append(Word(w=text, start=round(w.start, 3), end=round(w.end, 3)))
+        return words

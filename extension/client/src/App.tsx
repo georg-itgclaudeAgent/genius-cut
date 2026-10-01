@@ -44,7 +44,11 @@ export function App() {
         <span className="ver">{VERSION}</span>
       </header>
 
-      {runtime.isSample && (
+      {runtime.mode === "preview" && (
+        <div className="banner"><b>Preview.</b> This build runs on sample data: trimming your own clips arrives in an update.
+          Nothing here changes your timeline.</div>
+      )}
+      {runtime.mode === "browser" && (
         <div className="banner"><b>Sample data.</b> Running outside Premiere: the clip, cuts and results are illustrative.</div>
       )}
 

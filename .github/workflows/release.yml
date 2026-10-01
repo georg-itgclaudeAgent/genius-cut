@@ -1,9 +1,10 @@
 name: Release Genius Cut
 
 # Tag vX.Y.Z → build the panel, package it, publish a release Genius Installer Manager can
-# install. Until Task 17 bundles a Python runtime into backend/, releases are published as
-# pre-releases: the installer ignores those, so a build that can't run on a clean machine
-# never reaches an editor's Install button.
+# install.
+#   - Preview build (VITE_GENIUSCUT_PREVIEW=1): sample data, no backend → normal release.
+#   - Live build without a bundled Python runtime (Task 17): published as a pre-release,
+#     which the installer ignores, so it never reaches an editor's Install button.
 
 on:
   push:
@@ -66,7 +67,9 @@ jobs:
         run: |
           PRE=""
           NOTE=""
-          if [ "${{ steps.pkg.outputs.bundled_runtime }}" != "true" ]; then
+          if [ "${{ steps.pkg.outputs.preview }}" = "true" ]; then
+            NOTE="Preview: the Genius Cut panel in Premiere Pro on sample data. Trimming your own clips arrives in an update."
+          elif [ "${{ steps.pkg.outputs.bundled_runtime }}" != "true" ]; then
             PRE="--prerelease"
             NOTE="Pre-release: no bundled Python runtime yet (Task 17), so Genius Installer Manager won't offer it."
           fi

@@ -12,9 +12,13 @@ Guards (each fails the build with a message):
     what's installed; a mismatch means every install keeps offering the same "update");
   - the client has been built.
 
-Prints `bundled_runtime=true|false`: whether a Python runtime is inside the backend
-(Task 17). Without one the release can't run on a clean machine, so CI publishes it as a
-pre-release, which the installer ignores.
+Prints, for CI:
+  preview=true|false          — a preview build (VITE_GENIUSCUT_PREVIEW=1 in
+                                extension/client/.env.production): sample data, no backend;
+                                the backend is left out of the zip, and it's a normal release.
+  bundled_runtime=true|false  — whether a Python runtime is inside the backend (Task 17). A
+                                live build without one can't run on a clean machine, so CI
+                                publishes it as a pre-release, which the installer ignores.
 """
 
 import argparse
@@ -53,26 +57,33 @@ def check(version: str) -> None:
         fail("extension/client/dist is missing. Run `npm ci && npm run build` in extension/client.")
 
 
+def preview_build() -> bool:
+    env = EXT / "client" / ".env.production"
+    return env.exists() and re.search(r"^VITE_GENIUSCUT_PREVIEW=1\s*$", env.read_text(encoding="utf-8"), re.M) is not None
+
+
 def bundled_runtime() -> bool:
     return (BACKEND / "python" / "python.exe").exists()
 
 
-def files():
+def files(include_backend: bool):
     for sub in ("CSXS", "host", "client/dist"):
         for p in sorted((EXT / sub).rglob("*")):
             if p.is_file() and not p.name.endswith(".map"):
                 yield p, p.relative_to(EXT).as_posix()
+    if not include_backend:
+        return
     for p in sorted(BACKEND.rglob("*")):
         rel = p.relative_to(BACKEND)
         if p.is_file() and not (set(rel.parts) & BACKEND_SKIP_DIRS) and p.suffix not in BACKEND_SKIP_SUFFIXES:
             yield p, "backend/" + rel.as_posix()
 
 
-def build(version: str) -> Path:
+def build(version: str, include_backend: bool) -> Path:
     out = ROOT / "dist" / f"genius-cut-{version}.zip"
     out.parent.mkdir(exist_ok=True)
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
-        for src, arc in files():
+        for src, arc in files(include_backend):
             z.write(src, arc)
     return out
 
@@ -83,9 +94,11 @@ def main() -> None:
     ap.add_argument("--check", action="store_true")
     args = ap.parse_args()
     check(args.version)
+    preview = preview_build()
+    print(f"preview={'true' if preview else 'false'}")
     print(f"bundled_runtime={'true' if bundled_runtime() else 'false'}")
     if not args.check:
-        print(f"zip={build(args.version).relative_to(ROOT).as_posix()}")
+        print(f"zip={build(args.version, include_backend=not preview).relative_to(ROOT).as_posix()}")
 
 
 if __name__ == "__main__":

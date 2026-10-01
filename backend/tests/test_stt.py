@@ -6,7 +6,7 @@ import pytest
 from geniuscut import stt
 
 FIXTURE = Path(__file__).parent / "fixtures" / "speech.wav"
-# Small model keeps the suite fast; the real service uses large-v3 (see stt.DEFAULT_MODEL).
+# Small model keeps the suite fast; the real service uses large-v3 (see stt.model_for).
 TEST_MODEL = os.environ.get("GENIUSCUT_TEST_WHISPER_MODEL", "tiny")
 
 
@@ -94,3 +94,31 @@ def test_verbatim_prompt_can_be_switched_off(tmp_path, monkeypatch):
     t = stt.FasterWhisperTranscriber("x", model_factory=RecordingModel, cuda_ready=lambda: False, warm_up=False)
     t.transcribe(_silent_wav(tmp_path))
     assert "initial_prompt" not in t._model.kwargs
+
+
+def test_model_follows_the_device(monkeypatch):
+    monkeypatch.delenv("GENIUSCUT_WHISPER_MODEL", raising=False)
+    assert stt.model_for("cuda") == "large-v3"
+    assert stt.model_for("cpu") == "large-v3-turbo"
+
+
+def test_env_override_wins_on_any_device(monkeypatch):
+    monkeypatch.setenv("GENIUSCUT_WHISPER_MODEL", "tiny")
+    assert stt.model_for("cuda") == "tiny" and stt.model_for("cpu") == "tiny"
+
+
+def test_cuda_failure_falls_back_to_cpu_with_the_cpu_model(monkeypatch):
+    # Review Focus 4: an NVIDIA GPU with an old driver installs the cuda runtime, then
+    # CUDA fails at load. The CPU fallback must use turbo, not large-v3.
+    monkeypatch.delenv("GENIUSCUT_WHISPER_MODEL", raising=False)
+    made = []
+
+    def factory(name, device, compute_type):
+        made.append((name, device))
+        if device == "cuda":
+            raise RuntimeError("CUDA driver version is insufficient")
+        return FakeModel(name, device, compute_type)
+
+    t = stt.FasterWhisperTranscriber(model_factory=factory, cuda_ready=lambda: True, warm_up=False)
+    assert made == [("large-v3", "cuda"), ("large-v3-turbo", "cpu")]
+    assert t.device == "cpu" and t.model_name == "large-v3-turbo"

@@ -11,8 +11,8 @@ import tempfile
 from pathlib import Path
 from typing import Callable
 
-from geniuscut import audio, cuts, library
-from geniuscut.models import CutSpan, SequenceCut, Span, TrimRequest, TrimResponse
+from geniuscut import audio, cuts, library, pauses
+from geniuscut.models import PAUSE_KEEP_S, CutSpan, SequenceCut, Span, TrimRequest, TrimResponse
 from geniuscut.stt import Transcriber
 
 
@@ -53,8 +53,10 @@ def run_trim(
         words = transcriber.transcribe(wav)
     finally:
         shutil.rmtree(work, ignore_errors=True)
-    cut_spans = propose(words, library.build_fewshot(library_dir), req.prompt)
     duration = req.out_s - req.in_s
+    cut_spans = propose(words, library.build_fewshot(library_dir), req.prompt)
+    if req.cut_pauses:
+        cut_spans = pauses.merge_cuts(cut_spans, pauses.find_pauses(words, duration, req.min_pause_s, PAUSE_KEEP_S))
     kept = kept_spans(cut_spans, duration)
     if not kept:
         raise TrimRefused("The proposal would remove the whole clip, so nothing was changed. "

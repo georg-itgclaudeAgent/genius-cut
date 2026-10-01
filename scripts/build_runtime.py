@@ -10,6 +10,7 @@ because pip resolves wheels for the running interpreter.
 import argparse
 import hashlib
 import io
+import os
 import platform
 import shutil
 import subprocess
@@ -20,6 +21,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TRIM_FILE = Path(__file__).resolve().parent / "runtime_trim.txt"
+
+# The MSVC C++ runtime ctranslate2 / onnxruntime link against. Embeddable Python ships only
+# vcruntime140*.dll, so without these `import ctranslate2` fails on PCs that lack the
+# VC++ 2015-2022 x64 Redistributable. Copied from the build machine next to python.exe.
+MSVC_RUNTIME_DLLS = ("msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll",
+                     "vcruntime140.dll", "vcruntime140_1.dll", "concrt140.dll")
 
 
 def patch_pth(text: str) -> str:
@@ -43,6 +50,19 @@ def trim(root: Path, names: list[str]) -> int:
     return removed
 
 
+def copy_msvc_runtime(stage: Path, system32: Path) -> None:
+    """Put the MSVC C++ runtime in the runtime root. The embeddable's own vcruntime copies are
+    kept (they match its python.exe); msvcp*/concrt always come from the build machine."""
+    missing = [n for n in MSVC_RUNTIME_DLLS if n.startswith("msvcp") and not (system32 / n).is_file()]
+    if missing:
+        raise SystemExit(f"{', '.join(missing)} not found in {system32}. Install the Microsoft "
+                         "Visual C++ 2015-2022 x64 Redistributable on the build machine.")
+    for n in MSVC_RUNTIME_DLLS:
+        src, dst = system32 / n, stage / n
+        if src.is_file() and (n.startswith(("msvcp", "concrt")) or not dst.exists()):
+            shutil.copy2(src, dst)
+
+
 def requirements_for(flavour: str) -> Path:
     return ROOT / "backend" / ("requirements.txt" if flavour == "cuda" else "requirements-runtime.txt")
 
@@ -61,6 +81,7 @@ def build(flavour: str, version: str, out: Path) -> Path:
     shutil.rmtree(stage, ignore_errors=True)
     stage.mkdir(parents=True)
     fetch_embeddable(stage)
+    copy_msvc_runtime(stage, Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32")
     site = stage / "Lib" / "site-packages"
     subprocess.run([sys.executable, "-m", "pip", "install", "--no-compile", "--target", str(site),
                     "-r", str(requirements_for(flavour))], check=True)

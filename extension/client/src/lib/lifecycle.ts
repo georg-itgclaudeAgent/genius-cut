@@ -30,6 +30,7 @@ export async function ensureBackend({ health, spawn, sleep, attempts = 30, inter
   try {
     spawn();
   } catch (e: any) {
+    if (e?.needsSetup) return { kind: "failed", message: e.message }; // already user-ready, no prefix
     return { kind: "failed", message: `Couldn't start the Genius Cut backend: ${e?.message || e}` };
   }
   for (let i = 0; i < attempts; i++) {

@@ -25,7 +25,10 @@ jobs:
           python-version: '3.14'
       - name: Resolve version
         id: ver
-        run: echo "version=${GITHUB_REF_NAME#runtime-v}" >> "$GITHUB_OUTPUT"
+        run: |
+          v="${GITHUB_REF_NAME#runtime-v}"
+          [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Tag $GITHUB_REF_NAME is not runtime-vX.Y.Z"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
       - name: Build cpu runtime
         env: { VERSION: "${{ steps.ver.outputs.version }}" }
         run: python scripts/build_runtime.py cpu "$VERSION"
@@ -38,6 +41,27 @@ jobs:
           mkdir rt && cd rt
           python -c "import zipfile,sys;zipfile.ZipFile(sys.argv[1]).extractall('.')" "../dist/genius-cut-runtime-cpu-$VERSION.zip"
           ./python.exe ../backend/server.py --selftest
+      - name: Smoke-check the cuda runtime loads its own NVIDIA DLLs (no GPU needed)
+        env: { VERSION: "${{ steps.ver.outputs.version }}" }
+        run: |
+          mkdir rt-cuda && cd rt-cuda
+          python -c "import zipfile,sys;zipfile.ZipFile(sys.argv[1]).extractall('.')" "../dist/genius-cut-runtime-cuda-$VERSION.zip"
+          ./python.exe - <<'PY'
+          import ctypes, glob, os, sys
+          root = sys.prefix  # the runtime folder, as backend/geniuscut/stt.py sees it
+          nvidia = os.path.normcase(os.path.join(root, "Lib", "site-packages", "nvidia"))
+          for d in sorted(glob.glob(os.path.join(nvidia, "*", "bin"))):
+              os.add_dll_directory(d)
+          k32 = ctypes.WinDLL("kernel32")
+          k32.GetModuleFileNameW.argtypes = (ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32)
+          for n in ("cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll", "cudnn64_9.dll", "cudnn_ops64_9.dll"):
+              buf = ctypes.create_unicode_buffer(32768)
+              k32.GetModuleFileNameW(ctypes.WinDLL(n)._handle, buf, len(buf))
+              print(n, "->", buf.value)
+              assert os.path.normcase(buf.value).startswith(nvidia), f"{n} not loaded from the runtime's nvidia/*/bin"
+          import ctranslate2  # also proves the MSVC C++ runtime shipped next to python.exe
+          print("cuda runtime ok, ctranslate2", ctranslate2.__version__)
+          PY
       - name: Check sizes stay under GitHub's 2 GB asset limit
         run: |
           for f in dist/*.zip; do s=$(stat -c %s "$f"); echo "$f $((s/1048576)) MB"; test "$s" -lt 2000000000; done

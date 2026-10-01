@@ -60,3 +60,37 @@ def test_transcribes_real_speech_into_ordered_words():
     assert all(a.start <= b.start for a, b in zip(words, words[1:]))
     text = " ".join(w.w.lower() for w in words)
     assert "workspace" in text and "licensing" in text
+
+
+def _silent_wav(tmp_path):
+    import wave
+    p = tmp_path / "s.wav"
+    with wave.open(str(p), "wb") as f:
+        f.setnchannels(1); f.setsampwidth(2); f.setframerate(16000); f.writeframes(b"\x00\x00" * 1600)
+    return p
+
+
+class RecordingModel:
+    def __init__(self, name, device, compute_type):
+        self.kwargs = None
+
+    def transcribe(self, audio, **kw):
+        self.kwargs = kw
+        return iter([]), None
+
+
+def test_transcribes_verbatim_so_fillers_are_kept(tmp_path, monkeypatch):
+    # Whisper tidies away "um"/"uh" by default; on a real clip that was 0 fillers vs 11 in 2 min.
+    monkeypatch.delenv("GENIUSCUT_VERBATIM", raising=False)
+    t = stt.FasterWhisperTranscriber("x", model_factory=RecordingModel, cuda_ready=lambda: False, warm_up=False)
+    t.transcribe(_silent_wav(tmp_path))
+    prompt = t._model.kwargs.get("initial_prompt") or ""
+    assert "um" in prompt.lower() and "uh" in prompt.lower()
+    assert t._model.kwargs["word_timestamps"] is True
+
+
+def test_verbatim_prompt_can_be_switched_off(tmp_path, monkeypatch):
+    monkeypatch.setenv("GENIUSCUT_VERBATIM", "0")
+    t = stt.FasterWhisperTranscriber("x", model_factory=RecordingModel, cuda_ready=lambda: False, warm_up=False)
+    t.transcribe(_silent_wav(tmp_path))
+    assert "initial_prompt" not in t._model.kwargs

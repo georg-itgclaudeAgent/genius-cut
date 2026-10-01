@@ -17,6 +17,15 @@ from typing import Callable, Protocol
 from geniuscut.models import Word
 
 DEFAULT_MODEL = os.environ.get("GENIUSCUT_WHISPER_MODEL", "large-v3")
+
+# Whisper tidies "um"/"uh" out of transcripts unless shown disfluent speech first, and the
+# cut proposer can't remove a filler it never sees. On a real 2-minute clip this took the
+# um/uh count from 0 to 11 with the same words otherwise. Set GENIUSCUT_VERBATIM=0 to disable.
+VERBATIM_PROMPT = "Umm, so, uh, let me think. Like, hmm... Okay, so, um, here's what I'm, uh, I'm thinking."
+
+
+def _verbatim() -> bool:
+    return os.environ.get("GENIUSCUT_VERBATIM", "1") != "0"
 _REQUIRED_DLLS = ("cudart64_12.dll", "cublas64_12.dll", "cudnn64_9.dll", "cudnn_ops64_9.dll")
 
 
@@ -125,7 +134,8 @@ class FasterWhisperTranscriber:
             return self._words(samples)
 
     def _words(self, samples) -> list[Word]:
-        segments, _ = self._model.transcribe(samples, word_timestamps=True, vad_filter=True)
+        extra = {"initial_prompt": VERBATIM_PROMPT} if _verbatim() else {}
+        segments, _ = self._model.transcribe(samples, word_timestamps=True, vad_filter=True, **extra)
         words: list[Word] = []
         for seg in segments:
             for w in seg.words or []:

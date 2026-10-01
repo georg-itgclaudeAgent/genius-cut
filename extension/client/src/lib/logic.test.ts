@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { keptSpansSource, reviewSummary } from "./review";
 import { parseClipName } from "./prompt";
 import { formatTimecode, formatDuration } from "./timecode";
-import { backendPaths, parseRuntimePointer } from "./paths";
+import { backendPaths, parseRuntimePointer, liveRuntimePython } from "./paths";
 import { ensureBackend } from "./lifecycle";
 import type { Health, SequenceCut } from "../api/types";
 
@@ -172,5 +172,18 @@ describe("ensureBackend", () => {
       spawn: () => {}, sleep: async () => {},
     });
     expect(r).toEqual({ kind: "failed", message: expect.stringContaining("disk full") });
+  });
+});
+
+describe("liveRuntimePython", () => {
+  const text = '{"python":"C:/r/python.exe"}';
+  it("returns python when the file exists", () => {
+    expect(liveRuntimePython(text, () => true)).toBe("C:/r/python.exe");
+  });
+  it("stale pointer (python.exe gone) counts as no runtime, so setup is asked for", () => {
+    expect(liveRuntimePython(text, () => false)).toBeNull();
+  });
+  it("malformed pointer is null without probing the filesystem", () => {
+    expect(liveRuntimePython("nope", () => { throw new Error("should not be called"); })).toBeNull();
   });
 });

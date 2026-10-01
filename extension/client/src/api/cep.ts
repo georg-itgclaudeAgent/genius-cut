@@ -1,6 +1,6 @@
 /** Everything that only exists inside Premiere's CEP runtime. */
 import type { Transport } from "./backend";
-import { backendPaths, parseRuntimePointer } from "../lib/paths";
+import { backendPaths, liveRuntimePython } from "../lib/paths";
 
 declare global {
   interface Window {
@@ -61,7 +61,7 @@ function readRuntimePython(): string | null {
   try {
     const fs = node("fs"), path = node("path");
     const file = path.join(node("process").env.LOCALAPPDATA, "itGenius", "genius-cut", "runtime.json");
-    return fs.existsSync(file) ? parseRuntimePointer(fs.readFileSync(file, "utf8")) : null;
+    return fs.existsSync(file) ? liveRuntimePython(fs.readFileSync(file, "utf8"), (p: string) => fs.existsSync(p)) : null;
   } catch {
     return null;
   }

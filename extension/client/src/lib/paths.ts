@@ -34,3 +34,9 @@ export function parseRuntimePointer(text: string): string | null {
     return null;
   }
 }
+
+/** Like parseRuntimePointer, but a pointer whose python.exe is gone (runtime cleaned up) counts as no runtime. */
+export function liveRuntimePython(text: string, exists: (p: string) => boolean): string | null {
+  const py = parseRuntimePointer(text);
+  return py && exists(py) ? py : null;
+}

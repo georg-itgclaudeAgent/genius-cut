@@ -11,6 +11,15 @@ CORS is configured: a browser page can't reach the API, and the Host check below
 also stops DNS-rebinding tricks.
 """
 
+import os as _os
+import sys as _sys
+
+# Embeddable Python (the shipped runtime) ignores the script's folder: its ._pth file
+# replaces sys.path. Put this folder back so `geniuscut` imports.
+_here = _os.path.dirname(_os.path.abspath(__file__))
+if _here not in _sys.path:
+    _sys.path.insert(0, _here)
+
 import hmac
 import logging
 import threading
@@ -157,6 +166,12 @@ if __name__ == "__main__":
     import uvicorn
 
     logging.basicConfig(level=logging.INFO)
+    if "--selftest" in _sys.argv:
+        from geniuscut.stt import FasterWhisperTranscriber
+        t = FasterWhisperTranscriber()
+        words = t.transcribe(Path(_here) / "tests" / "fixtures" / "speech.wav")
+        print(f"selftest ok: {t.device} {t.model_name} {len(words)} words")
+        _sys.exit(0 if len(words) >= 5 else 1)
     loader = _ModelLoader()
     uvicorn.run(
         create_app(token=config.get_or_create_token(), stt_device=loader.device,

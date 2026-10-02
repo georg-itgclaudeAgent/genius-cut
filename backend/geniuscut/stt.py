@@ -16,7 +16,23 @@ from typing import Callable, Protocol
 
 from geniuscut.models import Word
 
-DEFAULT_MODEL = os.environ.get("GENIUSCUT_WHISPER_MODEL", "large-v3")
+
+def model_for(device: str) -> str:
+    """large-v3 on CUDA (keeps the most fillers); turbo on CPU (2.8x faster, half the disk)."""
+    override = os.environ.get("GENIUSCUT_WHISPER_MODEL")
+    if override:
+        return override
+    return "large-v3" if device == "cuda" else "large-v3-turbo"
+
+
+# Whisper tidies "um"/"uh" out of transcripts unless shown disfluent speech first, and the
+# cut proposer can't remove a filler it never sees. On a real 2-minute clip this took the
+# um/uh count from 0 to 11 with the same words otherwise. Set GENIUSCUT_VERBATIM=0 to disable.
+VERBATIM_PROMPT = "Umm, so, uh, let me think. Like, hmm... Okay, so, um, here's what I'm, uh, I'm thinking."
+
+
+def _verbatim() -> bool:
+    return os.environ.get("GENIUSCUT_VERBATIM", "1") != "0"
 _REQUIRED_DLLS = ("cudart64_12.dll", "cublas64_12.dll", "cudnn64_9.dll", "cudnn_ops64_9.dll")
 
 
@@ -79,19 +95,20 @@ class FasterWhisperTranscriber:
 
     def __init__(
         self,
-        model_name: str = DEFAULT_MODEL,
+        model_name: str | None = None,
         model_factory: Callable = _whisper_model,
         cuda_ready: Callable[[], bool] = cuda_runtime_available,
         warm_up: bool = True,
     ):
-        self.model_name = model_name
         self._factory = model_factory
+        self._explicit = model_name
         self.cuda_error: str | None = None
         self.device = "cpu"
         self._model = None
         if cuda_ready():
             try:
-                self._model = model_factory(model_name, device="cuda", compute_type="float16")
+                self.model_name = model_name or model_for("cuda")
+                self._model = model_factory(self.model_name, device="cuda", compute_type="float16")
                 if warm_up:
                     self._warm_up()
                 self.device = "cuda"
@@ -101,7 +118,8 @@ class FasterWhisperTranscriber:
         else:
             self.cuda_error = "CUDA 12 / cuDNN 9 runtime not available"
         if self._model is None:
-            self._model = model_factory(model_name, device="cpu", compute_type="int8")
+            self.model_name = model_name or model_for("cpu")
+            self._model = model_factory(self.model_name, device="cpu", compute_type="int8")
 
     def _warm_up(self) -> None:
         import numpy as np
@@ -120,12 +138,14 @@ class FasterWhisperTranscriber:
                 raise
             # e.g. out of GPU memory while Premiere is using the same card.
             self.cuda_error = str(e)
+            self.model_name = self._explicit or model_for("cpu")
             self._model = self._factory(self.model_name, device="cpu", compute_type="int8")
             self.device = "cpu"
             return self._words(samples)
 
     def _words(self, samples) -> list[Word]:
-        segments, _ = self._model.transcribe(samples, word_timestamps=True, vad_filter=True)
+        extra = {"initial_prompt": VERBATIM_PROMPT} if _verbatim() else {}
+        segments, _ = self._model.transcribe(samples, word_timestamps=True, vad_filter=True, **extra)
         words: list[Word] = []
         for seg in segments:
             for w in seg.words or []:

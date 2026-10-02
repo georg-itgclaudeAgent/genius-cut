@@ -32,7 +32,9 @@ def fake_extract(media_path, in_s, out_s, out_dir=None):
     return out
 
 
-REQ = TrimRequest(media_path="C:/footage/take3.mp4", in_s=10.0, out_s=14.0, clip_start_s=100.0, prompt="trim it")
+# These tests are about Claude's cuts and the clock mapping; pause cuts are tested separately.
+REQ = TrimRequest(media_path="C:/footage/take3.mp4", in_s=10.0, out_s=14.0, clip_start_s=100.0, prompt="trim it",
+                  cut_pauses=False)
 
 
 def run(tmp_path, cuts=CUTS):
@@ -124,3 +126,33 @@ def test_missing_api_key_is_a_clear_error_not_a_500(tmp_path):
     r = TestClient(app, base_url="http://127.0.0.1:8791").post("/trim", json=REQ.model_dump(), headers={"Authorization": f"Bearer {token}"})
     assert r.status_code == 503
     assert "ANTHROPIC_API_KEY" in r.json()["detail"]
+
+
+# ── pause cuts ─────────────────────────────────────────────────────
+
+PAUSEY = [Word(w="So", start=0.1, end=0.4), Word(w="right.", start=0.5, end=0.9),
+          Word(w="Anyway", start=3.3, end=3.8)]
+
+
+class PauseyTranscriber(FakeTranscriber):
+    def transcribe(self, wav):
+        return PAUSEY
+
+
+def test_trim_adds_pause_cuts_alongside_claudes(tmp_path):
+    r = trim.run_trim(TrimRequest(**{**REQ.model_dump(), "cut_pauses": True}), PauseyTranscriber(), tmp_path,
+                      propose=lambda w, f, i: [], extract=fake_extract)
+    assert [(c.start, c.end, c.reason) for c in r.cuts] == [(1.15, 3.05, "pause")]
+    assert [(s.start, s.end) for s in r.kept_spans_source][-1] == (13.05, 14.0)
+
+
+def test_trim_can_switch_pause_cuts_off(tmp_path):
+    req = TrimRequest(**{**REQ.model_dump(), "cut_pauses": False})
+    r = trim.run_trim(req, PauseyTranscriber(), tmp_path, propose=lambda w, f, i: [], extract=fake_extract)
+    assert r.cuts == []
+
+
+def test_a_minimum_pause_too_short_for_breathing_room_is_a_422(tmp_path):
+    c, auth = api(tmp_path, FakeTranscriber())
+    r = c.post("/trim", json={**REQ.model_dump(), "cut_pauses": True, "min_pause_s": 0.3}, headers=auth)
+    assert r.status_code == 422

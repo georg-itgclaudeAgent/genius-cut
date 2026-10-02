@@ -28,7 +28,7 @@ def fake_extract(media_path, in_s, out_s, out_dir=None):
     return out
 
 
-REQ = dict(media_path="C:/f/take.mp4", in_s=10.0, out_s=12.0, clip_start_s=0.0)
+REQ = dict(media_path="C:/f/take.mp4", in_s=10.0, out_s=12.0, clip_start_s=0.0, cut_pauses=False)
 
 
 def app(tmp_path, *, transcriber=lambda: FakeTranscriber(), propose=lambda w, f, i: [], **kw):

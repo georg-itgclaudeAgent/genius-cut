@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { keptSpansSource, reviewSummary } from "./review";
 import { parseClipName } from "./prompt";
 import { formatTimecode, formatDuration } from "./timecode";
-import { backendPaths } from "./paths";
+import { backendPaths, parseRuntimePointer, liveRuntimePython } from "./paths";
 import { ensureBackend } from "./lifecycle";
 import type { Health, SequenceCut } from "../api/types";
 
@@ -77,7 +77,7 @@ describe("timecode", () => {
 
 describe("backendPaths", () => {
   it("dev layout: backend sits next to the extension folder", () => {
-    const p = backendPaths("C:/src/genius-cut/extension", (x) => x === "C:/src/genius-cut/backend/server.py");
+    const p = backendPaths("C:/src/genius-cut/extension", (x) => x === "C:/src/genius-cut/backend/server.py", undefined);
     expect(p).toEqual({
       python: "C:/src/genius-cut/backend/.venv/Scripts/python.exe",
       server: "C:/src/genius-cut/backend/server.py",
@@ -86,11 +86,40 @@ describe("backendPaths", () => {
   });
   it("installed layout: backend bundled inside the extension", () => {
     const p = backendPaths("C:/Users/x/AppData/Roaming/Adobe/CEP/extensions/com.attract.genius-cut",
-      (x) => x.endsWith("com.attract.genius-cut/backend/server.py"));
-    expect(p?.server).toBe("C:/Users/x/AppData/Roaming/Adobe/CEP/extensions/com.attract.genius-cut/backend/server.py");
+      (x) => x.endsWith("com.attract.genius-cut/backend/server.py"), undefined);
+    expect(p).toMatchObject({ server: "C:/Users/x/AppData/Roaming/Adobe/CEP/extensions/com.attract.genius-cut/backend/server.py" });
   });
   it("no backend anywhere → null", () => {
-    expect(backendPaths("C:/nowhere/extension", () => false)).toBeNull();
+    expect(backendPaths("C:/nowhere/extension", () => false, undefined)).toBeNull();
+  });
+  it("installed layout with the runtime: python comes from runtime.json", () => {
+    const root = "C:/Users/x/AppData/Roaming/Adobe/CEP/extensions/com.attract.genius-cut";
+    const py = "C:/Users/x/AppData/Local/itGenius/genius-cut/runtime/1.0.0/python.exe";
+    expect(backendPaths(root, (p) => p.endsWith("/backend/server.py"), py)).toEqual({
+      python: py, server: `${root}/backend/server.py`, cwd: `${root}/backend`,
+    });
+  });
+  it("installed layout without a runtime asks for setup instead of guessing a venv", () => {
+    const root = "C:/Users/x/AppData/Roaming/Adobe/CEP/extensions/com.attract.genius-cut";
+    expect(backendPaths(root, (p) => p.endsWith("/backend/server.py"), null)).toEqual({ needsSetup: true });
+  });
+  it("dev layout ignores the runtime pointer", () => {
+    expect(backendPaths("C:/src/genius-cut/extension", (x) => x === "C:/src/genius-cut/backend/server.py", null))
+      .toEqual({
+        python: "C:/src/genius-cut/backend/.venv/Scripts/python.exe",
+        server: "C:/src/genius-cut/backend/server.py",
+        cwd: "C:/src/genius-cut/backend",
+      });
+  });
+});
+
+describe("parseRuntimePointer", () => {
+  it("returns the python path", () => {
+    expect(parseRuntimePointer('{"version":"1.0.0","flavour":"cpu","python":"C:\\\\r\\\\python.exe"}')).toBe("C:\\r\\python.exe");
+  });
+  it("treats malformed, empty or python-less files as no runtime", () => {
+    for (const t of ["", "not json", "null", "[]", '{"version":"1"}', '{"python":5}', '{"python":""}'])
+      expect(parseRuntimePointer(t)).toBeNull();
   });
 });
 
@@ -129,11 +158,32 @@ describe("ensureBackend", () => {
     });
     expect(r).toEqual({ kind: "failed", message: expect.stringContaining("python.exe not found") });
   });
+  it("a setup-needed spawn error surfaces its exact message", async () => {
+    const msg = "Genius Cut needs a one-time setup. Open Genius Installer Manager and click Finish setup.";
+    const r = await ensureBackend({
+      health: async () => { throw new Error("ECONNREFUSED"); },
+      spawn: () => { throw Object.assign(new Error(msg), { needsSetup: true }); }, sleep: async () => {},
+    });
+    expect(r).toEqual({ kind: "failed", message: msg });
+  });
   it("a load error from /health is a failure, not a spinner", async () => {
     const r = await ensureBackend({
       health: async (): Promise<Health> => ({ status: "error", version: "0.1.0", stt_device: "failed", error: "disk full" }),
       spawn: () => {}, sleep: async () => {},
     });
     expect(r).toEqual({ kind: "failed", message: expect.stringContaining("disk full") });
+  });
+});
+
+describe("liveRuntimePython", () => {
+  const text = '{"python":"C:/r/python.exe"}';
+  it("returns python when the file exists", () => {
+    expect(liveRuntimePython(text, () => true)).toBe("C:/r/python.exe");
+  });
+  it("stale pointer (python.exe gone) counts as no runtime, so setup is asked for", () => {
+    expect(liveRuntimePython(text, () => false)).toBeNull();
+  });
+  it("malformed pointer is null without probing the filesystem", () => {
+    expect(liveRuntimePython("nope", () => { throw new Error("should not be called"); })).toBeNull();
   });
 });

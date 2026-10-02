@@ -45,8 +45,20 @@ class ClipRef(BaseModel):
         return self
 
 
+PAUSE_KEEP_S = 0.25  # breathing room left next to speech when a pause is cut
+
+
 class TrimRequest(ClipRef):
     prompt: str = ""
+    cut_pauses: bool = True
+    min_pause_s: float = Field(default=1.0, le=30, allow_inf_nan=False,
+                               description="Silences at least this long become pause cuts")
+
+    @model_validator(mode="after")
+    def _pause_leaves_breathing_room(self):
+        if self.cut_pauses and self.min_pause_s <= 2 * PAUSE_KEEP_S:
+            raise ValueError(f"min_pause_s must be over {2 * PAUSE_KEEP_S}s, or pause cuts would clip speech")
+        return self
 
 
 class SequenceCut(CutSpan):

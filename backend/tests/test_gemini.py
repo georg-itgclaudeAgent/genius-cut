@@ -260,6 +260,35 @@ def test_a_cut_off_reply_is_still_billed():
     assert m.output_tokens == 16000
 
 
+@pytest.mark.parametrize("bad", ["gemini-3.7-flash-preview", "models/gemini-3.7-flash", "gemini-3.7-flsh"])
+def test_an_unpriced_gemini_model_is_refused_before_any_http_call(monkeypatch, bad):
+    monkeypatch.setenv("GENIUSCUT_GEMINI_MODEL", bad)
+    t = Transport()
+    with pytest.raises(llm.LLMError) as e:
+        gemini.ask_json("hi", {}, client=t)
+    assert t.calls == []
+    assert str(e.value) == (f"No price is known for Gemini model '{bad}', so the monthly limit can't be enforced. "
+                            f"Use one of: {', '.join(sorted(spend.PRICES))}.")
+
+
+def test_a_non_json_200_body_is_an_llm_error(monkeypatch):
+    class Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(gemini.urllib.request, "urlopen", lambda request, timeout: Resp(b"<html>proxy page</html>"))
+    with pytest.raises(llm.LLMError, match=r"^Gemini returned an unreadable response\.$"):
+        gemini.ask_json("hi", {})
+
+
+def test_a_non_object_body_from_the_transport_is_an_llm_error():
+    with pytest.raises(llm.LLMError, match=r"^Gemini returned an unreadable response\.$"):
+        gemini.ask_json("hi", {}, client=Transport(body=["not", "an", "object"]))
+
+
 def test_budget_gate_blocks_before_any_http_call(monkeypatch):
     monkeypatch.setenv("GENIUSCUT_MONTHLY_LIMIT_USD", "0.01")
     t = Transport()

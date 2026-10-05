@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import os
+import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -135,6 +136,12 @@ def meter(kind: str = "other"):
 
 # ── ledger ─────────────────────────────────────────────────────────
 
+# Calls whose ledger row couldn't be written, as (UTC time, usd): still counted by
+# month_total for the life of this process, so a failing disk can't switch the gate off.
+_unwritten: list[tuple[datetime, float]] = []
+_unwritten_lock = threading.Lock()
+
+
 def ledger_path():
     return config.data_dir() / "spend.jsonl"
 
@@ -156,30 +163,47 @@ def record(model: str, input_tokens: int, output_tokens: int, *, now: datetime |
             f.write(json.dumps(row) + "\n")
     except OSError as e:  # the call already happened; losing a ledger row must not lose the result
         log.warning("Couldn't write the AI spend ledger: %s", e)
+        if usd:
+            with _unwritten_lock:
+                _unwritten.append((now.astimezone(timezone.utc), usd))
     return usd
 
 
-def month_total(now: datetime | None = None) -> float:
-    """Sum of `usd` for the current calendar month in UTC. Unpriced rows count 0."""
-    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    try:
-        lines = ledger_path().read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
+def _usd(value) -> float:
+    """A row's cost: missing/null is 0; anything but a finite number ≥ 0 is corrupt."""
+    if value is None:
         return 0.0
-    total = 0.0
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        raise ValueError(f"usd is {value!r}")
+    return float(value)
+
+
+def month_total(now: datetime | None = None) -> float:
+    """Sum of `usd` for the current calendar month in UTC, plus any calls this process
+    couldn't write to the ledger. Unpriced rows count 0.
+
+    Read as bytes and decoded line by line: one bad byte, NaN, Infinity or negative cost
+    skips that line only, so a damaged ledger neither fails runs nor switches the gate off.
+    """
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    this_month = (now.year, now.month)
+    with _unwritten_lock:
+        total = sum(usd for ts, usd in _unwritten if (ts.year, ts.month) == this_month)
+    try:
+        lines = ledger_path().read_bytes().splitlines()
+    except FileNotFoundError:
+        return total
     for line in lines:
         try:
-            row = json.loads(line)
+            row = json.loads(line.decode("utf-8"))
             ts = datetime.fromisoformat(row["ts"])
             ts = (ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
-            usd = row.get("usd") or 0
-            if isinstance(usd, bool) or not isinstance(usd, (int, float)):
-                raise ValueError(f"usd is {usd!r}")
-        except (ValueError, TypeError, KeyError, AttributeError) as e:
+            usd = _usd(row.get("usd"))
+        except (ValueError, TypeError, KeyError, AttributeError) as e:  # UnicodeDecodeError is a ValueError
             if line.strip():
                 log.warning("Skipping a corrupt spend ledger line: %s", e)
             continue
-        if (ts.year, ts.month) == (now.year, now.month):
+        if (ts.year, ts.month) == this_month:
             total += usd
     return total
 
@@ -198,7 +222,7 @@ def check_budget(model: str, text: str, max_tokens: int, *, now: datetime | None
 
     Worst case: the whole prompt plus a reply that uses every one of `max_tokens`. The prompt
     is estimated at 1.5 characters per token: the transcript is one index-numbered word per
-    line, which tokenizes poorly (measured 2026-10-05: 19,197 characters were 12,053 tokens).
+    line, which tokenises poorly (measured 2026-10-05: 19,197 characters were 12,053 tokens).
     """
     worst = cost_usd(model, math.ceil(len(text) / CHARS_PER_TOKEN), max_tokens,
                      on=(now or datetime.now(timezone.utc)).astimezone(timezone.utc).date())
@@ -227,7 +251,7 @@ def estimate_per_minute(model: str, on: date | None = None) -> float | None:
     Calibrated on a live run, 2026-10-05, gemini-3.7-flash, thinking "low": a 10:47 clip of
     1,560 words was 12,053 input and 2,661 output tokens, $0.019. Hence:
     - 160 spoken words per minute;
-    - input: 7.7 tokens per word (the numbered transcript, one word per line, tokenizes
+    - input: 7.7 tokens per word (the numbered transcript, one word per line, tokenises
       poorly) plus 400 fixed tokens per run (system prompt, instructions), amortised over
       a 10-minute clip;
     - output: 1.7 tokens per word, for the JSON ranges and the model's thinking (billed as

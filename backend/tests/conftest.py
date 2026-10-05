@@ -15,6 +15,15 @@ def _isolated_data_dir(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_unwritten_spend():
+    """The in-memory total of ledger rows that couldn't be written is process-wide."""
+    from geniuscut import spend
+    spend._unwritten.clear()
+    yield
+    spend._unwritten.clear()
+
+
+@pytest.fixture(autouse=True)
 def _no_network(monkeypatch):
     """A test that forgets to inject a transport fails here instead of making a paid call."""
     import urllib.request

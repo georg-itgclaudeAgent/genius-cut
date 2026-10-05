@@ -78,6 +78,9 @@ def _usage(response: dict) -> tuple[int, int]:
 def _call(prompt: str, *, system: str | None, client, effort: str, max_tokens: int,
           schema: dict | None) -> str:
     name = model()
+    if spend.price(name) is None:  # an unpriced model would skip the gate: unlimited spend
+        raise LLMError(f"No price is known for Gemini model '{name}', so the monthly limit can't be "
+                       f"enforced. Use one of: {', '.join(sorted(spend.PRICES))}.")
     spend.check_budget(name, (system or "") + prompt, max_tokens)
     config = {"maxOutputTokens": max_tokens}
     if schema is not None:
@@ -96,6 +99,10 @@ def _call(prompt: str, *, system: str | None, client, effort: str, max_tokens: i
         raise _http_error(e, key) from None  # `from None`: the request (and its key header) stays out of tracebacks
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         raise LLMError("Couldn't reach the Gemini API. Check the internet connection.") from e
+    except ValueError as e:  # a 200 that isn't JSON (a proxy page, a truncated body)
+        raise LLMError("Gemini returned an unreadable response.") from e
+    if not isinstance(response, dict):
+        raise LLMError("Gemini returned an unreadable response.")
 
     spend.record(name, *_usage(response))
     block = (response.get("promptFeedback") or {}).get("blockReason")

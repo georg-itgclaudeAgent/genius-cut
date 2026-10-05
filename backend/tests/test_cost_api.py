@@ -220,6 +220,19 @@ def test_an_unreadable_ledger_never_fails_health(tmp_path, monkeypatch):
     assert r.json()["ai"]["month_usd"] is None
 
 
+def test_a_corrupt_ledger_never_fails_health_or_a_paid_trim(tmp_path):
+    path = spend.ledger_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b'\xff\xfe garbage\n{"ts": "2026-10-01T00:00:00+00:00", "usd": NaN}\n'
+                     b'{"ts": "2026-10-01T00:00:00+00:00", "usd": Infinity}\n')
+    c, auth = app(tmp_path)
+    h = c.get("/health")
+    assert h.status_code == 200 and h.json()["ai"]["month_usd"] == 0
+    r = c.post("/trim", json=REQ, headers=auth)
+    assert r.status_code == 200, r.text
+    assert r.json()["cost"]["month_usd"] == pytest.approx(0.30)
+
+
 def test_an_unknown_provider_never_fails_health(tmp_path, monkeypatch):
     monkeypatch.setenv("GENIUSCUT_LLM_PROVIDER", "bedrock")
     c, _ = app(tmp_path)

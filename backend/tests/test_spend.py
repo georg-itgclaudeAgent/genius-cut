@@ -1,6 +1,7 @@
 """Per-call cost, the monthly ledger and the budget gate."""
 
 import json
+import math
 from datetime import date, datetime, timezone
 
 import pytest
@@ -90,6 +91,59 @@ def test_corrupt_ledger_lines_are_skipped():
         "[1, 2]", "", json.dumps(good),
     ]) + "\n", encoding="utf-8")
     assert spend.month_total(now=datetime(2026, 10, 9, tzinfo=UTC)) == pytest.approx(0.50)
+
+
+GOOD_ROW = {"ts": "2026-10-05T01:00:00+00:00", "model": "gemini-3.7-flash", "kind": "trim",
+            "input_tokens": 1, "output_tokens": 1, "usd": 0.25}
+OCT = datetime(2026, 10, 9, tzinfo=UTC)
+
+
+def _write_ledger(raw: bytes):
+    path = spend.ledger_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(raw)
+
+
+def test_an_invalid_utf8_line_is_skipped_not_fatal():
+    good = json.dumps(GOOD_ROW).encode()
+    _write_ledger(good + b"\n" + b'{"ts": "2026-10-05T02:00:00+00:00", "usd": 0.5, "model": "\xff\xfe"}\n'
+                  + b"\xff\n" + good + b"\n")
+    assert spend.month_total(now=OCT) == pytest.approx(0.50)
+
+
+@pytest.mark.parametrize("bad", ["NaN", "Infinity", "-Infinity", "-0.5", "1e400"])
+def test_non_finite_or_negative_usd_rows_are_skipped(bad):
+    good = json.dumps(GOOD_ROW)
+    _write_ledger(f'{good}\n{{"ts": "2026-10-05T03:00:00+00:00", "usd": {bad}}}\n{good}\n'.encode())
+    total = spend.month_total(now=OCT)
+    assert math.isfinite(total) and total == pytest.approx(0.50)
+
+
+def test_a_nan_row_does_not_switch_the_gate_off(monkeypatch):
+    monkeypatch.setenv("GENIUSCUT_MONTHLY_LIMIT_USD", "0.5")
+    _write_ledger((json.dumps(GOOD_ROW) + '\n{"ts": "2026-10-05T03:00:00+00:00", "usd": NaN}\n'
+                   + json.dumps(GOOD_ROW) + "\n").encode())
+    with pytest.raises(spend.BudgetExceeded):
+        spend.check_budget("gemini-3.7-flash", "hi", 16000, now=OCT)
+
+
+def test_an_infinity_row_does_not_block_every_run():
+    _write_ledger(b'{"ts": "2026-10-05T03:00:00+00:00", "usd": Infinity}\n\xff\n')
+    spend.check_budget("gemini-3.7-flash", "hi", 16000, now=OCT)
+
+
+def test_a_failed_ledger_write_still_counts_towards_the_month(monkeypatch, tmp_path):
+    blocker = tmp_path / "blocker"
+    blocker.write_text("a file, not a folder")
+    monkeypatch.setenv("GENIUSCUT_DATA_DIR", str(blocker / "data"))
+    spend.record("gemini-2.5-flash-lite", 1_000_000, 0, now=datetime(2026, 10, 5, tzinfo=UTC))   # $0.10, unwritten
+    spend.record("gemini-2.5-flash-lite", 1_000_000, 0, now=datetime(2026, 9, 5, tzinfo=UTC))    # last month
+    spend.record("claude-opus-5-5", 5, 5, now=datetime(2026, 10, 5, tzinfo=UTC))                 # unpriced
+    monkeypatch.setenv("GENIUSCUT_DATA_DIR", str(tmp_path / "elsewhere"))  # the ledger is readable again
+    assert spend.month_total(now=OCT) == pytest.approx(0.10)
+    monkeypatch.setenv("GENIUSCUT_MONTHLY_LIMIT_USD", "0.12")
+    with pytest.raises(spend.BudgetExceeded):
+        spend.check_budget("gemini-3.7-flash", "hi", 16000, now=OCT)
 
 
 def test_no_ledger_yet_means_nothing_spent():

@@ -11,7 +11,7 @@ import tempfile
 from pathlib import Path
 from typing import Callable
 
-from geniuscut import audio, cuts, library, pauses
+from geniuscut import audio, cuts, library, llm, pauses, spend
 from geniuscut.models import PAUSE_KEEP_S, CutSpan, SequenceCut, Span, TrimRequest, TrimResponse
 from geniuscut.stt import Transcriber
 
@@ -54,7 +54,8 @@ def run_trim(
     finally:
         shutil.rmtree(work, ignore_errors=True)
     duration = req.out_s - req.in_s
-    cut_spans = propose(words, library.build_fewshot(library_dir), req.prompt)
+    with spend.meter(kind="trim") as m:
+        cut_spans = propose(words, library.build_fewshot(library_dir), req.prompt)
     if req.cut_pauses:
         cut_spans = pauses.merge_cuts(cut_spans, pauses.find_pauses(words, duration, req.min_pause_s, PAUSE_KEEP_S))
     kept = kept_spans(cut_spans, duration)
@@ -75,4 +76,5 @@ def run_trim(
         stt_device=transcriber.device,
         cut_fraction=round(cut_fraction, 4),
         warning=warning,
+        cost=llm.run_cost(m),
     )

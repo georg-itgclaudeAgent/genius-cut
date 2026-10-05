@@ -30,6 +30,12 @@ class FakeClient:
         return self._response
 
 
+@pytest.fixture(autouse=True)
+def _claude(monkeypatch):
+    """These tests drive Claude through a fake Anthropic client; Gemini has its own tests."""
+    monkeypatch.setenv("GENIUSCUT_LLM_PROVIDER", "anthropic")
+
+
 # ── claude.ask_json ────────────────────────────────────────────────
 
 def test_ask_json_sends_schema_effort_and_fallbacks():

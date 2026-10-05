@@ -1,13 +1,13 @@
-"""Claude proposes which words to cut, in the editor's style.
+"""The AI (Gemini by default, see `llm.py`) proposes which words to cut, in the editor's style.
 
-Claude returns inclusive *word index* ranges, never timecodes. It's reliable at indices
+The model returns inclusive *word index* ranges, never timecodes. It's reliable at indices
 and unreliable at arithmetic on times, so indices are resolved to times here, and any
 range that is out of bounds, backwards or overlapping is dropped rather than applied.
 """
 
 import logging
 
-from geniuscut import claude
+from geniuscut import llm
 from geniuscut.library import FewShot
 from geniuscut.models import CutSpan, Word
 
@@ -92,7 +92,7 @@ def validate_ranges(raw: list[dict], n_words: int) -> list[tuple[int, int, str]]
 def propose_cuts(words: list[Word], fewshot: FewShot, instruction: str = "", client=None) -> list[CutSpan]:
     if not words:
         return []
-    reply = claude.ask_json(build_prompt(words, fewshot, instruction), SCHEMA, system=SYSTEM, client=client)
+    reply = llm.ask_json(build_prompt(words, fewshot, instruction), SCHEMA, system=SYSTEM, client=client)
     ranges = validate_ranges(reply.get("cuts", []), len(words))
     return [
         CutSpan(start=words[s].start, end=words[e].end,

@@ -9,6 +9,10 @@ is reported as `status: "error"` and retried on the next `/trim`.
 The panel calls this through Node's `http` module (CEP `--enable-nodejs`), so no
 CORS is configured: a browser page can't reach the API, and the Host check below
 also stops DNS-rebinding tricks.
+
+AI errors: a missing key is 503, the monthly spend limit (`spend.BudgetExceeded`) is
+402, and any other provider error is 502. `/health` reports the AI provider, model and
+the month's spend so far, never a key.
 """
 
 import os as _os
@@ -30,12 +34,29 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel
 
-from geniuscut import audio, claude, config, cuts, library, secrets, trim
+from geniuscut import audio, config, cuts, library, llm, secrets, spend, trim
+from geniuscut.llm import LLMError
 from geniuscut.models import StyleExample, TrimRequest, TrimResponse, Word
 
 log = logging.getLogger("geniuscut")
 
 LOOPBACK_HOSTS = ["127.0.0.1", "localhost"]
+
+
+def ai_status() -> dict:
+    """The `/health` ai block. Never raises: a bad setting or ledger shows as nulls."""
+    try:
+        provider, model = llm.provider(), llm.model()
+    except LLMError:
+        provider, model = "unknown", None
+    try:
+        month_usd = round(spend.month_total(), 6)
+    except Exception:  # noqa: BLE001 — health must answer even if the ledger can't be read
+        log.exception("Couldn't read the AI spend ledger")
+        month_usd = None
+    per_minute = spend.estimate_per_minute(model) if model else None
+    return {"provider": provider, "model": model, "month_usd": month_usd, "limit_usd": spend.limit_usd(),
+            "usd_per_minute": per_minute}
 
 
 class NewExample(BaseModel):
@@ -51,10 +72,11 @@ def create_app(
     library_dir: Path | None = None,
     propose: Callable = cuts.propose_cuts,
     extract: Callable = audio.extract_span,
-    llm: Callable[[str], str] = claude.ask_text,
+    llm: Callable[[str], str] = llm.ask_text,
     load_error: Callable[[], str | None] = lambda: None,
     retry_load: Callable[[], None] = lambda: None,
 ) -> FastAPI:
+    llm_cost = globals()["llm"].run_cost  # the `llm` parameter shadows the module in here
     app = FastAPI(title="Genius Cut backend", version=config.VERSION)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=LOOPBACK_HOSTS)
     lib_dir = Path(library_dir) if library_dir else config.data_dir() / "library"
@@ -66,16 +88,18 @@ def create_app(
 
     auth = [Depends(require_token)]
 
-    def claude_errors(e: Exception) -> HTTPException | None:
+    def ai_errors(e: Exception) -> HTTPException | None:
         if isinstance(e, secrets.MissingKeyError):
             return HTTPException(status_code=503, detail=str(e))
-        if isinstance(e, claude.ClaudeError):
+        if isinstance(e, spend.BudgetExceeded):
+            return HTTPException(status_code=402, detail=str(e))
+        if isinstance(e, LLMError):
             return HTTPException(status_code=502, detail=str(e))
         return None
 
     @app.get("/health")
     def health() -> dict:
-        body = {"status": "ok", "version": config.VERSION, "stt_device": stt_device()}
+        body = {"status": "ok", "version": config.VERSION, "stt_device": stt_device(), "ai": ai_status()}
         err = load_error()
         if err:
             body.update(status="error", error=f"The speech model failed to load: {err}")
@@ -96,8 +120,8 @@ def create_app(
             return trim.run_trim(req, t, lib_dir, propose=propose, extract=extract)
         except (trim.TrimRefused, audio.FfmpegError, ValueError) as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
-        except (secrets.MissingKeyError, claude.ClaudeError) as e:
-            raise claude_errors(e) from e
+        except (secrets.MissingKeyError, LLMError) as e:
+            raise ai_errors(e) from e
 
     @app.post("/reload", dependencies=auth, status_code=202)
     def post_reload() -> dict:
@@ -116,11 +140,13 @@ def create_app(
     @app.post("/library/summarize", dependencies=auth)
     def post_summarize() -> dict:
         try:
-            return {"summary": library.regenerate_summary(lib_dir, llm)}
+            with spend.meter(kind="summary") as m:
+                summary = library.regenerate_summary(lib_dir, llm)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
-        except (secrets.MissingKeyError, claude.ClaudeError) as e:
-            raise claude_errors(e) from e
+        except (secrets.MissingKeyError, LLMError) as e:
+            raise ai_errors(e) from e
+        return {"summary": summary, "cost": llm_cost(m).model_dump()}
 
     return app
 

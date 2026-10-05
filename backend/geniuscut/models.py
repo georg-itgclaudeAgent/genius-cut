@@ -68,6 +68,17 @@ class SequenceCut(CutSpan):
     end_seq_s: float
 
 
+class RunCost(BaseModel):
+    """What one run's AI calls cost, and where the month stands afterwards. USD throughout."""
+
+    model: str
+    input_tokens: int
+    output_tokens: int
+    usd: float | None = Field(description="None when the model has no price (Claude)")
+    month_usd: float
+    limit_usd: float
+
+
 class TrimResponse(BaseModel):
     words: list[Word]
     cuts: list[SequenceCut]
@@ -75,6 +86,7 @@ class TrimResponse(BaseModel):
     stt_device: str
     cut_fraction: float = 0.0
     warning: str | None = None
+    cost: RunCost | None = None
 
 
 class RemovedSpan(BaseModel):

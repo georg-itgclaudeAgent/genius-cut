@@ -1,7 +1,8 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { runtime } from "../api/runtime";
 import { HostUnavailable, type ApplyResult } from "../api/host";
-import type { ClipInfo, Health, RunCost, TrimResponse } from "../api/types";
+import type { AiStatus, ClipInfo, Health, TrimResponse } from "../api/types";
+import { afterTrimRefresh, watchAiStatus } from "../lib/aiStatus";
 import { clipProblem } from "../lib/clip";
 import { budgetEstimate } from "../lib/cost";
 import { parseClipName } from "../lib/prompt";
@@ -45,8 +46,15 @@ export function CutTab({ health, ready, onTrimmed }: {
 }) {
   const [instruction, setInstruction] = useState("trim the selected clip");
   const [phase, setPhase] = useState<Phase>({ k: "idle" });
-  // /health is read once at connect; after a run, its own month total is the fresher one.
-  const [lastCost, setLastCost] = useState<RunCost | null>(null);
+  // /health is read once at connect; this re-reads its ai block after every trim attempt
+  // and on focus/visibility, so the month and the limit (the source of truth) stay current.
+  const [freshAi, setFreshAi] = useState<AiStatus | null>(null);
+  const aiWatch = useRef<ReturnType<typeof watchAiStatus> | null>(null);
+  useEffect(() => {
+    const w = watchAiStatus({ fetchHealth: runtime.backend.health, onAi: setFreshAi, win: window, doc: document });
+    aiWatch.current = w;
+    return () => { w.stop(); aiWatch.current = null; };
+  }, []);
   // Bumped on every phase change we start; a host call that returns after the user
   // has moved on (Done, Analyse again) must not resurrect the old phase.
   const epoch = useRef(0);
@@ -66,11 +74,11 @@ export function CutTab({ health, ready, onTrimmed }: {
     }
     setPhase({ k: "analysing", clip: found });
     try {
-      const res = await runtime.backend.trim({
+      // The refresh isn't awaited: the review shouldn't wait on /health.
+      const res = await afterTrimRefresh(() => runtime.backend.trim({
         media_path: found.mediaPath, in_s: found.inS, out_s: found.outS, clip_start_s: found.startS, prompt: instruction,
-      });
+      }), async () => { aiWatch.current?.refresh(); });
       const checked = res.cuts.map(() => true);
-      if (res.cost) setLastCost(res.cost);
       setPhase({ k: "review", clip: found, res, checked });
       onTrimmed(found, res, checked);
     } catch (e) {
@@ -136,8 +144,8 @@ export function CutTab({ health, ready, onTrimmed }: {
   }
 
   const working = phase.k === "finding" || phase.k === "analysing";
-  const ai = health?.ai ? { ...health.ai, limit_usd: lastCost?.limit_usd ?? health.ai.limit_usd } : null;
-  const monthUsd = lastCost ? lastCost.month_usd : ai?.month_usd ?? null;
+  const ai = health?.ai ? freshAi ?? health.ai : null;
+  const monthUsd = ai?.month_usd ?? null;
   const clipS = clip ? clip.outS - clip.inS : null;
   const overLimit = ai ? budgetEstimate(ai, clipS, monthUsd).over : false;
 

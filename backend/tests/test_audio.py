@@ -11,7 +11,7 @@ def five_second_source(tmp_path) -> Path:
     src = tmp_path / "source.mp4"
     subprocess.run(
         [find_tool("ffmpeg"), "-nostdin", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=5",
-         "-f", "lavfi", "-i", "color=c=black:s=320x240:d=5", "-shortest", "-c:v", "libx264", "-c:a", "aac",
+         "-f", "lavfi", "-i", "color=c=black:s=320x240:d=5", "-shortest", "-c:v", "mpeg4", "-c:a", "aac",  # native encoders: the bundled LGPL ffmpeg has no libx264
          str(src)],
         check=True, capture_output=True,
     )
@@ -28,6 +28,16 @@ def test_extracts_exactly_the_requested_span_as_16k_mono(five_second_source, tmp
         check=True, capture_output=True, text=True,
     ).stdout.strip()
     assert info == "16000,1"
+
+
+def test_prefers_the_ffmpeg_bundled_in_the_runtime(tmp_path, monkeypatch):
+    # The shipped runtime carries ffmpeg at <runtime>/ffmpeg/bin; editors have no other copy.
+    bundled = tmp_path / "ffmpeg" / "bin"
+    bundled.mkdir(parents=True)
+    (bundled / "ffprobe.exe").write_bytes(b"")
+    monkeypatch.delenv("GENIUSCUT_FFMPEG_DIR", raising=False)
+    monkeypatch.setattr("sys.prefix", str(tmp_path))
+    assert find_tool("ffprobe") == str(bundled / "ffprobe.exe")
 
 
 def test_missing_source_raises_with_ffmpeg_stderr(tmp_path):

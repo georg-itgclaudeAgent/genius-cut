@@ -8,6 +8,7 @@ import glob
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -17,10 +18,11 @@ class FfmpegError(RuntimeError):
 
 
 def find_tool(name: str) -> str:
-    """`GENIUSCUT_FFMPEG_DIR/<name>.exe`, else PATH, else a winget Gyan.FFmpeg install."""
+    """`GENIUSCUT_FFMPEG_DIR/<name>.exe`, else the copy bundled in the runtime, else PATH,
+    else a winget Gyan.FFmpeg install."""
     override = os.environ.get("GENIUSCUT_FFMPEG_DIR")
-    if override:
-        candidate = Path(override) / f"{name}.exe"
+    for folder in ([Path(override)] if override else []) + [Path(sys.prefix) / "ffmpeg" / "bin"]:
+        candidate = folder / f"{name}.exe"
         if candidate.is_file():
             return str(candidate)
     on_path = shutil.which(name)

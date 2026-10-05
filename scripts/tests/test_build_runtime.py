@@ -63,6 +63,38 @@ def test_copy_msvc_runtime_keeps_the_embeddables_own_vcruntime(tmp_path):
     assert (stage / "msvcp140.dll").read_bytes() == b"sys:msvcp140.dll"
 
 
+def _fake_ffmpeg_zip():
+    import hashlib, io, zipfile
+    buf = io.BytesIO()
+    top = "ffmpeg-n8.1-win64-lgpl-shared-8.1/"
+    with zipfile.ZipFile(buf, "w") as z:
+        for name in ("bin/ffmpeg.exe", "bin/ffprobe.exe", "bin/ffplay.exe", "bin/avcodec-62.dll",
+                     "LICENSE.txt", "include/libavcodec/avcodec.h", "doc/ffmpeg.html"):
+            z.writestr(top + name, name)
+    data = buf.getvalue()
+    return data, hashlib.sha256(data).hexdigest()
+
+
+def test_install_ffmpeg_keeps_only_what_the_backend_runs_plus_the_licence(tmp_path):
+    data, sha = _fake_ffmpeg_zip()
+    br.install_ffmpeg(data, sha, tmp_path)
+    got = sorted(p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*") if p.is_file())
+    assert got == ["ffmpeg/LICENSE.txt", "ffmpeg/bin/avcodec-62.dll", "ffmpeg/bin/ffmpeg.exe", "ffmpeg/bin/ffprobe.exe"]
+
+
+def test_install_ffmpeg_refuses_a_download_that_fails_its_checksum(tmp_path):
+    import pytest
+    data, _ = _fake_ffmpeg_zip()
+    with pytest.raises(SystemExit, match="checksum"):
+        br.install_ffmpeg(data, "0" * 64, tmp_path)
+    assert not (tmp_path / "ffmpeg").exists()
+
+
+def test_ffmpeg_pin_is_an_lgpl_build_with_a_sha256():
+    assert "lgpl" in br.FFMPEG_URL and br.FFMPEG_URL.startswith("https://github.com/BtbN/FFmpeg-Builds/releases/download/")
+    assert len(br.FFMPEG_SHA256) == 64
+
+
 def test_copy_msvc_runtime_fails_when_an_msvcp_dll_is_missing_on_the_build_machine(tmp_path):
     import pytest
     stage = tmp_path / "stage"; stage.mkdir()

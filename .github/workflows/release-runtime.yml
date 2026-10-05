@@ -41,6 +41,8 @@ jobs:
           mkdir rt && cd rt
           python -c "import zipfile,sys;zipfile.ZipFile(sys.argv[1]).extractall('.')" "../dist/genius-cut-runtime-cpu-$VERSION.zip"
           ./python.exe ../backend/server.py --selftest
+          ./python.exe -c "import sys; sys.path.insert(0, '../backend'); from geniuscut.audio import find_tool; import os; t = find_tool('ffmpeg'); print(t); assert os.path.samefile(t, os.path.join(sys.prefix, 'ffmpeg', 'bin', 'ffmpeg.exe'))"
+          ./ffmpeg/bin/ffmpeg.exe -hide_banner -version | head -1
       - name: Smoke-check the cuda runtime loads its own NVIDIA DLLs (no GPU needed)
         env: { VERSION: "${{ steps.ver.outputs.version }}" }
         run: |

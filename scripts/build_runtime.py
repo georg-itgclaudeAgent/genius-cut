@@ -28,6 +28,13 @@ TRIM_FILE = Path(__file__).resolve().parent / "runtime_trim.txt"
 MSVC_RUNTIME_DLLS = ("msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll",
                      "vcruntime140.dll", "vcruntime140_1.dll", "concrt140.dll")
 
+# ffmpeg for audio extraction (editors have none). LGPL shared build of the 8.1 release
+# branch, pinned by checksum. BtbN prunes old autobuilds: if this URL 404s, pick a current
+# `win64-lgpl-shared-<ver>.zip` from github.com/BtbN/FFmpeg-Builds/releases and re-pin both.
+FFMPEG_URL = ("https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-04-20-51/"
+              "ffmpeg-n8.1.3-14-g330caae0c1-win64-lgpl-shared-8.1.zip")
+FFMPEG_SHA256 = "68d53cc84f716c02853e2ea3ff5f1beaea590646cb6831e0a646d22208c97a83"
+
 
 def patch_pth(text: str) -> str:
     """Embeddable Python only searches what its ._pth lists, and skips `site` unless asked."""
@@ -63,6 +70,27 @@ def copy_msvc_runtime(stage: Path, system32: Path) -> None:
             shutil.copy2(src, dst)
 
 
+def install_ffmpeg(data: bytes, expected_sha256: str, stage: Path) -> None:
+    """Unpack ffmpeg.exe, ffprobe.exe, their DLLs and the licence to <stage>/ffmpeg."""
+    if hashlib.sha256(data).hexdigest() != expected_sha256:
+        raise SystemExit("The ffmpeg download failed its checksum; refusing to bundle it.")
+    dest = stage / "ffmpeg"
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        for name in z.namelist():
+            rel = name.split("/", 1)[1] if "/" in name else ""
+            keep = rel == "LICENSE.txt" or rel in ("bin/ffmpeg.exe", "bin/ffprobe.exe") or (
+                rel.startswith("bin/") and rel.endswith(".dll"))
+            if keep:
+                out = dest / rel
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_bytes(z.read(name))
+
+
+def fetch_ffmpeg(stage: Path) -> None:
+    with urllib.request.urlopen(FFMPEG_URL) as r:
+        install_ffmpeg(r.read(), FFMPEG_SHA256, stage)
+
+
 def requirements_for(flavour: str) -> Path:
     return ROOT / "backend" / ("requirements.txt" if flavour == "cuda" else "requirements-runtime.txt")
 
@@ -82,6 +110,7 @@ def build(flavour: str, version: str, out: Path) -> Path:
     stage.mkdir(parents=True)
     fetch_embeddable(stage)
     copy_msvc_runtime(stage, Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32")
+    fetch_ffmpeg(stage)
     site = stage / "Lib" / "site-packages"
     subprocess.run([sys.executable, "-m", "pip", "install", "--no-compile", "--target", str(site),
                     "-r", str(requirements_for(flavour))], check=True)

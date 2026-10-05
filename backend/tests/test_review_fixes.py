@@ -53,7 +53,8 @@ def test_i1_cutting_the_whole_clip_is_refused_not_returned(tmp_path):
 def test_i1_heavy_cuts_come_back_flagged(tmp_path):
     heavy = [CutSpan(start=0.0, end=1.5, text="hello", reason="tangent")]
     r = trim.run_trim(TrimRequest(**REQ), FakeTranscriber(), tmp_path,
-                      propose=lambda w, f, i: heavy, extract=fake_extract)
+                      propose=lambda w, f, i: heavy, extract=fake_extract,
+                      refine=lambda c, w, d, env=None: c)  # the threshold, not edge refinement
     assert r.cut_fraction == pytest.approx(0.75)
     assert r.warning and "75%" in r.warning
 

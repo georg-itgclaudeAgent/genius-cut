@@ -37,8 +37,21 @@ REQ = TrimRequest(media_path="C:/footage/take3.mp4", in_s=10.0, out_s=14.0, clip
                   cut_pauses=False)
 
 
+def as_proposed(cuts, words, duration, env=None):
+    return cuts
+
+
 def run(tmp_path, cuts=CUTS):
-    return trim.run_trim(REQ, FakeTranscriber(), tmp_path, propose=lambda w, f, i: cuts, extract=fake_extract)
+    # Edge refinement (boundaries.refine) is tested on its own; these tests pin the clock mapping.
+    return trim.run_trim(REQ, FakeTranscriber(), tmp_path, propose=lambda w, f, i: cuts, extract=fake_extract,
+                         refine=as_proposed)
+
+
+def test_by_default_proposed_cuts_are_widened_to_the_gap_around_them(tmp_path):
+    # Whisper's filler timings are loose (Checkpoint B): the "um," at 0.5-0.8 owns the gap 0.3-1.0.
+    r = trim.run_trim(REQ, FakeTranscriber(), tmp_path, propose=lambda w, f, i: CUTS[:1], extract=fake_extract)
+    assert [(c.start, c.end) for c in r.cuts] == [(0.35, 0.95)]
+    assert [(s.start, s.end) for s in r.kept_spans_source] == [(10.0, 10.35), (10.95, 14.0)]
 
 
 def test_kept_spans_are_the_complement_of_the_cuts_in_source_time(tmp_path):
@@ -91,7 +104,8 @@ def test_trim_endpoint_returns_words_cuts_and_kept_spans(tmp_path):
     assert r.status_code == 200, r.text
     body = r.json()
     assert len(body["words"]) == 5 and len(body["cuts"]) == 2
-    assert body["kept_spans_source"][0] == {"start": 10.0, "end": 10.5}
+    # "um," (0.5-0.8) is widened to its gap, keeping 0.05 s after "So," (ends 0.3).
+    assert body["kept_spans_source"][0] == {"start": 10.0, "end": 10.35}
 
 
 def test_trim_while_the_model_is_still_loading_is_503(tmp_path):

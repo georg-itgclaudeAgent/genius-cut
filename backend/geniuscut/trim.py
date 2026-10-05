@@ -11,9 +11,9 @@ import tempfile
 from pathlib import Path
 from typing import Callable
 
-from geniuscut import audio, cuts, library, llm, pauses, spend
+from geniuscut import audio, boundaries, cuts, library, llm, pauses, spend
 from geniuscut.models import PAUSE_KEEP_S, CutSpan, SequenceCut, Span, TrimRequest, TrimResponse
-from geniuscut.stt import Transcriber
+from geniuscut.stt import Transcriber, read_wav_16k_mono
 
 
 HEAVY_CUT_FRACTION = 0.5
@@ -46,16 +46,23 @@ def run_trim(
     library_dir: Path,
     propose: Callable = cuts.propose_cuts,
     extract: Callable = audio.extract_span,
+    refine: Callable = boundaries.refine,
 ) -> TrimResponse:
     work = Path(tempfile.mkdtemp(prefix="geniuscut-"))
+    env = None
     try:
         wav = extract(req.media_path, req.in_s, req.out_s, out_dir=work)
         words = transcriber.transcribe(wav)
+        try:
+            env = boundaries.envelope(read_wav_16k_mono(wav))
+        except Exception:  # noqa: BLE001 — edges are then widened without the silence check
+            env = None
     finally:
         shutil.rmtree(work, ignore_errors=True)
     duration = req.out_s - req.in_s
     with spend.meter(kind="trim") as m:
         cut_spans = propose(words, library.build_fewshot(library_dir), req.prompt)
+    cut_spans = refine(cut_spans, words, duration, env=env)
     if req.cut_pauses:
         cut_spans = pauses.merge_cuts(cut_spans, pauses.find_pauses(words, duration, req.min_pause_s, PAUSE_KEEP_S))
     kept = kept_spans(cut_spans, duration)

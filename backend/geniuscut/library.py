@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from geniuscut import spend
 from geniuscut.models import RemovedSpan, StyleExample, Word
 
 log = logging.getLogger(__name__)
@@ -137,6 +138,7 @@ def regenerate_summary(library_dir: Path, llm: Callable[[str], str]) -> str:
         "describe this editor's cutting style: what they remove, what they always keep, and any "
         "patterns in how much they trim. Base every rule on the examples; don't add generic advice."
     )
-    summary = llm(prompt).strip()
+    with spend.tagged("summary"):
+        summary = llm(prompt).strip()
     (Path(library_dir) / SUMMARY_FILE).write_text(summary, encoding="utf-8")
     return summary

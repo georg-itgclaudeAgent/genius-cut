@@ -42,6 +42,9 @@ PRICES: dict[str, list[tuple[date, float, float]]] = {
 }
 
 
+CHARS_PER_TOKEN = 1.5  # prompt-size estimate for the gate, see check_budget
+
+
 class BudgetExceeded(LLMError):
     """This call could take the month past the limit; nothing was sent."""
 
@@ -105,6 +108,18 @@ class Meter:
 
 
 _current: ContextVar[Meter | None] = ContextVar("geniuscut_spend_meter", default=None)
+_kind: ContextVar[str] = ContextVar("geniuscut_spend_kind", default="other")
+
+
+@contextmanager
+def tagged(kind: str):
+    """Ledger rows written inside the block get this `kind`. Doesn't open a meter, so an
+    outer `meter()` still sees the calls; a call that raises was already recorded."""
+    token = _kind.set(kind)
+    try:
+        yield
+    finally:
+        _kind.reset(token)
 
 
 @contextmanager
@@ -112,7 +127,8 @@ def meter(kind: str = "other"):
     m = Meter(kind=kind)
     token = _current.set(m)
     try:
-        yield m
+        with tagged(kind):
+            yield m
     finally:
         _current.reset(token)
 
@@ -131,7 +147,7 @@ def record(model: str, input_tokens: int, output_tokens: int, *, now: datetime |
     if m is not None:
         m.calls.append((model, input_tokens, output_tokens, usd))
     row = {"ts": now.astimezone(timezone.utc).isoformat(timespec="seconds"), "model": model,
-           "kind": m.kind if m else "other", "input_tokens": input_tokens, "output_tokens": output_tokens,
+           "kind": _kind.get(), "input_tokens": input_tokens, "output_tokens": output_tokens,
            "usd": usd}
     try:
         path = ledger_path()
@@ -180,10 +196,11 @@ def limit_usd() -> float:
 def check_budget(model: str, text: str, max_tokens: int, *, now: datetime | None = None) -> None:
     """Raise BudgetExceeded if this call's worst case would take the month past the limit.
 
-    Worst case: the whole prompt (estimated at 3 characters per token, which overestimates
-    English) plus a reply that uses every one of `max_tokens`.
+    Worst case: the whole prompt plus a reply that uses every one of `max_tokens`. The prompt
+    is estimated at 1.5 characters per token: the transcript is one index-numbered word per
+    line, which tokenizes poorly (measured 2026-10-05: 19,197 characters were 12,053 tokens).
     """
-    worst = cost_usd(model, math.ceil(len(text) / 3), max_tokens,
+    worst = cost_usd(model, math.ceil(len(text) / CHARS_PER_TOKEN), max_tokens,
                      on=(now or datetime.now(timezone.utc)).astimezone(timezone.utc).date())
     if worst is None:
         return
@@ -198,25 +215,26 @@ def check_budget(model: str, text: str, max_tokens: int, *, now: datetime | None
 # ── estimate ───────────────────────────────────────────────────────
 
 WORDS_PER_MINUTE = 160
-INPUT_TOKENS_PER_WORD = 4
-FIXED_PROMPT_TOKENS = 700
+INPUT_TOKENS_PER_WORD = 7.7
+FIXED_PROMPT_TOKENS = 400       # per run
 FIXED_AMORTISED_OVER_MIN = 10
-OUTPUT_BASE_TOKENS = 1500
-OUTPUT_TOKENS_PER_WORD = 1.5
+OUTPUT_TOKENS_PER_WORD = 1.7
 
 
 def estimate_per_minute(model: str, on: date | None = None) -> float | None:
     """Rough USD per minute of clip, for the panel's "Est." line. None if unpriced.
 
-    Assumptions (calibrate against real ledger rows later):
+    Calibrated on a live run, 2026-10-05, gemini-3.7-flash, thinking "low": a 10:47 clip of
+    1,560 words was 12,053 input and 2,661 output tokens, $0.019. Hence:
     - 160 spoken words per minute;
-    - input: 4 tokens per word (the numbered transcript, one word per line) plus the
-      700-token system prompt and instructions, amortised over a 10-minute clip;
-    - output: 1,500 + 1.5 × words tokens per minute, for the JSON ranges and the model's
-      thinking (billed as output).
-    It deliberately leans high: the panel would rather over-estimate.
+    - input: 7.7 tokens per word (the numbered transcript, one word per line, tokenizes
+      poorly) plus 400 fixed tokens per run (system prompt, instructions), amortised over
+      a 10-minute clip;
+    - output: 1.7 tokens per word, for the JSON ranges and the model's thinking (billed as
+      output).
+    Re-check against new ledger rows if the prompt, model or thinking level changes.
     """
     words = WORDS_PER_MINUTE
     input_tokens = words * INPUT_TOKENS_PER_WORD + FIXED_PROMPT_TOKENS / FIXED_AMORTISED_OVER_MIN
-    output_tokens = OUTPUT_BASE_TOKENS + OUTPUT_TOKENS_PER_WORD * words
+    output_tokens = OUTPUT_TOKENS_PER_WORD * words
     return cost_usd(model, input_tokens, output_tokens, on)

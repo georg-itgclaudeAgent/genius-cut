@@ -4,8 +4,8 @@
 - Key from `secrets.gemini_api_key()`, sent as the `x-goog-api-key` header, never in the
   URL, a log line or an error message.
 - JSON comes back through `responseMimeType` + `responseJsonSchema`.
-- `effort` becomes `thinkingConfig.thinkingLevel` on gemini-3* models; older models don't
-  take it.
+- `thinkingConfig.thinkingLevel` on gemini-3* models (older models don't take it) comes
+  from GENIUSCUT_GEMINI_THINKING (low|medium|high), default `low`; `effort` is ignored here.
 - Before every call the spend gate checks the worst case against the monthly limit, so a
   refused run never reaches the API. Usage is recorded after every reply, even one that
   then fails (a cut-off reply is still billed).
@@ -24,11 +24,21 @@ DEFAULT_MODEL = "gemini-3.7-flash"
 API_ROOT = "https://generativelanguage.googleapis.com/v1beta/models"
 TIMEOUT_S = 300
 DECLINED = {"SAFETY", "RECITATION", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII"}
-THINKING_LEVELS = {"low": "low", "medium": "medium", "high": "high"}
+THINKING_LEVELS = ("low", "medium", "high")
+# Default "low", whatever the caller's effort. Measured 2026-10-05 on gemini-3.7-flash with a
+# real 10:47 clip (1,560 words): "high" ran out of max_tokens=16000 (12,053 in / 15,986 out,
+# $0.069, no usable reply); "low" took 10.2 s, 12,053 in / 2,661 out, $0.019, 45 valid cuts.
+DEFAULT_THINKING = "low"
 
 
 def model() -> str:
     return (os.environ.get("GENIUSCUT_GEMINI_MODEL") or DEFAULT_MODEL).strip()
+
+
+def thinking_level() -> str:
+    """GENIUSCUT_GEMINI_THINKING if it's a valid level, else the default."""
+    level = (os.environ.get("GENIUSCUT_GEMINI_THINKING") or "").strip().lower()
+    return level if level in THINKING_LEVELS else DEFAULT_THINKING
 
 
 def _post(url: str, body: dict, headers: dict) -> dict:
@@ -73,7 +83,7 @@ def _call(prompt: str, *, system: str | None, client, effort: str, max_tokens: i
     if schema is not None:
         config.update(responseMimeType="application/json", responseJsonSchema=schema)
     if name.startswith("gemini-3"):
-        config["thinkingConfig"] = {"thinkingLevel": THINKING_LEVELS.get(effort, "high")}
+        config["thinkingConfig"] = {"thinkingLevel": thinking_level()}
     body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}], "generationConfig": config}
     if system:
         body["systemInstruction"] = {"parts": [{"text": system}]}

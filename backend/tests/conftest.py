@@ -3,7 +3,7 @@ import pytest
 # Settings that change which AI provider, model or limit a test sees, or where the spend
 # ledger lands. Cleared so the developer's own environment can't leak into a test.
 _AI_ENV = ["GENIUSCUT_LLM_PROVIDER", "GENIUSCUT_CLAUDE_PROVIDER", "GENIUSCUT_GEMINI_MODEL",
-           "GENIUSCUT_GEMINI_API_KEY", "GENIUSCUT_MONTHLY_LIMIT_USD"]
+           "GENIUSCUT_GEMINI_API_KEY", "GENIUSCUT_GEMINI_THINKING", "GENIUSCUT_MONTHLY_LIMIT_USD"]
 
 
 @pytest.fixture(autouse=True)

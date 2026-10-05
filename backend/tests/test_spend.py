@@ -117,7 +117,7 @@ def test_gate_is_a_budget_exceeded_llm_error_with_the_exact_message(monkeypatch)
     monkeypatch.setenv("GENIUSCUT_MONTHLY_LIMIT_USD", "2")
     now = datetime(2026, 10, 5, tzinfo=UTC)
     spend.record("gemini-2.5-flash-lite", 0, 4_850_000, now=now)  # $1.94
-    # est_input = ceil(3001 / 3) = 1001 tokens; worst case = 1001 * 0.75e-6 + 16000 * 3.75e-6 = $0.0608
+    # est_input = ceil(3001 / 1.5) = 2001 tokens; worst case = 2001 * 0.75e-6 + 16000 * 3.75e-6 = $0.0615
     with pytest.raises(spend.BudgetExceeded) as e:
         spend.check_budget("gemini-3.7-flash", "x" * 3001, 16000, now=now)
     assert isinstance(e.value, llm.LLMError)
@@ -130,6 +130,16 @@ def test_gate_shows_tiny_amounts_as_under_a_cent(monkeypatch):
     with pytest.raises(spend.BudgetExceeded) as e:
         spend.check_budget("gemini-2.5-flash-lite", "hi", 5000)  # worst case $0.002
     assert str(e.value).startswith("This run could cost up to <$0.01, and this month's AI spend is $0.00 of the <$0.01 limit.")
+
+
+def test_gate_estimates_input_at_1_5_characters_per_token(monkeypatch):
+    # Measured 2026-10-05: 19,197 characters of numbered transcript were 12,053 tokens.
+    # 15,000 chars -> 10,000 tokens -> $0.0075 input, no output: passes $0.0076, fails $0.0074.
+    monkeypatch.setenv("GENIUSCUT_MONTHLY_LIMIT_USD", "0.0076")
+    spend.check_budget("gemini-3.7-flash", "x" * 15_000, 0)
+    monkeypatch.setenv("GENIUSCUT_MONTHLY_LIMIT_USD", "0.0074")
+    with pytest.raises(spend.BudgetExceeded):
+        spend.check_budget("gemini-3.7-flash", "x" * 15_000, 0)
 
 
 def test_gate_ignores_unpriced_models(monkeypatch):
@@ -156,6 +166,18 @@ def test_meter_collects_every_call_inside_the_block_and_tags_the_kind():
     assert (m.input_tokens, m.output_tokens, m.model) == (1_000_000, 1_000_000, "gemini-2.5-flash-lite")
     kinds = [json.loads(line)["kind"] for line in spend.ledger_path().read_text(encoding="utf-8").splitlines()]
     assert kinds == ["other", "trim", "trim", "other"]
+
+
+def test_tagged_sets_the_kind_without_a_meter_and_keeps_the_outer_meter():
+    with spend.meter(kind="trim") as m:
+        with spend.tagged("summary"):
+            spend.record("gemini-2.5-flash-lite", 1_000_000, 0)
+    with spend.tagged("trim"):
+        spend.record("gemini-2.5-flash-lite", 1_000_000, 0)
+    spend.record("gemini-2.5-flash-lite", 1_000_000, 0)
+    assert m.input_tokens == 1_000_000
+    kinds = [json.loads(line)["kind"] for line in spend.ledger_path().read_text(encoding="utf-8").splitlines()]
+    assert kinds == ["summary", "trim", "other"]
 
 
 def test_meter_with_no_calls_costs_zero():
@@ -189,7 +211,13 @@ def test_an_unwritable_ledger_never_fails_the_call(monkeypatch, tmp_path):
 # ── estimate ───────────────────────────────────────────────────────
 
 def test_estimate_per_minute():
-    # 160 words: input 160 * 4 + 700 / 10 = 710 tokens; output 1500 + 1.5 * 160 = 1740 tokens.
-    expected = 710 * 0.75 / 1e6 + 1740 * 3.75 / 1e6
+    # 160 words: input 160 * 7.7 + 400 / 10 = 1272 tokens; output 1.7 * 160 = 272 tokens.
+    expected = 1272 * 0.75 / 1e6 + 272 * 3.75 / 1e6
     assert spend.estimate_per_minute("gemini-3.7-flash", on=date(2026, 10, 5)) == pytest.approx(expected)
+
+
+def test_estimate_matches_the_measured_10_47_clip():
+    # Live run 2026-10-05, thinking low: $0.019 for a 10:47 clip. The panel shows ~$0.02.
+    clip = spend.estimate_per_minute("gemini-3.7-flash", on=date(2026, 10, 5)) * (647 / 60)
+    assert clip == pytest.approx(0.02, rel=0.25)
     assert spend.estimate_per_minute("claude-opus-5-5") is None

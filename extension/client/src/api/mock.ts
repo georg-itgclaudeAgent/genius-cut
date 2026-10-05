@@ -42,7 +42,7 @@ let summary: string | null = null;
 const MODEL = "gemini-3.7-flash";
 let monthUsd = 0.08;
 const aiStatus = (): AiStatus =>
-  ({ provider: "gemini", model: MODEL, month_usd: monthUsd, limit_usd: 2, usd_per_minute: 0.0071 });
+  ({ provider: "gemini", model: MODEL, month_usd: monthUsd, limit_usd: 2, usd_per_minute: 0.002 });
 function sampleCost(input_tokens: number, output_tokens: number): RunCost {
   const usd = (input_tokens * 0.75 + output_tokens * 3.75) / 1e6;
   monthUsd += usd;
@@ -66,7 +66,7 @@ export const mockTransport: Transport = async (req) => {
     const cuts = cutsFor(clip);
     const response: TrimResponse = {
       words: WORDS, cuts, kept_spans_source: [], stt_device: "cuda",
-      cut_fraction: 0, warning: null, cost: sampleCost(7100, 4200),
+      cut_fraction: 0, warning: null, cost: sampleCost(12053, 2661),
     };
     return ok(response);
   }

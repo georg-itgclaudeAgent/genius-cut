@@ -84,6 +84,43 @@ def test_propose_cuts_goes_through_gemini_by_default(monkeypatch):
     assert ":generateContent" in seen[0]
 
 
+def _cut_off(url, body, headers):
+    return {"candidates": [{"content": {"parts": [{"text": '{"cu'}]}, "finishReason": "MAX_TOKENS"}],
+            "usageMetadata": {"promptTokenCount": 12053, "candidatesTokenCount": 15986}}
+
+
+def _kinds():
+    import json
+    return [json.loads(line)["kind"] for line in spend.ledger_path().read_text(encoding="utf-8").splitlines()]
+
+
+def test_a_failed_propose_call_outside_run_trim_is_still_recorded_as_trim(monkeypatch):
+    from geniuscut import llm
+    monkeypatch.setenv("GENIUSCUT_GEMINI_API_KEY", "AIza-test")
+    with pytest.raises(llm.LLMError, match="cut off"):
+        cuts.propose_cuts(WORDS, FewShot(None, []), client=_cut_off)
+    assert _kinds() == ["trim"]
+    assert spend.month_total() == pytest.approx(12053 * 0.75e-6 + 15986 * 3.75e-6)
+
+
+def test_a_failed_run_trim_call_is_metered_and_recorded_as_trim(tmp_path, monkeypatch):
+    from geniuscut import llm
+    monkeypatch.setenv("GENIUSCUT_GEMINI_API_KEY", "AIza-test")
+    propose = lambda w, f, i: cuts.propose_cuts(w, f, i, client=_cut_off)
+    with pytest.raises(llm.LLMError):
+        trim.run_trim(TrimRequest(**REQ), FakeTranscriber(), tmp_path, propose=propose, extract=fake_extract)
+    assert _kinds() == ["trim"]
+
+
+def test_summary_kind_is_recorded_outside_the_server_and_when_the_call_raises(tmp_path, monkeypatch):
+    from geniuscut import library, llm
+    monkeypatch.setenv("GENIUSCUT_GEMINI_API_KEY", "AIza-test")
+    library.add_example(WORDS, "hello", "take.mp4", tmp_path)
+    with pytest.raises(llm.LLMError):
+        library.regenerate_summary(tmp_path, lambda p: llm.ask_text(p, client=_cut_off))
+    assert _kinds() == ["summary"]
+
+
 # ── HTTP ───────────────────────────────────────────────────────────
 
 def test_trim_response_carries_cost(tmp_path):

@@ -7,7 +7,7 @@ range that is out of bounds, backwards or overlapping is dropped rather than app
 
 import logging
 
-from geniuscut import llm
+from geniuscut import llm, spend
 from geniuscut.library import FewShot
 from geniuscut.models import CutSpan, Word
 
@@ -92,7 +92,8 @@ def validate_ranges(raw: list[dict], n_words: int) -> list[tuple[int, int, str]]
 def propose_cuts(words: list[Word], fewshot: FewShot, instruction: str = "", client=None) -> list[CutSpan]:
     if not words:
         return []
-    reply = llm.ask_json(build_prompt(words, fewshot, instruction), SCHEMA, system=SYSTEM, client=client)
+    with spend.tagged("trim"):  # also when called outside run_trim, and when the call raises
+        reply = llm.ask_json(build_prompt(words, fewshot, instruction), SCHEMA, system=SYSTEM, client=client)
     ranges = validate_ranges(reply.get("cuts", []), len(words))
     return [
         CutSpan(start=words[s].start, end=words[e].end,

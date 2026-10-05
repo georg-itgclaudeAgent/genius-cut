@@ -63,7 +63,7 @@ def test_json_request_body_url_and_key_header():
     assert cfg["maxOutputTokens"] == 1234
     assert cfg["responseMimeType"] == "application/json"
     assert cfg["responseJsonSchema"] == schema
-    assert cfg["thinkingConfig"] == {"thinkingLevel": "high"}
+    assert cfg["thinkingConfig"] == {"thinkingLevel": "low"}
 
 
 def test_text_request_has_no_schema_and_no_system_when_none():
@@ -73,14 +73,30 @@ def test_text_request_has_no_schema_and_no_system_when_none():
     assert "systemInstruction" not in body
     assert "responseMimeType" not in body["generationConfig"]
     assert "responseJsonSchema" not in body["generationConfig"]
-    assert body["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "medium"}
+    assert body["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "low"}
 
 
-@pytest.mark.parametrize("effort", ["low", "medium", "high"])
-def test_effort_maps_to_thinking_level_on_gemini_3(effort):
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "max"])
+def test_thinking_defaults_to_low_whatever_the_effort(effort):
     t = Transport()
     gemini.ask_json("hi", {}, client=t, effort=effort)
-    assert t.calls[0]["body"]["generationConfig"]["thinkingConfig"] == {"thinkingLevel": effort}
+    assert t.calls[0]["body"]["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "low"}
+
+
+@pytest.mark.parametrize("level", ["low", "medium", "high", " High "])
+def test_thinking_env_overrides(monkeypatch, level):
+    monkeypatch.setenv("GENIUSCUT_GEMINI_THINKING", level)
+    t = Transport()
+    gemini.ask_json("hi", {}, client=t, effort="low")
+    assert t.calls[0]["body"]["generationConfig"]["thinkingConfig"] == {"thinkingLevel": level.strip().lower()}
+
+
+@pytest.mark.parametrize("bad", ["max", "none", ""])
+def test_invalid_thinking_env_falls_back_to_low(monkeypatch, bad):
+    monkeypatch.setenv("GENIUSCUT_GEMINI_THINKING", bad)
+    t = Transport()
+    gemini.ask_text("hi", client=t)
+    assert t.calls[0]["body"]["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "low"}
 
 
 def test_no_thinking_level_for_older_models(monkeypatch):

@@ -1,11 +1,11 @@
 /**
  * Sample data for running the panel in a browser (`npm run dev`), outside Premiere.
  * The transcript is from the committed synthetic fixture; the cuts are illustrative,
- * not produced by Claude. The panel shows a "Sample data" banner in this mode.
+ * not produced by the AI, and the costs are plausible, not billed. The panel shows a "Sample data" banner in this mode.
  */
 import type { Transport } from "./backend";
 import type { Host } from "./host";
-import type { ClipInfo, Health, Library, SequenceCut, StyleExample, TrimResponse, Word } from "./types";
+import type { AiStatus, ClipInfo, Health, Library, RunCost, SequenceCut, StyleExample, TrimResponse, Word } from "./types";
 
 const W = (w: string, start: number, end: number): Word => ({ w, start, end });
 const WORDS: Word[] = [
@@ -38,13 +38,25 @@ let library: StyleExample[] = [{
 }];
 let summary: string | null = null;
 
+// Gemini 3.7 Flash rates (0.75 / 3.75 USD per 1M tokens); the month grows with each sample run.
+const MODEL = "gemini-3.7-flash";
+let monthUsd = 0.08;
+const aiStatus = (): AiStatus =>
+  ({ provider: "gemini", model: MODEL, month_usd: monthUsd, limit_usd: 2, usd_per_minute: 0.0071 });
+function sampleCost(input_tokens: number, output_tokens: number): RunCost {
+  const usd = (input_tokens * 0.75 + output_tokens * 3.75) / 1e6;
+  monthUsd += usd;
+  return { model: MODEL, input_tokens, output_tokens, usd, month_usd: monthUsd, limit_usd: 2 };
+}
+
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 let bootedAt = Date.now();
 
 export const mockTransport: Transport = async (req) => {
   const ok = (body: unknown) => ({ status: 200, body: JSON.stringify(body) });
   if (req.path === "/health") {
-    const health: Health = { status: "ok", version: "0.1.0", stt_device: Date.now() - bootedAt < 1500 ? "loading" : "cuda" };
+    const health: Health = { status: "ok", version: "0.1.0", stt_device: Date.now() - bootedAt < 1500 ? "loading" : "cuda",
+      ai: aiStatus() };
     return ok(health);
   }
   if (req.path === "/trim") {
@@ -54,7 +66,7 @@ export const mockTransport: Transport = async (req) => {
     const cuts = cutsFor(clip);
     const response: TrimResponse = {
       words: WORDS, cuts, kept_spans_source: [], stt_device: "cuda",
-      cut_fraction: 0, warning: null,
+      cut_fraction: 0, warning: null, cost: sampleCost(7100, 4200),
     };
     return ok(response);
   }
@@ -71,7 +83,7 @@ export const mockTransport: Transport = async (req) => {
   if (req.path === "/library/summarize") {
     await delay(900);
     summary = "- Cut filler words (um, uh, you know) at the start of an answer.\n- Keep product names intact.";
-    return ok({ summary });
+    return ok({ summary, cost: sampleCost(2400, 900) });
   }
   return { status: 404, body: JSON.stringify({ detail: `No mock for ${req.path}` }) };
 };

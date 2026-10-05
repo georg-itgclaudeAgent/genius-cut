@@ -1,11 +1,13 @@
 import { useRef, useState } from "react";
 import { runtime } from "../api/runtime";
 import { HostUnavailable, type ApplyResult } from "../api/host";
-import type { ClipInfo, Health, TrimResponse } from "../api/types";
+import type { ClipInfo, Health, RunCost, TrimResponse } from "../api/types";
 import { clipProblem } from "../lib/clip";
+import { budgetEstimate } from "../lib/cost";
 import { parseClipName } from "../lib/prompt";
 import { keptSpansSource } from "../lib/review";
 import { formatDuration } from "../lib/timecode";
+import { CostEstimate } from "./Cost";
 import { CutReview } from "./CutReview";
 
 type Phase =
@@ -43,6 +45,8 @@ export function CutTab({ health, ready, onTrimmed }: {
 }) {
   const [instruction, setInstruction] = useState("trim the selected clip");
   const [phase, setPhase] = useState<Phase>({ k: "idle" });
+  // /health is read once at connect; after a run, its own month total is the fresher one.
+  const [lastCost, setLastCost] = useState<RunCost | null>(null);
   // Bumped on every phase change we start; a host call that returns after the user
   // has moved on (Done, Analyse again) must not resurrect the old phase.
   const epoch = useRef(0);
@@ -66,6 +70,7 @@ export function CutTab({ health, ready, onTrimmed }: {
         media_path: found.mediaPath, in_s: found.inS, out_s: found.outS, clip_start_s: found.startS, prompt: instruction,
       });
       const checked = res.cuts.map(() => true);
+      if (res.cost) setLastCost(res.cost);
       setPhase({ k: "review", clip: found, res, checked });
       onTrimmed(found, res, checked);
     } catch (e) {
@@ -131,6 +136,10 @@ export function CutTab({ health, ready, onTrimmed }: {
   }
 
   const working = phase.k === "finding" || phase.k === "analysing";
+  const ai = health?.ai ? { ...health.ai, limit_usd: lastCost?.limit_usd ?? health.ai.limit_usd } : null;
+  const monthUsd = lastCost ? lastCost.month_usd : ai?.month_usd ?? null;
+  const clipS = clip ? clip.outS - clip.inS : null;
+  const overLimit = ai ? budgetEstimate(ai, clipS, monthUsd).over : false;
 
   return (
     <>
@@ -156,8 +165,10 @@ export function CutTab({ health, ready, onTrimmed }: {
         <form className="prompt" onSubmit={(e) => { e.preventDefault(); analyse(); }}>
           <input value={instruction} onChange={(e) => setInstruction(e.target.value)} aria-label="Instruction" />
           <button className="btn btn-p" type="submit"
-            disabled={!ready || working || phase.k === "applying" || phase.k === "applied"}>Analyse</button>
+            disabled={!ready || working || overLimit || phase.k === "applying" || phase.k === "applied"}
+            title={overLimit ? "Monthly AI limit reached" : undefined}>Analyse</button>
         </form>
+        {ai && <CostEstimate ai={ai} clipS={clipS} monthUsd={monthUsd} />}
       </div>
 
       {working && (

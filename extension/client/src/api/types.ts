@@ -22,6 +22,16 @@ export interface TrimRequest {
   prompt: string;
 }
 
+/** What one run's AI calls cost, and where the month stands afterwards. USD throughout. */
+export interface RunCost {
+  model: string;
+  input_tokens: number;
+  output_tokens: number;
+  usd: number | null;     // null: the model has no price (Claude)
+  month_usd: number;
+  limit_usd: number;
+}
+
 export interface TrimResponse {
   words: Word[];
   cuts: SequenceCut[];
@@ -29,6 +39,16 @@ export interface TrimResponse {
   stt_device: string;
   cut_fraction: number;
   warning: string | null;
+  cost?: RunCost | null;  // absent from backends older than the spend limit
+}
+
+/** The AI provider and the month's spend, from /health. Never carries a key. */
+export interface AiStatus {
+  provider: string;       // "gemini" | "anthropic" | "vertex" | "unknown"
+  model: string | null;
+  month_usd: number | null;       // null: the spend ledger couldn't be read
+  limit_usd: number;
+  usd_per_minute: number | null;  // null: the model has no price
 }
 
 export interface Health {
@@ -36,6 +56,7 @@ export interface Health {
   version: string;
   stt_device: string;     // "cuda" | "cpu" | "loading" | "failed"
   error?: string;
+  ai?: AiStatus;
 }
 
 export interface RemovedSpan { start: number; end: number; text: string; reason: string }

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { ClipInfo, TrimResponse } from "../api/types";
 import { reviewSummary } from "../lib/review";
+import { RunCostLine } from "./Cost";
 import { formatDuration, formatTimecode } from "../lib/timecode";
 
 interface Props {
@@ -23,9 +24,12 @@ export function CutReview({ clip, res, checked, onToggle, onToggleAll, onApply, 
 
   if (res.cuts.length === 0) {
     return (
-      <div className="sec">
-        <div className="note"><b>Nothing to cut.</b> This clip already reads cleanly in your style.</div>
-      </div>
+      <>
+        <div className="sec">
+          <div className="note"><b>Nothing to cut.</b> This clip already reads cleanly in your style.</div>
+        </div>
+        {res.cost && <RunCostLine cost={res.cost} />}
+      </>
     );
   }
 
@@ -44,6 +48,7 @@ export function CutReview({ clip, res, checked, onToggle, onToggleAll, onApply, 
         </div>
       </div>
 
+      {res.cost && <RunCostLine cost={res.cost} />}
       {res.warning && <div className="sec"><div className="note warn">{res.warning}</div></div>}
       {s.keepsNothing && (
         <div className="sec"><div className="note bad"><b>That would remove the whole clip.</b> Untick at least one cut to apply.</div></div>

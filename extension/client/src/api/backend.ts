@@ -3,7 +3,7 @@
  * Node's http module (CEP --enable-nodejs), so CORS never applies; in a browser it's the
  * sample-data mock.
  */
-import type { Health, Library, StyleExample, TrimRequest, TrimResponse, Word } from "./types";
+import type { Health, Library, RunCost, StyleExample, TrimRequest, TrimResponse, Word } from "./types";
 
 export interface TransportRequest {
   method: "GET" | "POST";
@@ -51,7 +51,7 @@ export function createBackend({ transport, token }: { transport: Transport; toke
     library: () => call<Library>("GET", "/library"),
     addExample: (raw_words: Word[], final_text: string, source_clip: string) =>
       call<StyleExample>("POST", "/library/examples", { body: { raw_words, final_text, source_clip } }),
-    summarize: () => call<{ summary: string }>("POST", "/library/summarize", { timeoutMs: 5 * 60_000 }),
+    summarize: () => call<{ summary: string; cost?: RunCost | null }>("POST", "/library/summarize", { timeoutMs: 5 * 60_000 }),
     reload: () => call<{ status: string }>("POST", "/reload", { timeoutMs: 2000 }),
   };
 }

@@ -40,6 +40,16 @@ describe("backend client", () => {
     expect(err.message).toContain("credit balance is too low");
   });
 
+  it("the monthly AI limit (402) comes through as the backend's own message", async () => {
+    const detail = "This run could cost up to $0.06, and this month's AI spend is $1.97 of the $2.00 limit. " +
+      "Raise GENIUSCUT_MONTHLY_LIMIT_USD to continue.";
+    const api = createBackend({ transport: fake(402, { detail }).transport, token: () => "tok" });
+    const err = await api.trim({ media_path: "x", in_s: 0, out_s: 1, clip_start_s: 0, prompt: "" }).catch((e) => e);
+    expect(err).toBeInstanceOf(BackendError);
+    expect(err.status).toBe(402);
+    expect(err.message).toBe(detail);
+  });
+
   it("validation errors (422 with a list) still read as one sentence", async () => {
     const api = createBackend({
       transport: fake(422, { detail: [{ msg: "Value error, out_s (3.0) must be after in_s (9.0)" }] }).transport,

@@ -259,8 +259,24 @@ function gcutFindClip(nameJson) {
 
 function gcutKey(trackIndex, startTicks) { return "v" + trackIndex + "@" + startTicks; }
 
-/** Kept spans → whole-frame placements: [{inS, outS, frames}] in source seconds. */
-function gcutPlan(spans, inS, outS, clock) {
+/** The source media's frame rate, falling back to the sequence's if Premiere won't say. */
+function gcutSourceFps(pi, clock) {
+    try {
+        var fps = Number(pi.getFootageInterpretation().frameRate);
+        if (fps > 0 && isFinite(fps)) return fps;
+    } catch (e) { /* not available on this item */ }
+    return clock.fps;
+}
+
+/**
+ * Kept spans → whole-frame placements: [{inS, outS, frames, setIn, setOut}] in source seconds.
+ * Premiere rounds set in/out points DOWN to the source frame grid (Checkpoint B, 2026-10-05:
+ * a span starting at 13.020 s on 30 fps media read back as 13.000 s and was refused). So each
+ * span starts on a source frame. setIn/setOut sit a quarter of a source frame later: the
+ * fallback when floating-point error makes Premiere round the exact value down a frame.
+ */
+function gcutPlan(spans, inS, outS, clock, srcFrameS) {
+    srcFrameS = srcFrameS || clock.frameS;
     if (!gcutIsArray(spans) || !spans.length) throw new Error("There's nothing to keep, so nothing was changed.");
     var plan = [], prevEnd = inS - clock.frameS;
     for (var i = 0; i < spans.length; i++) {
@@ -268,9 +284,11 @@ function gcutPlan(spans, inS, outS, clock) {
         if (!(s.end > s.start)) throw new Error("A kept span is empty or backwards. Nothing was changed.");
         if (s.start < inS - clock.frameS || s.end > outS + clock.frameS) throw new Error("A kept span falls outside the clip. Nothing was changed.");
         if (s.start < prevEnd - clock.frameS / 2) throw new Error("Kept spans overlap or are out of order. Nothing was changed.");
-        var frames = Math.round((s.end - s.start) / clock.frameS);
+        var start = Math.round(s.start / srcFrameS) * srcFrameS;
+        var frames = Math.round((s.end - start) / clock.frameS);
         if (frames < 1) throw new Error("A kept span is shorter than a frame. Nothing was changed.");
-        plan.push({ inS: s.start, outS: s.start + frames * clock.frameS, frames: frames });
+        var end = start + frames * clock.frameS, nudge = srcFrameS / 4;
+        plan.push({ inS: start, outS: end, frames: frames, setIn: start + nudge, setOut: end + nudge });
         prevEnd = s.end;
     }
     return plan;
@@ -360,7 +378,13 @@ function gcutApplyCuts(specJson) {
         clock = gcutClock(seq);
         var item = gcutFindVideoItem(seq, spec.trackIndex, spec.startTicks);
         if (Math.abs(gcutSpeed(item) - 1) > 1e-6) throw new Error("This clip isn't at 100% speed. Nothing was changed.");
-        var plan = gcutPlan(spec.spans, item.inPoint.seconds, item.outPoint.seconds, clock);
+        var srcFps = gcutSourceFps(item.projectItem, clock), ratio = srcFps / clock.fps;
+        if (Math.round(ratio) < 1 || Math.abs(ratio - Math.round(ratio)) > 1e-3) {
+            throw new Error("This clip is " + Math.round(srcFps * 1000) / 1000 + " fps but the sequence is " +
+                Math.round(clock.fps * 1000) / 1000 + " fps. Genius Cut can only rebuild clips whose frame rate matches " +
+                "the sequence (or is a whole multiple of it) for now. Nothing was changed.");
+        }
+        var plan = gcutPlan(spec.spans, item.inPoint.seconds, item.outPoint.seconds, clock, 1 / srcFps);
 
         pi = item.projectItem;
         var node = pi.nodeId, startT = gcutT(item.start), endT = gcutT(item.end);
@@ -410,7 +434,12 @@ function gcutApplyCuts(specJson) {
             var cursorT = startT;
             for (var p = 0; p < plan.length; p++) {
                 var span = plan[p], durT = span.frames * clock.tpf;
-                gcutSetRange(pi, span.inS, span.outS, clock.frameS / 2);
+                try {
+                    gcutSetRange(pi, span.inS, span.outS, clock.frameS / 2);
+                } catch (rangeErr) {
+                    // Rounded down a frame by floating-point error: aim a quarter-frame later.
+                    gcutSetRange(pi, span.setIn, span.setOut, clock.frameS / 2);
+                }
                 track.overwriteClip(pi, String(cursorT));
                 rec.rebuiltEndT = Math.max(rec.rebuiltEndT, cursorT + durT);
                 var landed = false, vItems = gcutItems(track);

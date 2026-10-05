@@ -36,11 +36,18 @@ const snap = (ticks: number) => Math.round(ticks / TPF) * TPF;
 class ProjectItem {
   inS = 0; outS: number;
   rejectInAfterOut = false;
+  /** Real Premiere (Checkpoint B, 2026-10-05) rounds set in/out points DOWN to the media's frame grid. */
+  floorToFrames = false;
+  mediaFps = FPS;
   constructor(public name: string, public nodeId: string, public durationS: number, public unit: Unit = "seconds", public hasAudio = true) {
     this.outS = durationS;
   }
   getMediaPath() { return `D:/Footage/${this.name}`; }
-  private toSeconds(v: any) { return this.unit === "seconds" ? Number(v) : Number(v) / TICKS; }
+  getFootageInterpretation() { return { frameRate: this.mediaFps }; }
+  private toSeconds(v: any) {
+    const s = this.unit === "seconds" ? Number(v) : Number(v) / TICKS;
+    return this.floorToFrames ? Math.floor(s * this.mediaFps) / this.mediaFps : s;
+  }
   setInPoint(v: any, _m: number) {
     const s = this.toSeconds(v);
     if (this.rejectInAfterOut && s >= this.outS) throw new Error("In point after out point");
@@ -250,6 +257,33 @@ describe("gcutApplyCuts", () => {
     for (let i = 1; i < v.numItems; i++) expect(v[i].start.t).toBe(v[i - 1].end.t);
   });
 
+  it("Checkpoint B: works when Premiere rounds set in/out points down to whole source frames", () => {
+    // Real clip, 2026-10-05: "Premiere didn't accept the source range 13.020-16.253 s." Spans
+    // that start mid-frame must be snapped to the source grid before they're set.
+    const s = scene();
+    s.pi.floorToFrames = true;
+    const r = apply(s, [{ start: 10, end: 12.5 }, { start: 13.03, end: 16.27 }, { start: 17.41, end: 19.97 }]);
+    expect(r).toMatchObject({ ok: true, appliedCount: 3 });
+    const v = s.seq.videoTracks[0].clips;
+    for (let i = 0; i < v.numItems; i++) expect(Math.abs(v[i].inPoint.seconds * FPS - Math.round(v[i].inPoint.seconds * FPS))).toBeLessThan(1e-6);
+    for (let i = 1; i < v.numItems; i++) expect(v[i].start.t).toBe(v[i - 1].end.t);
+    expect([s.pi.inS, s.pi.outS]).toEqual([2, 58]);
+  });
+
+  it("works when the source is an integer multiple of the sequence frame rate (50 fps in 25)", () => {
+    const s = scene();
+    s.pi.floorToFrames = true; s.pi.mediaFps = 50;
+    expect(apply(s, [{ start: 10.011, end: 12.49 }, { start: 13.03, end: 19.97 }])).toMatchObject({ ok: true, appliedCount: 2 });
+  });
+
+  it("refuses, changing nothing, when the source frame rate doesn't fit the sequence's (24 fps in 25)", () => {
+    const s = scene();
+    s.pi.mediaFps = 24;
+    const before = layout(s.seq.videoTracks[0]);
+    expect(() => apply(s)).toThrow(/24 fps.*25 fps|frame rate/);
+    expect(layout(s.seq.videoTracks[0])).toEqual(before);
+  });
+
   it("leaves the bin item's own in/out exactly as it found them", () => {
     const s = scene();
     apply(s);
@@ -293,8 +327,10 @@ describe("gcutApplyCuts", () => {
   it("C1: a throw part-way (Premiere rejecting a point) also rolls back", () => {
     const s = scene();
     const orig = s.pi.setInPoint.bind(s.pi);
-    let calls = 0;
-    s.pi.setInPoint = (v: any, m: number) => { if (++calls === 3) throw new Error("boom"); return orig(v, m); };
+    // Span 2's in point (13 s, exact or nudged, either unit) is always rejected: a one-off
+    // rejection is now retried (Checkpoint B fix), so the refusal has to persist.
+    const sec = (v: any) => (Number(v) > 1e6 ? Number(v) / TICKS : Number(v));
+    s.pi.setInPoint = (v: any, m: number) => { if (Math.abs(sec(v) - 13) < 0.2) throw new Error("boom"); return orig(v, m); };
     const r = apply(s);
     expect(r).toMatchObject({ ok: false, rolledBack: true });
     expect(layout(s.seq.videoTracks[0])).toEqual([[100, 110]]);

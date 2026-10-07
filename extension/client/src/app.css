@@ -181,3 +181,4 @@ textarea.field { width: 100%; min-height: 64px; resize: vertical; }
 .meter { height: 3px; margin-top: 5px; background: var(--raise); border-radius: 2px; overflow: hidden; }
 .meter span { display: block; height: 100%; background: var(--blue); }
 .meter.hot span { background: var(--coral); }
+.picker { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }

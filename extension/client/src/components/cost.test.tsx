@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { CutTab } from "./CutTab";
 import { CutReview } from "./CutReview";
 import { mockTransport } from "../api/mock";
-import type { ClipInfo, Health, TrimResponse } from "../api/types";
+import type { Health, Snapshot, TrimResponse } from "../api/types";
 
 const HEALTH: Health = {
   status: "ok", version: "0.1.0", stt_device: "cuda",
@@ -33,17 +33,21 @@ describe("CutTab cost estimate", () => {
   });
 });
 
-const CLIP: ClipInfo = {
-  found: true, name: "take.mp4", mediaPath: "C:/take.mp4", trackIndex: 0, startTicks: "0", inS: 0, outS: 10, startS: 0,
-  fps: 25, matchCount: 1, selectedUsed: true, speed: 1, effects: [],
+const item = (kind: "video" | "audio", label: string): Snapshot["video"][number] => ({
+  kind, trackIndex: 0, label, startTicks: "0", endTicks: "1", name: "take.mp4", mediaPath: "C:/take.mp4", inS: 0, outS: 10,
+  speed: 1, effects: [],
+});
+const SNAP: Snapshot = {
+  found: true, sequenceId: "s", startTicks: "0", endTicks: "1", startS: 0, durationS: 10, fps: 25,
+  video: [item("video", "V1")], audio: [item("audio", "A1")], problems: [],
 };
 const RES: TrimResponse = {
-  words: [], kept_spans_source: [], stt_device: "cuda", cut_fraction: 0.1, warning: null,
+  words: [], kept_spans_source: [], kept_spans: [], stt_device: "cuda", cut_fraction: 0.1, warning: null,
   cuts: [{ start: 1, end: 2, text: "um", reason: "filler", start_seq_s: 1, end_seq_s: 2 }],
   cost: { model: "gemini-3.7-flash", input_tokens: 7100, output_tokens: 4200, usd: 0.03, month_usd: 0.11, limit_usd: 2 },
 };
 const review = (res: TrimResponse) => renderToStaticMarkup(
-  <CutReview clip={CLIP} res={res} checked={res.cuts.map(() => true)} busy={false}
+  <CutReview snap={SNAP} res={res} checked={res.cuts.map(() => true)} busy={false}
     onToggle={() => {}} onToggleAll={() => {}} onApply={() => {}} onDiscard={() => {}} />);
 
 describe("CutReview cost line", () => {

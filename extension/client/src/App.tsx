@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { runtime } from "./api/runtime";
-import type { ClipInfo, TrimResponse } from "./api/types";
+import type { Snapshot, TrimResponse } from "./api/types";
 import { useBackend } from "./hooks/useBackend";
 import { startingMessage } from "./lib/lifecycle";
 import { CutTab } from "./components/CutTab";
@@ -62,7 +62,7 @@ export function App() {
       <BackendStatus state={state} onRetry={retry} />
 
       <CutTab health={health} ready={ready}
-        onTrimmed={(clip: ClipInfo, res: TrimResponse, checked: boolean[]) => setLastTrim({ clip, res, checked })} />
+        onTrimmed={(snap: Snapshot, res: TrimResponse, checked: boolean[]) => setLastTrim({ snap, res, checked })} />
 
       <StyleLibrary ready={ready} lastTrim={lastTrim} />
     </div>

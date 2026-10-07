@@ -1,7 +1,6 @@
-/** Regression tests for the panel review (C1, I3, I5). I1/I2/I4 are covered where they live. */
+/** Regression tests for the panel review (C1, I3). I1/I2/I4 are covered where they live. */
 import { describe, it, expect } from "vitest";
 import { round3 } from "./review";
-import { clipProblem } from "./clip";
 import { cepHost, HostUnavailable } from "../api/host";
 
 describe("C1: round3 matches Python round(x, 3)", () => {
@@ -16,15 +15,6 @@ describe("C1: round3 matches Python round(x, 3)", () => {
   ])("%d → %d", (x, want) => {
     expect(round3(x)).toBe(want);
   });
-});
-
-const CLIP: Parameters<typeof clipProblem>[0] = { found: true, name: "a.mp4", speed: 1 };
-
-describe("I5: clips Phase 1 can't trim correctly are refused before analysis", () => {
-  it("a normal clip is fine", () => expect(clipProblem(CLIP)).toBeNull());
-  it("a clip that wasn't found", () => expect(clipProblem({ ...CLIP, found: false })).toMatch(/No matching clip/));
-  it("a sped-up or slowed clip", () => expect(clipProblem({ ...CLIP, speed: 1.5 })).toMatch(/150%/));
-  it("a reversed clip", () => expect(clipProblem({ ...CLIP, speed: -1 })).toMatch(/reversed/));
 });
 
 describe("I3: only a genuinely missing gcut* function means 'Phase C not installed'", () => {

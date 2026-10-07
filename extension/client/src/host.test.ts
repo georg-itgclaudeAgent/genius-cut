@@ -31,7 +31,6 @@ class Time {
 }
 
 type Unit = "seconds" | "ticks";
-const snap = (ticks: number) => Math.round(ticks / TPF) * TPF;
 
 class ProjectItem {
   inS = 0; outS: number;
@@ -153,6 +152,7 @@ class Seq {
     if (n === this.dropSpanIndex) return;
     const inS = this.ignoreInOut ? 0 : pi.inS;
     const outS = this.ignoreInOut ? pi.durationS : pi.outS;
+    const tpf = Number(this.timebase), snap = (ticks: number) => Math.round(ticks / tpf) * tpf; // this sequence's own grid
     const s = snap(startT), durT = snap(Math.round((outS - inS) * TICKS));
     const v = track.place(pi, s, inS, durT);
     if (track.kind === "video" && pi.hasAudio) {
@@ -1064,5 +1064,58 @@ describe("Restore and Close gap (timeline mapping)", () => {
     applyCuts(s, cuts);
     expect(s.host.call("gcutCloseGapMulti", { startTicks: START })).toEqual({ ok: true, movedCount: 1 });
     expect(span(s.seq.videoTracks[3])).toEqual([[99, 104, 0], [110, 113, 0]]);
+  });
+});
+
+describe("audio items and the frame-rate check", () => {
+  const F = 1001 / 30000; // one 29.97 fps frame, in seconds
+  /** A 29.97 fps sequence: a camera on V1 and a .wav on A1, both at 100 s, both selected. */
+  function ntscScene(micFps: number) {
+    const seq = new Seq(1, 1);
+    seq.timebase = String(Math.round(F * TICKS));
+    const cam = new ProjectItem("cam.mov", "node-c", 900, "seconds", false);
+    const mic = new ProjectItem("mic.wav", "node-m", 900, "seconds", false);
+    cam.mediaFps = 30000 / 1001; mic.mediaFps = micFps;
+    const v1 = seq.videoTracks[0].add(cam, 2997 * F, 300 * F, 600 * F);
+    const a1 = seq.audioTracks[0].add(mic, 2997 * F, 1500 * F, 1800 * F);
+    v1.selected = true; a1.selected = true;
+    return { seq, cam, mic, v1, a1, host: load(seq) };
+  }
+  // Premiere may report a .wav's sample rate (or 0) as its frame rate: that mustn't refuse Apply.
+  it.each([48000, 0])("applies an audio item whose frame rate reads %s, its pieces' in points on the sequence frame grid", (fps) => {
+    const s = ntscScene(fps);
+    expect(applyCuts(s, [{ start: 2, end: 3 }])).toMatchObject({ ok: true });
+    const a = s.seq.audioTracks[0].clips;
+    expect(a.numItems).toBe(2);
+    for (let i = 0; i < a.numItems; i++) {
+      const frames = a[i].inPoint.seconds / F;
+      expect(Math.abs(frames - Math.round(frames))).toBeLessThan(1e-6);
+    }
+  });
+  it("still refuses a video item whose frame rate doesn't fit the sequence's", () => {
+    const s = ntscScene(48000);
+    s.cam.mediaFps = 25;
+    expect(() => applyCuts(s, [{ start: 2, end: 3 }])).toThrow(/V1 is 25 fps/);
+  });
+});
+
+describe("cuts land on whole sequence frames", () => {
+  it("a range starting off the frame grid (audio starting a quarter frame after the video) still cuts on whole frames", () => {
+    const s = georgScene();
+    s.a1.start = Time.s(100.01); s.a1.inPoint = Time.s(51.01);
+    const snap = snapshot(s);
+    expect(snap.problems).toEqual([]);
+    expect(snap.startS).toBeCloseTo(100.01, 6);
+    expect(applyCuts(s, cuts, snap)).toMatchObject({ ok: true });
+    const rec = (s.host.ctx as any).$.global.gcutStash["m@" + snap.startTicks];
+    for (const c of rec.cutsT) expect([c.startT % TPF, c.endT % TPF]).toEqual([0, 0]);
+    expect(rec.cutsT.map((c: any) => [c.startT / TICKS, c.endT / TICKS])).toEqual([[102, 103], [107, 108]]);
+    expect(span(s.seq.videoTracks[0])).toEqual([[100, 102, 10], [102, 106, 13], [106, 108, 18]]);
+  });
+  it("gcutCutTicks: an off-grid start is snapped as an absolute time, and clamped to whole frames inside the range", () => {
+    const ctx = multiScene().host.ctx as any;
+    const at = (x: number) => Math.round(x * TICKS);
+    const c = ctx.gcutCutTicks([{ start: 0, end: 0.5 }, { start: 2, end: 3 }, { start: 9.5, end: 10 }], at(100.01), { tpf: TPF }, at(110.01));
+    expect(c.map((x: any) => [x.startT / TICKS, x.endT / TICKS])).toEqual([[100.04, 100.52], [102, 103], [109.52, 110]]);
   });
 });

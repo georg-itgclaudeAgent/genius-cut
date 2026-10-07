@@ -346,15 +346,21 @@ function gcutRefind(seq, spec, clock) {
         }
         if (typeof track.isLocked === "function" && track.isLocked()) throw new Error(label + " is locked. Unlock it to apply.");
         if (Math.abs(gcutSpeed(it) - 1) > 1e-6) throw new Error(label + " isn't at 100% speed. Nothing was changed.");
-        var srcFps = gcutSourceFps(it.projectItem, clock), ratio = srcFps / clock.fps;
-        if (Math.round(ratio) < 1 || Math.abs(ratio - Math.round(ratio)) > 1e-3) {
-            throw new Error(label + " is " + Math.round(srcFps * 1000) / 1000 + " fps but the sequence is " +
-                Math.round(clock.fps * 1000) / 1000 + " fps. Genius Cut can only rebuild clips whose frame rate matches " +
-                "the sequence (or is a whole multiple of it) for now. Nothing was changed.");
+        // Audio has no frame rate of its own (Premiere may report the sample rate, or 0): its source
+        // points snap to the sequence's frames. Video must fit the sequence's frame rate.
+        var srcFrameS = clock.frameS;
+        if (x.kind !== "audio") {
+            var srcFps = gcutSourceFps(it.projectItem, clock), ratio = srcFps / clock.fps;
+            if (Math.round(ratio) < 1 || Math.abs(ratio - Math.round(ratio)) > 1e-3) {
+                throw new Error(label + " is " + Math.round(srcFps * 1000) / 1000 + " fps but the sequence is " +
+                    Math.round(clock.fps * 1000) / 1000 + " fps. Genius Cut can only rebuild clips whose frame rate matches " +
+                    "the sequence (or is a whole multiple of it) for now. Nothing was changed.");
+            }
+            srcFrameS = 1 / srcFps;
         }
         found.push({ kind: x.kind, trackIndex: x.trackIndex, label: label, item: it, pi: it.projectItem,
                      node: it.projectItem.nodeId, startT: gcutT(it.start), endT: gcutT(it.end),
-                     inS: it.inPoint.seconds, outS: it.outPoint.seconds, srcFrameS: 1 / srcFps });
+                     inS: it.inPoint.seconds, outS: it.outPoint.seconds, srcFrameS: srcFrameS });
     }
     return found;
 }
@@ -419,17 +425,18 @@ function gcutAtPlanned(items, plan, kind, trackIndex, it, clock) {
 
 /**
  * Cut ranges (seconds relative to the range start) → sorted, merged [{startT, endT}] in sequence
- * ticks, snapped to whole sequence frames. With `endT`, cuts are clipped to [startT, endT]: the
- * range is all that was transcribed, and a cut reaching a frame past it must not take the first
- * frame of whatever follows. Empty ranges are dropped; refuses if none remain.
+ * ticks, each end snapped as a timeline time to whole sequence frames (the range start itself may
+ * be off the grid, when an audio clip sets it). With `endT`, cuts are clipped to the whole frames
+ * inside [startT, endT]: the range is all that was transcribed, and a cut reaching a frame past it
+ * must not take the first frame of whatever follows. Empty ranges are dropped; refuses if none remain.
  */
 function gcutCutTicks(cuts, startT, clock, endT) {
     if (!gcutIsArray(cuts)) throw new Error("There's nothing to cut, so nothing was changed.");
-    var raw = [], i;
+    var raw = [], i, tpf = clock.tpf;
     for (i = 0; i < cuts.length; i++) {
-        var a = startT + Math.round(cuts[i].start * GCUT_TICKS / clock.tpf) * clock.tpf;
-        var b = startT + Math.round(cuts[i].end * GCUT_TICKS / clock.tpf) * clock.tpf;
-        if (endT !== undefined) { a = Math.max(a, startT); b = Math.min(b, endT); }
+        var a = Math.round((startT + cuts[i].start * GCUT_TICKS) / tpf) * tpf;
+        var b = Math.round((startT + cuts[i].end * GCUT_TICKS) / tpf) * tpf;
+        if (endT !== undefined) { a = Math.max(a, Math.ceil(startT / tpf) * tpf); b = Math.min(b, Math.floor(endT / tpf) * tpf); }
         if (b > a) raw.push({ startT: a, endT: b });
     }
     raw.sort(function (x, y) { return x.startT - y.startT; });

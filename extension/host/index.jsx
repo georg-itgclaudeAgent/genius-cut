@@ -144,13 +144,30 @@ function gcutSpeed(item) {
 
 function gcutNode(item) { return item.projectItem ? item.projectItem.nodeId : null; }
 
-/** The source media's frame rate, falling back to the sequence's if Premiere won't say. */
-function gcutSourceFps(pi, clock) {
+// A "frame rate" above this is an audio file's sample rate (48000), not frames.
+var GCUT_MAX_FRAME_RATE = 1000;
+
+/** The source media's frame rate as Premiere reports it, or 0 if it won't say. */
+function gcutMediaFps(pi) {
     try {
         var fps = Number(pi.getFootageInterpretation().frameRate);
         if (fps > 0 && isFinite(fps)) return fps;
     } catch (e) { /* not available on this item */ }
-    return clock.fps;
+    return 0;
+}
+
+/** The source media's frame rate, falling back to the sequence's if Premiere won't say. */
+function gcutSourceFps(pi, clock) { return gcutMediaFps(pi) || clock.fps; }
+
+/**
+ * True if a source's frames coincide with the sequence's: EXACTLY the same rate, or an exact whole
+ * multiple (29.97 = 30000/1001 in a 29.97 sequence). Premiere 26.5.2 (measured 2026-10-08) reports a
+ * screen recording at 29.9950808 fps, and floors set points to THOSE frames: in a 30 fps sequence
+ * that drifts a frame every few minutes, so it doesn't fit.
+ */
+function gcutFits(srcFps, clock) {
+    var ratio = srcFps / clock.fps;
+    return Math.round(ratio) >= 1 && Math.abs(ratio - Math.round(ratio)) < 1e-5;
 }
 
 function gcutEffects(item, intrinsic, out) {
@@ -350,16 +367,18 @@ function gcutRefind(seq, spec, clock) {
         }
         if (typeof track.isLocked === "function" && track.isLocked()) throw new Error(label + " is locked. Unlock it to apply.");
         if (Math.abs(gcutSpeed(it) - 1) > 1e-6) throw new Error(label + " isn't at 100% speed. Nothing was changed.");
-        // Audio has no frame rate of its own (Premiere may report the sample rate, or 0): its source
-        // points snap to the sequence's frames. Video that fits the sequence's frame rate (the same,
-        // or a whole multiple) snaps to its own frames. Video that doesn't (a variable-frame-rate
-        // phone, 24 in 25) is "loose": cut on timeline time like audio, with one of its own frames
-        // of slack wherever Premiere floors a set point to them (gcutSlackS). Nothing is refused.
+        // A source that fits the sequence's frame rate (gcutFits) snaps to its own frames. One that
+        // doesn't (a variable-frame-rate phone, 24 in 25, a 29.995 screen recording in 30) is
+        // "loose": cut on timeline time, with one of its own frames of slack wherever Premiere
+        // floors a set point to them (gcutSlackS). Nothing is refused. Audio follows its project
+        // item's frame rate (a camera's own audio floors to the camera's frames, measured); an
+        // audio-only file (no rate, or a sample rate) has none, and snaps to the sequence's frames.
         var srcFrameS = clock.frameS, loose = false, mediaFrameS = 0;
-        if (x.kind !== "audio") {
-            var srcFps = gcutSourceFps(it.projectItem, clock), ratio = srcFps / clock.fps;
-            if (Math.round(ratio) < 1 || Math.abs(ratio - Math.round(ratio)) > 1e-3) { loose = true; mediaFrameS = 1 / srcFps; }
-            else srcFrameS = 1 / srcFps;
+        var srcFps = x.kind === "audio" ? gcutMediaFps(it.projectItem) : gcutSourceFps(it.projectItem, clock);
+        if (x.kind === "audio" && srcFps > GCUT_MAX_FRAME_RATE) srcFps = 0;
+        if (srcFps > 0) {
+            if (gcutFits(srcFps, clock)) srcFrameS = 1 / srcFps;
+            else { loose = true; mediaFrameS = 1 / srcFps; }
         }
         found.push({ kind: x.kind, trackIndex: x.trackIndex, label: label, item: it, pi: it.projectItem,
                      node: it.projectItem.nodeId, startT: gcutT(it.start), endT: gcutT(it.end),
@@ -371,7 +390,7 @@ function gcutRefind(seq, spec, clock) {
 
 /**
  * Extra tolerance, in seconds, for a recorded item's source points: one of its own frames for a
- * loose item (Premiere floors set points to them), none for any other. Lengths stay exact.
+ * loose item, video or audio (Premiere floors set points to them), none for any other. Lengths stay exact.
  */
 function gcutSlackS(f) { return f.loose ? f.mediaFrameS : 0; }
 
@@ -643,19 +662,30 @@ function gcutTrimTo(track, f, atT, endT, clock) {
 }
 
 /**
+ * True if a laid piece's in point, as Premiere reports it (gotS), fits the planned srcIn. Premiere
+ * floors the set point to the source's frames (up to gcutSlackS(f) early), and Premiere 26.5.2
+ * (measured) reports a track item's in point floored again, to the SEQUENCE's frames. So: no more
+ * than half a sequence frame late, and no earlier than the sequence frame holding srcIn less the
+ * slack, less half a frame. For a source whose frames are the sequence's, that is srcIn to half a frame.
+ */
+function gcutInPointOk(gotS, srcIn, f, clock) {
+    var low = Math.floor((srcIn - gcutSlackS(f)) / clock.frameS + 1e-6) * clock.frameS;
+    return gotS <= srcIn + clock.frameS / 2 && gotS >= low - clock.frameS / 2;
+}
+
+/**
  * null if every piece of `f` sits where planned; otherwise what's wrong. Start and length are
- * exact for every item (to half a sequence frame); a loose item's in point may sit up to one of
- * its own frames early, where Premiere floored it.
+ * exact for every item (to half a sequence frame); the in point as gcutInPointOk allows.
  */
 function gcutVerifyItems(seq, f, pieces, clock) {
-    var items = gcutItems(gcutKindTracks(seq, f.kind)[f.trackIndex]), inTolS = clock.frameS / 2 + gcutSlackS(f);
+    var items = gcutItems(gcutKindTracks(seq, f.kind)[f.trackIndex]);
     for (var p = 0; p < pieces.length; p++) {
         var ok = 0;
         for (var i = 0; i < items.length; i++) {
             var v = items[i];
             if (gcutNode(v) === f.node && gcutNear(gcutT(v.start), pieces[p].atT, clock.half) &&
                 gcutNear(gcutT(v.end) - gcutT(v.start), pieces[p].durT, clock.half) &&
-                gcutNear(v.inPoint.seconds, pieces[p].srcIn, inTolS)) ok++;
+                gcutInPointOk(v.inPoint.seconds, pieces[p].srcIn, f, clock)) ok++;
         }
         if (ok !== 1) return "Kept span " + (p + 1) + " of " + pieces.length + " on " + f.label + " didn't land where or as expected.";
     }

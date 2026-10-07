@@ -39,6 +39,9 @@ class ProjectItem {
   floorToFrames = false;
   /** Out points, and a clip's end, can't run past the end of the media (off by default). */
   clampToMedia = false;
+  /** Premiere 26.5.2 (measured 2026-10-08): an out point lands a whole number of the media's frames
+   *  after the in point already set, floored (off by default). */
+  outFromIn = false;
   mediaFps = FPS;
   constructor(public name: string, public nodeId: string, public durationS: number, public unit: Unit = "seconds", public hasAudio = true) {
     this.outS = durationS;
@@ -55,7 +58,12 @@ class ProjectItem {
     this.inS = s; return 0;
   }
   setOutPoint(v: any, _m: number) {
-    const s = this.clampToMedia ? Math.min(this.toSeconds(v), this.durationS) : this.toSeconds(v);
+    let s: number;
+    if (this.outFromIn) {
+      const raw = this.unit === "seconds" ? Number(v) : Number(v) / TICKS;
+      const want = this.clampToMedia ? Math.min(raw, this.durationS) : raw;
+      s = this.inS + Math.floor((want - this.inS) * this.mediaFps) / this.mediaFps;
+    } else s = this.clampToMedia ? Math.min(this.toSeconds(v), this.durationS) : this.toSeconds(v);
     if (this.rejectInAfterOut && s <= this.inS) throw new Error("Out point before in point");
     this.outS = s; return 0;
   }
@@ -64,17 +72,27 @@ class ProjectItem {
 }
 
 class TrackItem {
-  start: Time; inPoint: Time; outPoint: Time;
+  start: Time; outPoint: Time;
+  /** The source time the clip really starts at; `inPoint` is what Premiere reports of it. */
+  trueIn: Time;
   private _end: Time;
   selected = false; speed = 1; reversed = 0;
   linked: TrackItem[] = [];
   components: any;
   constructor(public track: Track, public projectItem: ProjectItem, startT: number, inS: number, durT: number, public mediaType: string) {
     this.start = Time.k(startT); this._end = Time.k(startT + durT);
-    this.inPoint = Time.s(inS); this.outPoint = Time.s(inS + durT / TICKS);
+    this.trueIn = Time.s(inS); this.outPoint = Time.s(inS + durT / TICKS);
     const names = mediaType === "Video" ? ["Opacity", "Motion"] : ["Volume", "Channel Volume", "Panner"];
     this.components = Object.assign(names.map((displayName) => ({ displayName })), { numItems: names.length });
   }
+  /** Premiere 26.5.2 (measured 2026-10-08) reports the in point floored to the SEQUENCE's frames
+   *  (`seq.inPointOnSeqGrid`); the simulator's own edits always use `trueIn`. */
+  get inPoint() {
+    if (!this.track.seq.inPointOnSeqGrid) return this.trueIn;
+    const tpf = Number(this.track.seq.timebase);
+    return Time.k(Math.floor(this.trueIn.t / tpf + 1e-6) * tpf);
+  }
+  set inPoint(v: Time) { this.trueIn = v; }
   get end() { return this._end; }
   /** A trim, as setting `end` is in Premiere: the in point stays, the out point follows. Throws when `seq.endSettable` is off. */
   set end(v: Time) {
@@ -82,13 +100,13 @@ class TrackItem {
     let t = Number(v.ticks);
     const pi = this.projectItem;
     if (pi.clampToMedia) { // the last whole sequence frame the media still covers
-      const tpf = Number(this.track.seq.timebase), last = this.start.t + (pi.durationS - this.inPoint.seconds) * TICKS;
+      const tpf = Number(this.track.seq.timebase), last = this.start.t + (pi.durationS - this.trueIn.seconds) * TICKS;
       t = Math.min(t, Math.floor(last / tpf + 1e-9) * tpf);
     }
     this.setEnd(t);
   }
   /** The simulator's own trims (overwrites), never refused. */
-  setEnd(t: number) { this._end = Time.k(t); this.outPoint = Time.s(this.inPoint.seconds + (t - this.start.t) / TICKS); }
+  setEnd(t: number) { this._end = Time.k(t); this.outPoint = Time.s(this.trueIn.seconds + (t - this.start.t) / TICKS); }
   get name() { return this.projectItem.name; }
   isSelected() { return this.selected; }
   getSpeed() { return this.speed; }
@@ -129,13 +147,13 @@ class Track {
       if (oe <= startT || os >= endT) continue;
       if (os >= startT && oe <= endT) { this.items = this.items.filter((i) => i !== o); continue; }
       if (os < startT && oe > endT) { // split: keep left, add right remainder
-        const right = new TrackItem(this, o.projectItem, endT, o.inPoint.seconds + (endT - os) / TICKS, oe - endT, o.mediaType);
+        const right = new TrackItem(this, o.projectItem, endT, o.trueIn.seconds + (endT - os) / TICKS, oe - endT, o.mediaType);
         this.items.push(right);
         o.setEnd(startT);
         continue;
       }
       if (os < startT) { o.setEnd(startT); }
-      else { o.inPoint = Time.s(o.inPoint.seconds + (endT - os) / TICKS); o.start = Time.k(endT); }
+      else { o.trueIn = Time.s(o.trueIn.seconds + (endT - os) / TICKS); o.start = Time.k(endT); }
     }
     const it = new TrackItem(this, pi, startT, inS, durT, this.kind === "video" ? "Video" : "Audio");
     this.items.push(it);
@@ -156,6 +174,8 @@ class Seq {
   dropSpanIndex = -1;
   ignoreInOut = false;
   endSettable = true;
+  /** TrackItem.inPoint reads floored to this sequence's frames, as measured in Premiere 26.5.2. */
+  inPointOnSeqGrid = false;
   removeLinked = false;
   moveLinked = false;
   private placements = 0;
@@ -1107,6 +1127,11 @@ describe("audio items and the frame-rate check", () => {
   it.each([48000, 0])("applies an audio item whose frame rate reads %s, its pieces' in points on the sequence frame grid", (fps) => {
     const s = ntscScene(fps);
     expect(applyCuts(s, [{ start: 2, end: 3 }])).toMatchObject({ ok: true });
+    // Audio-only (a sample rate, or no rate): neither loose nor on a grid of its own, the sequence's.
+    const rec: any = Object.values((s.host.ctx as any).$.global.gcutStash)[0];
+    const a1 = rec.items.find((i: any) => i.label === "A1");
+    expect([a1.loose, a1.mediaFrameS]).toEqual([false, 0]);
+    expect(a1.srcFrameS).toBeCloseTo(F, 12);
     const a = s.seq.audioTracks[0].clips;
     expect(a.numItems).toBe(2);
     for (let i = 0; i < a.numItems; i++) {
@@ -1397,5 +1422,138 @@ describe("Apply, Restore, Apply again, Close gap", () => {
     expect(span(s.seq.videoTracks[2])).toEqual([[100.28, 102, 5], [102, 106, 7.72], [106, 108, 12.72]]);
     expect(span(s.seq.audioTracks[0])).toEqual([[99, 102, 50], [102, 106, 54], [106, 109, 59]]);
     expect(span(s.seq.videoTracks[3])).toEqual([[110, 113, 0]]);
+  });
+});
+
+describe("measured in Premiere 26.5.2: classify by EXACT frame rate, audio follows its clip", () => {
+  const TPF30 = TICKS / 30, SEQ_F = 1 / 30;
+  const RESTREAM = 29.9950808, CAM_B = 17.363944, CAM_A = 29.896349;
+  /** As measured: set points floor to the media's own frames, and an out point lands whole frames after the in point. */
+  const measured = (name: string, node: string, durationS: number, fps: number, hasAudio: boolean) => {
+    const pi = new ProjectItem(name, node, durationS, "seconds", hasAudio);
+    pi.mediaFps = fps; pi.floorToFrames = true; pi.outFromIn = true;
+    return pi;
+  };
+  /** Georg's sequence (30 fps): Restream on V1 with its own audio on A1 (0–120 s, from 785.3 s), Camera B
+   *  on V2 (0.5–119 s), Camera A on V3 (1–121 s) whose source ends exactly where the clip does. */
+  function restreamScene() {
+    const seq = new Seq(3, 1);
+    seq.timebase = String(TPF30); seq.inPointOnSeqGrid = true;
+    const rs = measured("Restream.io.mp4", "node-r", 6219.453, RESTREAM, true);
+    const camB = measured("Camera B.mov", "node-b", 3600, CAM_B, false);
+    const camA = measured("Camera A.mov", "node-a", 1122.478, CAM_A, false);
+    camA.clampToMedia = true;
+    const v1 = seq.videoTracks[0].add(rs, 0, 785.3, 905.3);
+    const a1 = seq.audioTracks[0].add(rs, 0, 785.3, 905.3);
+    v1.linked = [a1]; a1.linked = [v1];
+    const v2 = seq.videoTracks[1].add(camB, 0.5, 700.1, 818.6);
+    const v3 = seq.videoTracks[2].add(camA, 1, 1002.478, 1122.478);
+    for (const x of [v1, v2, v3, a1]) x.selected = true;
+    return { seq, rs, camB, camA, host: load(seq) };
+  }
+  type Scene = ReturnType<typeof restreamScene>;
+  const tracks = (s: Scene) => [s.seq.videoTracks[0], s.seq.videoTracks[1], s.seq.videoTracks[2], s.seq.audioTracks[0]];
+  /** Each track's clip: [startFrame, endFrame, true source in, own frame length]. */
+  const ORIGINAL: [number, number, number, number][] = [[0, 3600, 785.3, 1 / RESTREAM], [15, 3570, 700.1, 1 / CAM_B],
+    [30, 3630, 1002.478, 1 / CAM_A], [0, 3600, 785.3, 1 / RESTREAM]];
+  const removedBefore = (cutsF: number[][], t: number) => cutsF.reduce((n, [a, b]) => n + (b <= t ? b - a : a < t ? t - a : 0), 0);
+  /** An item's kept pieces, the host's mapping: [atFrame, endFrame, fromFrame]. */
+  const plan = (startF: number, endF: number, cutsF: number[][]) => {
+    const out: number[][] = [];
+    let cursor = startF;
+    const push = (a: number, b: number) => { if (b > a) out.push([a - removedBefore(cutsF, a), b - removedBefore(cutsF, a), a]); };
+    for (const [a, b] of cutsF) { if (b <= cursor || a >= endF) continue; push(cursor, Math.min(a, endF)); cursor = Math.max(cursor, b); }
+    push(cursor, endF);
+    return out;
+  };
+  /** Every piece exactly on its planned sequence frames, and its true source in point no later than planned and
+   *  at most one sequence frame (the reported in point is floored to them) plus one own frame earlier. */
+  const expectLayout = (s: Scene, cutsF: number[][]) => tracks(s).forEach((t, k) => {
+    const [startF, endF, inS, ownF] = ORIGINAL[k], want = plan(startF, endF, cutsF), clips = t.clips;
+    expect(clips.map((i: TrackItem) => [i.start.t, i.end.t]), `track ${k}`).toEqual(want.map(([a, b]) => [a * TPF30, b * TPF30]));
+    want.forEach(([, , from], i) => {
+      const planned = inS + (from - startF) / 30, got = clips[i].trueIn.seconds;
+      expect(got, `track ${k} piece ${i}`).toBeLessThanOrEqual(planned + 1e-9);
+      expect(got, `track ${k} piece ${i}`).toBeGreaterThan(planned - SEQ_F - ownF);
+    });
+  });
+  const expectOriginal = (s: Scene) => expectLayout(s, []);
+  const toF = (c: number[][]) => c.map(([a, b]) => [Math.round(a * 30), Math.min(Math.round(b * 30), 3600)]);
+  const cutsOf = (c: number[][]) => c.map(([start, end]) => ({ start, end }));
+
+  it("records every Restream, Camera A and Camera B item as loose, the Restream audio too, with its own frame length", () => {
+    const s = restreamScene();
+    expect(applyCuts(s, cutsOf([[73, 74.433], [79.133, 81]]))).toMatchObject({ ok: true, clipCount: 4 });
+    const rec: any = Object.values((s.host.ctx as any).$.global.gcutStash)[0];
+    expect(rec.items.map((i: any) => [i.label, i.loose, i.mediaFrameS, i.srcFrameS]))
+      .toEqual([["V1", true, 1 / RESTREAM, SEQ_F], ["V2", true, 1 / CAM_B, SEQ_F], ["V3", true, 1 / CAM_A, SEQ_F], ["A1", true, 1 / RESTREAM, SEQ_F]]);
+  });
+
+  // The pair that failed on 2026-10-08 (kept source ≈ 859.733–864.433 s on Restream), cuts at the start and at the
+  // end of the range, and a sweep of pairs across the clips.
+  const sweep = Array.from({ length: 24 }, (_, k) => {
+    const a = 2 + k * 4.71 + (k % 7) * 0.0333;
+    return [[a, a + 0.4 + (k % 5) * 0.317], [a + 1.9 + (k % 3) * 0.271, a + 2.5 + (k % 4) * 0.5]];
+  });
+  const cases: number[][][] = [[[73, 74.433], [79.133, 81]], [[0, 0.7], [118.5, 120]], [[0.2, 0.633], [119.9, 120]], ...sweep];
+
+  it.each(cases)("cuts %j: Apply lays every track exactly on the sequence frames, back to back, and Restore is exact", (...c) => {
+    const s = restreamScene(), snap = snapshot(s);
+    expect(applyCuts(s, cutsOf(c), snap)).toMatchObject({ ok: true, clipCount: 4 });
+    expectLayout(s, toF(c));
+    for (const t of tracks(s)) for (let i = 1; i < t.clips.numItems; i++) expect(t.clips[i].start.t).toBe(t.clips[i - 1].end.t);
+    expect(s.host.call("gcutRestoreMulti", { startTicks: snap.startTicks })).toEqual({ ok: true });
+    expectOriginal(s);
+  });
+
+  it.each(cases)("cuts %j: a piece landing wrong rolls every track back exactly", (...c) => {
+    const s = restreamScene();
+    s.seq.dropSpanIndex = plan(0, 3600, toF(c)).length; // V2's first piece: V1's pieces are laid first
+    expect(applyCuts(s, cutsOf(c))).toMatchObject({ ok: false, rolledBack: true });
+    expectOriginal(s);
+  });
+
+  it("accepts a piece whose reported in point is two sequence frames early (its own floor, then the sequence's)", () => {
+    // Camera A alone at 100–104 s from 1002.478 s; the mic is an audio-only file. Find a piece start whose source
+    // time floors (to Camera A's frames) just over one sequence frame early: Premiere then reports it two early.
+    const seq = new Seq(1, 1);
+    seq.timebase = String(TPF30); seq.inPointOnSeqGrid = true;
+    const camA = measured("Camera A.mov", "node-a", 1122.478, CAM_A, false);
+    const mic = new ProjectItem("mic.wav", "node-m", 900, "seconds", false);
+    mic.mediaFps = 0;
+    const v1 = seq.videoTracks[0].add(camA, 100, 1002.478, 1006.478);
+    const a1 = seq.audioTracks[0].add(mic, 100, 50, 54);
+    v1.selected = true; a1.selected = true;
+    const s = { seq, host: load(seq) };
+    const reportedIn = Math.floor(1002.478 * 30) / 30, floorA = (x: number) => Math.floor(x * CAM_A) / CAM_A;
+    const j = Array.from({ length: 105 }, (_, k) => k + 15).find((k) => {
+      const p = reportedIn + k / 30;
+      return p - Math.floor(floorA(p) * 30 + 1e-6) / 30 > 1.5 / 30;
+    })!;
+    expect(j).toBeDefined();
+    expect(applyCuts(s, [{ start: j / 30 - 0.5, end: j / 30 }])).toMatchObject({ ok: true });
+    const piece = seq.videoTracks[0].clips[1];
+    expect(piece.start.t).toBe((3000 + j - 15) * TPF30);
+    expect((reportedIn + j / 30 - piece.inPoint.seconds) * 30).toBeCloseTo(2, 6);
+  });
+
+  describe("a source at exactly the sequence's rate, or a whole multiple, stays fitting (strict)", () => {
+    const F = 1001 / 30000;
+    it.each([30000 / 1001, 29.97, 60000 / 1001, 59.94])("%s fps in a 29.97 fps sequence", (fps) => {
+      const seq = new Seq(1, 1);
+      seq.timebase = String(Math.round(F * TICKS)); seq.inPointOnSeqGrid = true;
+      const cam = measured("cam.mov", "node-c", 900, fps, true);
+      const v1 = seq.videoTracks[0].add(cam, 2997 * F, 300 * F, 600 * F);
+      const a1 = seq.audioTracks[0].add(cam, 2997 * F, 300 * F, 600 * F);
+      v1.linked = [a1]; a1.linked = [v1]; v1.selected = true; a1.selected = true;
+      const s = { seq, host: load(seq) };
+      expect(applyCuts(s, [{ start: 2, end: 3.5 }, { start: 6.1, end: 7 }])).toMatchObject({ ok: true });
+      const rec: any = Object.values((s.host.ctx as any).$.global.gcutStash)[0];
+      expect(rec.items.map((i: any) => [i.label, i.loose, i.srcFrameS])).toEqual([["V1", false, 1 / fps], ["A1", false, 1 / fps]]);
+      const tpf = Math.round(F * TICKS);
+      for (const t of [seq.videoTracks[0], seq.audioTracks[0]]) {
+        expect(t.clips.map((i: TrackItem) => [i.start.t / tpf, i.end.t / tpf])).toEqual([[2997, 3057], [3057, 3135], [3135, 3225]]);
+      }
+    });
   });
 });

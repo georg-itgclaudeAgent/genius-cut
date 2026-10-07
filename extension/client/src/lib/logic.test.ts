@@ -53,6 +53,11 @@ describe("parseClipName", () => {
     ["trim interview_take3", "interview_take3"],
     ["interview_take3", "interview_take3"],
     ["  clip named   A-cam 02  ", "A-cam 02"],
+    // Extra instructions after the name aren't part of it (they still go to the AI).
+    ["trim the clip named interview_take3 and cut the tangents", "interview_take3"],
+    ["trim the clip named interview_take3, keep the jokes", "interview_take3"],
+    ["trim the clip named A-cam 02 but keep the pauses", "A-cam 02"],
+    ["trim the clip named \"Q and A.mp4\" and cut fillers", "Q and A.mp4"],
   ])("%s → %s", (input, name) => {
     expect(parseClipName(input)).toBe(name);
   });
@@ -60,6 +65,7 @@ describe("parseClipName", () => {
     expect(parseClipName("")).toBeNull();
     expect(parseClipName("trim it")).toBeNull();
     expect(parseClipName("tighten this")).toBeNull();
+    expect(parseClipName("trim the selected clip, but keep the natural ums")).toBeNull();
   });
 });
 

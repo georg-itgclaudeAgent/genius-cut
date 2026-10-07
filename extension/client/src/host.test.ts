@@ -534,3 +534,93 @@ describe("gcutSnapshotSelection", () => {
     expect(r.video[0].effects).toEqual([]);
   });
 });
+
+const rel = [{ start: 0, end: 2 }, { start: 3, end: 7 }, { start: 8, end: 10 }]; // keeps 8 of 10 s
+function applyMulti(s: ReturnType<typeof multiScene>, spans: unknown = rel, snap = snapshot(s)) {
+  const items = [...snap.video, ...snap.audio].map((i: any) => ({ kind: i.kind, trackIndex: i.trackIndex, startTicks: i.startTicks, endTicks: i.endTicks }));
+  return s.host.call("gcutApplyCutsMulti", { sequenceId: snap.sequenceId, startTicks: snap.startTicks, endTicks: snap.endTicks, items, spans });
+}
+const pieces = (t: Track) => t.clips.map((i: TrackItem) => [+(i.start.seconds).toFixed(3), +(i.end.seconds).toFixed(3), +(i.inPoint.seconds).toFixed(3)]);
+
+describe("gcutApplyCutsMulti", () => {
+  it("cuts every recorded clip identically, back to back, each from its own source", () => {
+    const s = multiScene({ music: false });
+    const r = applyMulti(s);
+    expect(r).toMatchObject({ ok: true, appliedCount: 3, clipCount: 4 });
+    expect(r.trailingGapS).toBeCloseTo(2, 3);
+    expect(pieces(s.seq.videoTracks[0])).toEqual([[100, 102, 10], [102, 106, 13], [106, 108, 18]]);
+    expect(pieces(s.seq.videoTracks[1])).toEqual([[100, 102, 12], [102, 106, 15], [106, 108, 20]]);
+    expect(pieces(s.seq.videoTracks[2])).toEqual([[100, 102, 5], [102, 106, 8], [106, 108, 13]]);
+  });
+
+  it("same-source camera audio ends up exactly once per piece on A1", () => {
+    const s = multiScene({ music: false });
+    applyMulti(s);
+    expect(pieces(s.seq.audioTracks[0])).toEqual([[100, 102, 10], [102, 106, 13], [106, 108, 18]]);
+    // The close-up's own audio that overwriteClip brought along (sim: lands on A2) is removed.
+    expect(s.seq.audioTracks[1].clips.numItems).toBe(0);
+  });
+
+  it("leaves everything it didn't record exactly as it was (the title on V4)", () => {
+    const s = multiScene({ music: false });
+    applyMulti(s);
+    expect(layout(s.seq.videoTracks[3])).toEqual([[104, 106]]);
+  });
+
+  it("uses the recorded clips even if the selection changed after Analyse", () => {
+    const s = multiScene({ music: false });
+    const snap = snapshot(s);
+    for (const v of [s.v1, s.v2, s.v3]) v.selected = false;
+    s.seq.videoTracks[3].clips[0].selected = true;
+    expect(applyMulti(s, rel, snap)).toMatchObject({ ok: true, clipCount: 4 });
+    expect(layout(s.seq.videoTracks[3])).toEqual([[104, 106]]);
+  });
+
+  it("refuses when a different sequence is open", () => {
+    const s = multiScene({ music: false });
+    const snap = snapshot(s);
+    s.seq.sequenceID = "seq-2";
+    const before = layout(s.seq.videoTracks[0]);
+    expect(() => applyMulti(s, rel, snap)).toThrow(/different sequence/);
+    expect(layout(s.seq.videoTracks[0])).toEqual(before);
+  });
+
+  it("refuses when a recorded clip moved since Analyse, naming its track", () => {
+    const s = multiScene({ music: false });
+    const snap = snapshot(s);
+    s.v2.start = Time.k(101 * TICKS); s.v2.end = Time.k(111 * TICKS);
+    expect(() => applyMulti(s, rel, snap)).toThrow(/V2's clip changed since Analyse/);
+  });
+
+  it("refuses a locked track before changing anything", () => {
+    const s = multiScene({ music: false });
+    s.seq.videoTracks[2].locked = true;
+    const before = layout(s.seq.videoTracks[0]);
+    expect(() => applyMulti(s)).toThrow(/V3 is locked/);
+    expect(layout(s.seq.videoTracks[0])).toEqual(before);
+  });
+
+  it("one piece landing wrong rolls back every clip to how it was", () => {
+    const s = multiScene({ music: false });
+    s.seq.dropSpanIndex = 4; // the 5th placement (V2's second piece) silently fails
+    const r = applyMulti(s);
+    expect(r).toMatchObject({ ok: false, rolledBack: true });
+    expect(r.message).toMatch(/V2/);
+    for (const [t, inS] of [[0, 10], [1, 12], [2, 5]] as const) expect(pieces(s.seq.videoTracks[t])).toEqual([[100, 110, inS]]);
+    expect(pieces(s.seq.audioTracks[0])).toEqual([[100, 110, 10]]);
+    expect(s.seq.audioTracks[1].clips.numItems).toBe(0);
+    expect([s.wide.inS, s.wide.outS]).toEqual([2, 58]);
+  });
+
+  it("works when Premiere rounds set points down to whole source frames", () => {
+    const s = multiScene({ music: false });
+    for (const pi of [s.wide, s.close, s.screen]) pi.floorToFrames = true;
+    expect(applyMulti(s, [{ start: 0, end: 2.5 }, { start: 3.03, end: 6.27 }, { start: 7.41, end: 9.97 }])).toMatchObject({ ok: true });
+  });
+
+  it("refuses a source whose frame rate doesn't fit the sequence's", () => {
+    const s = multiScene({ music: false });
+    s.close.mediaFps = 24;
+    expect(() => applyMulti(s)).toThrow(/V2.*24 fps.*25 fps/);
+  });
+});

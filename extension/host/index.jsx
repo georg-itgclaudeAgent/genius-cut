@@ -879,9 +879,9 @@ function gcutOurs(ours, track, startT) {
  * cuts removed before it (t -> t - removedBefore(t)), on every track: the mapping the recorded
  * clips already got, so titles, B-roll and music stay in step with the speech. The rebuilt pieces
  * are already in place and never move; clips starting before the range never move. Refuses,
- * before moving anything, a clip that crosses a cut (it would need cutting itself), a locked track
- * with a clip to move, and a slide that would land on a clip. Items already moved as a linked
- * partner are not moved twice.
+ * before moving anything, a rebuilt piece edited since Apply (it would slide a second time), a
+ * clip that crosses a cut (it would need cutting itself), a locked track with a clip to move, and
+ * a slide that would land on a clip. Items already moved as a linked partner are not moved twice.
  * spec: { startTicks } — the range start recorded at Analyse.
  */
 function gcutCloseGapMulti(specJson) {
@@ -892,12 +892,19 @@ function gcutCloseGapMulti(specJson) {
         if (rec.gapClosed) return gcutOk({ ok: true, movedCount: 0 });
 
         var ours = gcutOursNow(seq, rec, clock), movers = [], finals = [], tracks = gcutTracks(seq), t, i, j, c, it;
+        var span = gcutSpan(rec.items);
         for (t = 0; t < tracks.length; t++) {
             var items = gcutItems(tracks[t].track), later = false;
             finals.push([]); // where each clip on this track ends up
             for (i = 0; i < items.length; i++) {
                 it = items[i];
-                var s = gcutT(it.start), e = gcutT(it.end), shift = 0;
+                var s = gcutT(it.start), e = gcutT(it.end), shift = 0, n = gcutNode(it);
+                // A clip of a recorded source on its own track, among the rebuilt pieces, that is neither
+                // a planned piece nor was there at Apply is a piece edited since: it already slid once.
+                if (gcutHome(rec.items, n, tracks[t]) && gcutOverlaps(s, e, span.fromT, span.toT, clock) &&
+                    !gcutOurs(ours, tracks[t], s) && !gcutKept(rec.others, t, s, n)) {
+                    throw new Error("A rebuilt clip on " + tracks[t].label + " changed since Apply. Close the gap by hand.");
+                }
                 if (s >= rec.startT - clock.half && !gcutOurs(ours, tracks[t], s)) {
                     for (c = 0; c < rec.cutsT.length; c++) {
                         if (gcutOverlaps(s, e, rec.cutsT[c].startT, rec.cutsT[c].endT, clock)) {

@@ -948,8 +948,8 @@ describe("gcutRestoreMulti", () => {
     expect(() => restoreMulti(s)).toThrow(/Undo/);
     const rec = (s.host.ctx as any).$.global.gcutStash["m@" + START];
     expect([rec.rebuiltEndT, rec.gapClosed]).toEqual([108 * TICKS, false]);
-    // The clips that did go back whole aren't planned pieces, so Close gap sees them crossing the cuts.
-    expect(() => closeGapMulti(s)).toThrow(/close\.mov on V2 crosses a cut at 1:42\.0/);
+    // The clips that did go back whole aren't planned pieces, so Close gap refuses them as changed since Apply.
+    expect(() => closeGapMulti(s)).toThrow("A rebuilt clip on V2 changed since Apply. Close the gap by hand.");
   });
 });
 
@@ -1117,5 +1117,36 @@ describe("cuts land on whole sequence frames", () => {
     const at = (x: number) => Math.round(x * TICKS);
     const c = ctx.gcutCutTicks([{ start: 0, end: 0.5 }, { start: 2, end: 3 }, { start: 9.5, end: 10 }], at(100.01), { tpf: TPF }, at(110.01));
     expect(c.map((x: any) => [x.startT / TICKS, x.endT / TICKS])).toEqual([[100.04, 100.52], [102, 103], [109.52, 110]]);
+  });
+});
+
+describe("Close gap after a rebuilt piece was edited", () => {
+  it("refuses, naming the track, when a rebuilt piece was trimmed after Apply, and moves nothing", () => {
+    const s = georgScene();
+    applyCuts(s, cuts);
+    // Trim the head of V1's middle piece (102–106) to 103.5: it would otherwise slide by the 1 s cut before it, a second time.
+    const mid = s.seq.videoTracks[0].clips[1];
+    mid.start = Time.s(103.5); mid.inPoint = Time.s(mid.inPoint.seconds + 1.5);
+    const before = [0, 1, 2, 3].map((t) => span(s.seq.videoTracks[t]));
+    expect(() => s.host.call("gcutCloseGapMulti", { startTicks: START })).toThrow("A rebuilt clip on V1 changed since Apply. Close the gap by hand.");
+    expect([0, 1, 2, 3].map((t) => span(s.seq.videoTracks[t]))).toEqual(before);
+  });
+});
+
+describe("Apply, Restore, Apply again, Close gap", () => {
+  it("ends with the hand-made offsets intact and the title slid by the total", () => {
+    const s = georgScene();
+    expect(applyCuts(s, cuts)).toMatchObject({ ok: true });
+    expect(s.host.call("gcutRestoreMulti", { startTicks: START })).toEqual({ ok: true });
+    // Restore lays fresh clips: select them again, as the editor would, and Analyse again.
+    for (const t of [0, 1, 2]) for (const x of s.seq.videoTracks[t].items) x.selected = true;
+    for (const x of s.seq.audioTracks[0].items) x.selected = true;
+    expect(applyCuts(s, cuts)).toMatchObject({ ok: true, clipCount: 4 });
+    expect(s.host.call("gcutCloseGapMulti", { startTicks: START })).toEqual({ ok: true, movedCount: 1 });
+    expect(span(s.seq.videoTracks[0])).toEqual([[100, 102, 10], [102, 106, 13], [106, 108, 18]]);
+    expect(span(s.seq.videoTracks[1])).toEqual([[100.24, 102, 30], [102, 106, 32.76], [106, 107.84, 37.76]]);
+    expect(span(s.seq.videoTracks[2])).toEqual([[100.28, 102, 5], [102, 106, 7.72], [106, 108, 12.72]]);
+    expect(span(s.seq.audioTracks[0])).toEqual([[99, 102, 50], [102, 106, 54], [106, 109, 59]]);
+    expect(span(s.seq.videoTracks[3])).toEqual([[110, 113, 0]]);
   });
 });

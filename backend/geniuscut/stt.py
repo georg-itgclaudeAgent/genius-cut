@@ -9,12 +9,15 @@ remaining failure at startup instead of mid-request.
 """
 
 import ctypes
+import logging
 import os
 import sys
 from pathlib import Path
 from typing import Callable, Protocol
 
 from geniuscut.models import Word
+
+log = logging.getLogger(__name__)
 
 
 def model_for(device: str) -> str:
@@ -84,10 +87,25 @@ class Transcriber(Protocol):
     def transcribe(self, wav: Path) -> list[Word]: ...
 
 
-def _whisper_model(name: str, device: str, compute_type: str):
-    from faster_whisper import WhisperModel
+def model_is_cached(name: str) -> bool:
+    """True if the model is already on disk (Hugging Face cache or a local folder)."""
+    if Path(name).is_dir():
+        return True
+    try:
+        from faster_whisper.utils import download_model
 
-    return WhisperModel(name, device=device, compute_type=compute_type)
+        download_model(name, local_files_only=True)
+        return True
+    except Exception:  # noqa: BLE001 — anything else means "needs a download"
+        return False
+
+
+def _whisper_model(name: str, device: str, compute_type: str):
+    import faster_whisper
+
+    # A cached model loads straight from disk: no online check, so startup works offline.
+    return faster_whisper.WhisperModel(name, device=device, compute_type=compute_type,
+                                       local_files_only=model_is_cached(name))
 
 
 class FasterWhisperTranscriber:
@@ -105,6 +123,7 @@ class FasterWhisperTranscriber:
         self.cuda_error: str | None = None
         self.device = "cpu"
         self._model = None
+        self._cpu_model = None  # loaded on first use, if a request ever fails on the GPU
         if cuda_ready():
             try:
                 self.model_name = model_name or model_for("cuda")
@@ -114,6 +133,7 @@ class FasterWhisperTranscriber:
                 self.device = "cuda"
             except Exception as e:  # noqa: BLE001 — any GPU failure means "use the CPU"
                 self.cuda_error = str(e)
+                log.warning("The speech model couldn't start on the GPU, using the CPU: %s", e)
                 self._model = None
         else:
             self.cuda_error = "CUDA 12 / cuDNN 9 runtime not available"
@@ -132,20 +152,21 @@ class FasterWhisperTranscriber:
         # argument PyAV 19 removed. Our WAVs always come from audio.extract_span.
         samples = read_wav_16k_mono(wav)
         try:
-            return self._words(samples)
+            return self._words(self._model, samples)
         except Exception as e:  # noqa: BLE001
             if self.device != "cuda":
                 raise
-            # e.g. out of GPU memory while Premiere is using the same card.
+            # e.g. out of GPU memory while Premiere is using the same card. Only this request
+            # moves to the CPU: the next one tries the GPU again.
             self.cuda_error = str(e)
-            self.model_name = self._explicit or model_for("cpu")
-            self._model = self._factory(self.model_name, device="cpu", compute_type="int8")
-            self.device = "cpu"
-            return self._words(samples)
+            log.warning("Transcription failed on the GPU, retrying this clip on the CPU: %s", e)
+            if self._cpu_model is None:
+                self._cpu_model = self._factory(self._explicit or model_for("cpu"), device="cpu", compute_type="int8")
+            return self._words(self._cpu_model, samples)
 
-    def _words(self, samples) -> list[Word]:
+    def _words(self, model, samples) -> list[Word]:
         extra = {"initial_prompt": VERBATIM_PROMPT} if _verbatim() else {}
-        segments, _ = self._model.transcribe(samples, word_timestamps=True, vad_filter=True, **extra)
+        segments, _ = model.transcribe(samples, word_timestamps=True, vad_filter=True, **extra)
         words: list[Word] = []
         for seg in segments:
             for w in seg.words or []:

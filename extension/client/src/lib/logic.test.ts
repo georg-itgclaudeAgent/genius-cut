@@ -3,7 +3,7 @@ import { keptSpansSource, reviewSummary } from "./review";
 import { parseClipName } from "./prompt";
 import { formatTimecode, formatDuration } from "./timecode";
 import { backendPaths, parseRuntimePointer, liveRuntimePython } from "./paths";
-import { ensureBackend } from "./lifecycle";
+import { ensureBackend, startingMessage } from "./lifecycle";
 import type { Health, SequenceCut } from "../api/types";
 
 const cut = (start: number, end: number, reason = "filler"): SequenceCut => ({
@@ -185,5 +185,20 @@ describe("liveRuntimePython", () => {
   });
   it("malformed pointer is null without probing the filesystem", () => {
     expect(liveRuntimePython("nope", () => { throw new Error("should not be called"); })).toBeNull();
+  });
+});
+
+describe("startingMessage", () => {
+  // Checkpoint B (2026-10-07): the panel said "downloads about 3 GB" on every start, though the
+  // model was cached and only loading into the graphics card.
+  const h = (stt_phase?: "loading" | "downloading") => ({ status: "ok" as const, version: "0.1.0", stt_device: "loading", stt_phase });
+  it("says loading, not downloading, when the model is already on this PC", () => {
+    expect(startingMessage(h("loading"))).toBe("Loading the speech model (about 30 seconds)…");
+  });
+  it("mentions the download only when one is really happening", () => {
+    expect(startingMessage(h("downloading"))).toBe("Downloading the speech model. This happens once and is about 3 GB.");
+  });
+  it("falls back to loading for a backend that doesn't report a phase", () => {
+    expect(startingMessage(h())).toBe("Loading the speech model (about 30 seconds)…");
   });
 });

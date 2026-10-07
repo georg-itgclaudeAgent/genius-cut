@@ -74,6 +74,7 @@ def create_app(
     extract: Callable = audio.extract_span,
     llm: Callable[[str], str] = llm.ask_text,
     load_error: Callable[[], str | None] = lambda: None,
+    stt_phase: Callable[[], str | None] = lambda: None,
     retry_load: Callable[[], None] = lambda: None,
 ) -> FastAPI:
     llm_cost = globals()["llm"].run_cost  # the `llm` parameter shadows the module in here
@@ -100,6 +101,8 @@ def create_app(
     @app.get("/health")
     def health() -> dict:
         body = {"status": "ok", "version": config.VERSION, "stt_device": stt_device(), "ai": ai_status()}
+        if body["stt_device"] == "loading":
+            body["stt_phase"] = stt_phase() or "loading"  # "downloading" only when it really is
         err = load_error()
         if err:
             body.update(status="error", error=f"The speech model failed to load: {err}")
@@ -151,12 +154,21 @@ def create_app(
     return app
 
 
+def load_phase() -> str:
+    """'downloading' if the speech model this machine will use isn't cached yet, else 'loading'."""
+    from geniuscut import stt
+
+    name = stt.model_for("cuda" if stt.cuda_runtime_available() else "cpu")
+    return "loading" if stt.model_is_cached(name) else "downloading"
+
+
 class _ModelLoader:
     """Loads the transcriber once, in the background; a failed load can be retried."""
 
     def __init__(self):
         self.transcriber = None
         self.error: str | None = None
+        self.phase: str | None = None
         self._lock = threading.Lock()
         self._loading = False
         self.retry()
@@ -170,6 +182,10 @@ class _ModelLoader:
 
     def _load(self):
         try:
+            try:
+                self.phase = load_phase()
+            except Exception:  # noqa: BLE001 — the phase is only for the panel's message
+                self.phase = "loading"
             from geniuscut.stt import FasterWhisperTranscriber
 
             t = FasterWhisperTranscriber()
@@ -200,7 +216,7 @@ if __name__ == "__main__":
         _sys.exit(0 if len(words) >= 5 else 1)
     loader = _ModelLoader()
     uvicorn.run(
-        create_app(token=config.get_or_create_token(), stt_device=loader.device,
+        create_app(token=config.get_or_create_token(), stt_device=loader.device, stt_phase=lambda: loader.phase,
                    transcriber=lambda: loader.transcriber,
                    load_error=lambda: None if loader.transcriber else loader.error,
                    retry_load=loader.retry),

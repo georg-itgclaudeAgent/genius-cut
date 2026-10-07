@@ -122,3 +122,72 @@ def test_cuda_failure_falls_back_to_cpu_with_the_cpu_model(monkeypatch):
     t = stt.FasterWhisperTranscriber(model_factory=factory, cuda_ready=lambda: True, warm_up=False)
     assert made == [("large-v3", "cuda"), ("large-v3-turbo", "cpu")]
     assert t.device == "cpu" and t.model_name == "large-v3-turbo"
+
+
+class _Seg:
+    def __init__(self, words):
+        self.words = words
+
+
+class _W:
+    def __init__(self, word, start, end):
+        self.word, self.start, self.end = word, start, end
+
+
+def test_a_gpu_failure_mid_request_uses_the_cpu_for_that_request_only(tmp_path, caplog):
+    # Checkpoint B (2026-10-07): a 1 h 30 min clip failed on the GPU. The fallback then stayed on
+    # the slow CPU model for every later request, and the GPU's error was never logged.
+    made, gpu_calls = [], []
+
+    class GPU:
+        def transcribe(self, audio, **kw):
+            gpu_calls.append(1)
+            if len(gpu_calls) == 1:
+                raise RuntimeError("CUDA failed with error out of memory")
+            return iter([_Seg([_W(" gpu", 0.0, 0.5)])]), None
+
+    class CPU:
+        def transcribe(self, audio, **kw):
+            return iter([_Seg([_W(" cpu", 0.0, 0.5)])]), None
+
+    def factory(name, device, compute_type):
+        made.append((name, device))
+        return GPU() if device == "cuda" else CPU()
+
+    t = stt.FasterWhisperTranscriber(model_factory=factory, cuda_ready=lambda: True, warm_up=False)
+    wav = _silent_wav(tmp_path)
+    with caplog.at_level("WARNING"):
+        assert [w.w for w in t.transcribe(wav)] == ["cpu"]
+    assert "out of memory" in caplog.text
+    assert t.device == "cuda"
+    assert [w.w for w in t.transcribe(wav)] == ["gpu"]  # the next request is back on the GPU
+    assert [d for _, d in made].count("cpu") == 1      # the CPU model is loaded once, then reused
+
+
+def test_model_is_cached_asks_without_going_online(monkeypatch):
+    seen = {}
+
+    def fake_download(name, local_files_only=False, **kw):
+        seen["local_only"] = local_files_only
+        raise OSError("not in the cache")
+
+    monkeypatch.setattr("faster_whisper.utils.download_model", fake_download)
+    assert stt.model_is_cached("large-v3") is False and seen["local_only"] is True
+    monkeypatch.setattr("faster_whisper.utils.download_model", lambda name, **kw: "C:/cache/large-v3")
+    assert stt.model_is_cached("large-v3") is True
+
+
+def test_a_cached_model_loads_without_checking_online(monkeypatch):
+    got = {}
+
+    class FakeWhisper:
+        def __init__(self, name, **kw):
+            got.update(kw)
+
+    monkeypatch.setattr("faster_whisper.WhisperModel", FakeWhisper)
+    monkeypatch.setattr(stt, "model_is_cached", lambda name: True)
+    stt._whisper_model("large-v3", device="cuda", compute_type="float16")
+    assert got["local_files_only"] is True
+    monkeypatch.setattr(stt, "model_is_cached", lambda name: False)
+    stt._whisper_model("large-v3", device="cuda", compute_type="float16")
+    assert got["local_files_only"] is False

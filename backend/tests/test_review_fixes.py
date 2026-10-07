@@ -101,7 +101,8 @@ def test_i3_gpu_failure_during_transcription_retries_on_cpu(tmp_path):
     assert t.device == "cuda"
     words = t.transcribe(wav)
     assert [w.w for w in words] == ["hi"]
-    assert t.device == "cpu" and "out of memory" in t.cuda_error
+    # Only that request moved to the CPU (Checkpoint B, 2026-10-07): the GPU stays in use.
+    assert t.device == "cuda" and "out of memory" in t.cuda_error
 
 
 # ── I4: loopback only, even through DNS rebinding ──────────────────

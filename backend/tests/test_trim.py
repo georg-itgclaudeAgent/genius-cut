@@ -170,3 +170,27 @@ def test_a_minimum_pause_too_short_for_breathing_room_is_a_422(tmp_path):
     c, auth = api(tmp_path, FakeTranscriber())
     r = c.post("/trim", json={**REQ.model_dump(), "cut_pauses": True, "min_pause_s": 0.3}, headers=auth)
     assert r.status_code == 422
+
+
+def _health(tmp_path, device, phase):
+    app = create_app(token=get_or_create_token(tmp_path), stt_device=lambda: device, stt_phase=lambda: phase,
+                     library_dir=tmp_path / "library")
+    return TestClient(app, base_url="http://127.0.0.1:8791").get("/health").json()
+
+
+def test_health_says_whether_the_speech_model_is_loading_or_downloading(tmp_path):
+    # The panel said "the first start downloads about 3 GB" every time; a cached model only loads.
+    assert _health(tmp_path, "loading", "loading")["stt_phase"] == "loading"
+    assert _health(tmp_path, "loading", "downloading")["stt_phase"] == "downloading"
+    assert "stt_phase" not in _health(tmp_path, "cuda", None)
+
+
+def test_the_loader_reports_downloading_only_for_a_model_that_isnt_cached(monkeypatch):
+    import server
+    from geniuscut import stt
+    monkeypatch.setattr(stt, "cuda_runtime_available", lambda: True)
+    monkeypatch.setattr(stt, "model_is_cached", lambda name: name == "large-v3")
+    monkeypatch.delenv("GENIUSCUT_WHISPER_MODEL", raising=False)
+    assert server.load_phase() == "loading"
+    monkeypatch.setattr(stt, "model_is_cached", lambda name: False)
+    assert server.load_phase() == "downloading"

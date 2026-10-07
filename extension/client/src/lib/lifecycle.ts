@@ -44,3 +44,10 @@ export async function ensureBackend({ health, spawn, sleep, attempts = 30, inter
       "Check the log at %APPDATA%/itGenius/genius-cut/backend.log.",
   };
 }
+
+/** What the panel says while the speech model loads: a download only when one is happening. */
+export function startingMessage(h: Health): string {
+  return h.stt_phase === "downloading"
+    ? "Downloading the speech model. This happens once and is about 3 GB."
+    : "Loading the speech model (about 30 seconds)…";
+}

@@ -2,6 +2,7 @@ import { useState } from "react";
 import { runtime } from "./api/runtime";
 import type { ClipInfo, TrimResponse } from "./api/types";
 import { useBackend } from "./hooks/useBackend";
+import { startingMessage } from "./lib/lifecycle";
 import { CutTab } from "./components/CutTab";
 import { StyleLibrary, type LastTrim } from "./components/StyleLibrary";
 
@@ -11,7 +12,7 @@ function BackendStatus({ state, onRetry }: { state: ReturnType<typeof useBackend
   if (state.kind === "ready") return null;
   const text =
     state.kind === "checking" ? "Connecting to the Genius Cut backend…"
-    : state.kind === "starting" ? "Loading the speech model. The first start downloads about 3 GB."
+    : state.kind === "starting" ? startingMessage(state.health)
     : state.message;
   return (
     <div className="sec">

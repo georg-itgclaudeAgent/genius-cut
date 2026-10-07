@@ -247,7 +247,7 @@ function gcutSnapshotSelection(nameJson) {
         for (i = 0; i < video.length; i++) {
             var v = video[i].item, lbl = gcutLabel("video", video[i].track);
             if (!gcutNear(gcutT(v.start), startT, clock.half) || !gcutNear(gcutT(v.end), endT, clock.half)) {
-                var off = Math.abs(gcutT(v.start) - startT) / GCUT_TICKS;
+                var off = Math.max(Math.abs(gcutT(v.start) - startT), Math.abs(gcutT(v.end) - endT)) / GCUT_TICKS;
                 problems.push(lbl + " doesn't start and end with " + gcutLabel("video", first.track) + " (off by " +
                     off.toFixed(2) + " s). Genius Cut needs synced clips that start and end together.");
             }
@@ -312,6 +312,25 @@ function gcutRefind(seq, spec, clock) {
                      outS: it.outPoint.seconds, srcFrameS: 1 / srcFps });
     }
     return found;
+}
+
+/**
+ * Refuse if any audio under [startT, endT), on any audio track, wasn't recorded at Analyse: an
+ * angle's linked audio may land on that track and overwrite it, and that's only seen afterwards.
+ */
+function gcutAudioAdded(seq, spec, startT, endT, clock) {
+    for (var t = 0; t < seq.audioTracks.numTracks; t++) {
+        var items = gcutItems(seq.audioTracks[t]);
+        for (var i = 0; i < items.length; i++) {
+            var it = items[i], s = gcutT(it.start), recorded = false;
+            if (gcutT(it.end) <= startT + clock.half || s >= endT - clock.half) continue;
+            for (var j = 0; j < spec.items.length; j++) {
+                var x = spec.items[j];
+                if (x.kind === "audio" && x.trackIndex === t && it.start.ticks === String(x.startTicks)) recorded = true;
+            }
+            if (!recorded) throw new Error("Something was added under the clips on " + gcutLabel("audio", t) + " since Analyse. Analyse again.");
+        }
+    }
 }
 
 /**
@@ -531,6 +550,7 @@ function gcutApplyCutsMulti(specJson) {
         if (!gcutIsArray(spec.items) || !spec.items.length) throw new Error("No clips were recorded at Analyse. Analyse again.");
         var startT = Number(spec.startTicks), endT = Number(spec.endTicks);
         var found = gcutRefind(seq, spec, clock);
+        gcutAudioAdded(seq, spec, startT, endT, clock);
         var pieces = gcutPieces(spec.spans, (endT - startT) / GCUT_TICKS, clock);
         var others = gcutOthers(seq, found, startT, endT);
         for (k = 0; k < found.length; k++) {
@@ -617,22 +637,22 @@ function gcutOursNow(seq, rec, fromT, toT, clock) {
 
 /**
  * Restore re-lays every recorded clip over the whole range on its own track (and the camera
- * angles may bring their audio along). Refuse if anything that wasn't there at Apply now sits
- * where that would overwrite it: anywhere in the range on a recorded track, or in the gap on any
- * track. Returns the refusal, or null.
+ * angles may bring their audio along, onto any audio track). Refuse if anything that wasn't there
+ * at Apply now sits where that would overwrite it: anywhere in the range on a recorded track or
+ * any audio track, or in the gap on any track. Returns the refusal, or null.
  */
 function gcutInTheWay(seq, rec, others, clock) {
     var tracks = gcutTracks(seq);
     for (var i = 0; i < others.length; i++) {
-        var o = others[i], recorded = false;
+        var o = others[i], guarded = tracks[o.t].audio;
         if (gcutKept(rec.others, o.t, o.start, o.node)) continue;
         for (var j = 0; j < rec.items.length; j++) {
-            if ((rec.items[j].kind === "audio") === tracks[o.t].audio && rec.items[j].trackIndex === tracks[o.t].index) recorded = true;
+            if ((rec.items[j].kind === "audio") === tracks[o.t].audio && rec.items[j].trackIndex === tracks[o.t].index) guarded = true;
         }
         if (o.end > rec.rebuiltEndT + clock.half && o.start < rec.endT - clock.half) {
             return "Something was placed in the gap on " + o.label + " since, and restoring would overwrite it. Use Premiere's Undo instead.";
         }
-        if (recorded && o.start < rec.endT - clock.half) {
+        if (guarded && o.start < rec.endT - clock.half) {
             return "Something was placed on " + o.label + " over the cut clips since, and restoring would overwrite it. Use Premiere's Undo instead.";
         }
     }

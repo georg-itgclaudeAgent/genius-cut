@@ -371,16 +371,17 @@ describe("gcutApplyCutsMulti: one clip", () => {
     expect([s.pi.inS, s.pi.outS]).toEqual([2, 58]);
   });
 
-  it("C3: refuses when audio landing elsewhere would overwrite other audio — and reports it", () => {
+  it("C3: refuses, before changing anything, when unrecorded audio sits where linked audio could land", () => {
     const s = scene();
     const music = new ProjectItem("music.wav", "node-9", 300);
     s.seq.audioTracks[1].add(music, 90, 0, 40);
     s.seq.audioTrackFor = () => 1; // Premiere puts the rebuilt audio on A2, over the music
-    // The snapshot refuses the music bed as a J/L overhang; send only V1 + A1 to reach the rebuild.
+    // The snapshot refuses the music bed as a J/L overhang; send only V1 + A1 to reach Apply.
     const items = [{ kind: "video", trackIndex: 0 }, { kind: "audio", trackIndex: 0 }].map((i) => ({ ...i, startTicks: START, endTicks: String(110 * TICKS) }));
-    const r = s.host.call("gcutApplyCutsMulti", { sequenceId: "seq-1", startTicks: START, endTicks: String(110 * TICKS), items, spans: rel });
-    expect(r.ok).toBe(false);
-    expect(r.message).toMatch(/A2/);
+    expect(() => s.host.call("gcutApplyCutsMulti", { sequenceId: "seq-1", startTicks: START, endTicks: String(110 * TICKS), items, spans: rel }))
+      .toThrow(/on A2 since Analyse/);
+    expect(layout(s.seq.audioTracks[1])).toEqual([[90, 130]]);
+    expect(layout(s.seq.videoTracks[0])).toEqual([[100, 110]]);
   });
 
   it("C3: refuses a J/L cut (linked audio extends past the video) before changing anything", () => {
@@ -512,6 +513,12 @@ describe("gcutSnapshotSelection", () => {
     expect(snapshot(s).problems.join(" ")).toMatch(/V2.*3\.00 s.*start and end together/);
   });
 
+  it("measures an end-only mismatch too, rather than saying off by 0.00 s", () => {
+    const s = multiScene({ music: false });
+    s.v2.end = Time.k(112 * TICKS);
+    expect(snapshot(s).problems.join(" ")).toMatch(/V2 doesn't start and end with V1 \(off by 2\.00 s\)/);
+  });
+
   it("says when there's no audio under the clips", () => {
     const s = multiScene({ music: false });
     s.seq.audioTracks[0].items = [];
@@ -632,6 +639,18 @@ describe("gcutApplyCutsMulti", () => {
     const s = multiScene({ music: false });
     s.close.mediaFps = 24;
     expect(() => applyMulti(s)).toThrow(/V2.*24 fps.*25 fps/);
+  });
+
+  it("refuses audio added under the clips since Analyse, naming the track, before changing anything", () => {
+    const s = multiScene({ music: false });
+    const snap = snapshot(s);
+    // An angle's linked audio would land on A2 (sim) and destroy it, so it must be caught up front.
+    s.seq.audioTracks[1].add(new ProjectItem("sfx.wav", "node-x", 5, "seconds", false), 103, 0, 1);
+    const all = () => [...[0, 1, 2, 3].map((t) => pieces(s.seq.videoTracks[t])), ...[0, 1, 2].map((t) => pieces(s.seq.audioTracks[t]))];
+    const before = all();
+    expect(() => applyMulti(s, rel, snap)).toThrow("Something was added under the clips on A2 since Analyse. Analyse again.");
+    expect(all()).toEqual(before);
+    expect(pieces(s.seq.audioTracks[1])).toEqual([[103, 104, 0]]);
   });
 });
 
@@ -758,6 +777,18 @@ describe("gcutRestoreMulti", () => {
     s.seq.videoTracks[1].add(new ProjectItem("logo.png", "node-l", 5, "seconds", false), 101, 0, 0.5);
     expect(() => restoreMulti(s)).toThrow(/V2/);
     expect(layout(s.seq.videoTracks[1])).toContainEqual([101, 101.5]);
+  });
+  it("refuses, naming the track, if audio was added under the cut clips on a track it didn't record", () => {
+    const s = multiScene({ music: false });
+    applyMulti(s);
+    // A2 holds nothing recorded, but the angles' linked audio lands there when Restore re-lays them.
+    s.seq.audioTracks[1].add(new ProjectItem("sfx.wav", "node-x", 5, "seconds", false), 101, 0, 0.5);
+    expect(() => restoreMulti(s)).toThrow(/A2/);
+    expect(pieces(s.seq.audioTracks[1])).toEqual([[101, 101.5, 0]]);
+    for (const [t, inS] of [[0, 10], [1, 12], [2, 5]] as const) {
+      expect(pieces(s.seq.videoTracks[t])).toEqual([[100, 102, inS], [102, 106, inS + 3], [106, 108, inS + 8]]);
+    }
+    expect(pieces(s.seq.audioTracks[0])).toEqual([[100, 102, 10], [102, 106, 13], [106, 108, 18]]);
   });
   it("leaves alone a clip that already sat in the gap at Apply", () => {
     const s = multiScene({ music: false });

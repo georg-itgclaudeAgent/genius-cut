@@ -158,3 +158,57 @@ def test_api_errors_become_readable_claude_errors():
 
     with pytest.raises(claude.ClaudeError, match="reach"):
         claude.ask_json("hi", {}, client=_raising_client(anthropic.APIConnectionError(request=req)))
+
+
+# ── long transcripts go to the model in chunks ──────────────────────
+
+class SequenceClient(FakeClient):
+    """Returns one canned reply per call, in order, and records each prompt."""
+
+    def __init__(self, payloads):
+        super().__init__({})
+        self._payloads = list(payloads)
+
+    def _create(self, **kwargs):
+        self.requests.append(kwargs)
+        body = json.dumps(self._payloads.pop(0))
+        return SimpleNamespace(stop_reason="end_turn", stop_details=None, content=[SimpleNamespace(type="text", text=body)])
+
+
+def _sentences(n_sentences, words_each=5):
+    out, t = [], 0.0
+    for s in range(n_sentences):
+        for i in range(words_each):
+            text = f"w{s}_{i}" + ("." if i == words_each - 1 else "")
+            out.append(Word(w=text, start=round(t, 2), end=round(t + 0.3, 2)))
+            t += 0.4
+    return out
+
+
+def test_chunks_split_at_sentence_ends_near_the_target_size():
+    words = _sentences(6)  # 30 words, sentences end at indices 4, 9, 14, 19, 24, 29
+    assert cuts.chunk_bounds(words, size=12, slack=3) == [(0, 15), (15, 30)]
+
+
+def test_a_transcript_without_sentence_ends_is_split_at_the_size():
+    words = [Word(w=f"w{i}", start=i, end=i + 0.5) for i in range(25)]
+    assert cuts.chunk_bounds(words, size=10, slack=2) == [(0, 10), (10, 20), (20, 25)]
+
+
+def test_long_transcripts_are_proposed_chunk_by_chunk_with_indices_mapped_back():
+    # A 90-minute clip is ~16,000 words: one reply listing every cut would hit the output cap.
+    words = _sentences(6)
+    client = SequenceClient([
+        {"cuts": [{"start_idx": 1, "end_idx": 1, "reason": "filler"}]},
+        {"cuts": [{"start_idx": 0, "end_idx": 1, "reason": "repeat"}]},  # chunk 2's own indices
+    ])
+    result = cuts.propose_cuts(words, FewShot(None, []), client=client, chunk_words=12)
+    assert len(client.requests) == 2
+    assert "[0] w3_0" in client.requests[1]["messages"][0]["content"]  # chunk 2 is renumbered from 0
+    assert [(c.text, c.reason) for c in result] == [("w0_1", "filler"), ("w3_0 w3_1", "repeat")]
+
+
+def test_short_transcripts_are_one_call():
+    client = SequenceClient([{"cuts": []}])
+    cuts.propose_cuts(_sentences(4), FewShot(None, []), client=client)
+    assert len(client.requests) == 1

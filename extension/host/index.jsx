@@ -200,7 +200,11 @@ function gcutSetRange(pi, inS, outS, tolS) {
         ? gcutSetOne(pi, "out", outS, tolS) && gcutSetOne(pi, "in", inS, tolS)
         : gcutSetOne(pi, "in", inS, tolS) && gcutSetOne(pi, "out", outS, tolS);
     if (ok && gcutPointIs(pi, "in", inS, tolS) && gcutPointIs(pi, "out", outS, tolS)) return;
-    throw new Error("Premiere didn't accept the source range " + inS.toFixed(3) + "-" + outS.toFixed(3) + " s.");
+    // Say what Premiere actually holds: the only evidence we get from a real session.
+    var got = "";
+    try { got = " It holds " + pi.getInPoint().seconds.toFixed(3) + "-" + pi.getOutPoint().seconds.toFixed(3) + " s"; } catch (e) { got = ""; }
+    throw new Error("Premiere didn't accept the source range " + inS.toFixed(3) + "-" + outS.toFixed(3) + " s on " +
+        (pi.name || "a clip") + "." + got + (got ? " (tolerance " + tolS.toFixed(3) + " s)." : ""));
 }
 
 // ── multi-clip: the selected clips, cut at the same timeline moments ────────────────

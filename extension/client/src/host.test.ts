@@ -394,9 +394,21 @@ describe("gcutApplyCutsMulti: one clip", () => {
     s.seq.audioTrackFor = () => 1; // Premiere puts the rebuilt audio on A2, over the music
     const items = [{ kind: "video", trackIndex: 0 }, { kind: "audio", trackIndex: 0 }].map((i) => ({ ...i, startTicks: START, endTicks: String(110 * TICKS) }));
     expect(() => s.host.call("gcutApplyCutsMulti", { sequenceId: "seq-1", startTicks: START, endTicks: String(110 * TICKS), items, cuts }))
-      .toThrow(/on A2 since Analyse/);
+      .toThrow("A2 (music.wav) sits under the selected video clips, and rebuilding them could overwrite it. Select it too, or move it off the clips' time, then Analyse again.");
     expect(layout(s.seq.audioTracks[1])).toEqual([[90, 130]]);
     expect(layout(s.seq.videoTracks[0])).toEqual([[100, 110]]);
+  });
+
+  it("refuses a range that doesn't lie inside the recorded video clips, before changing anything", () => {
+    const s = scene();
+    const snap = snapshot(s);
+    const items = [...snap.video, ...snap.audio].map((i: any) => ({ kind: i.kind, trackIndex: i.trackIndex, startTicks: i.startTicks, endTicks: i.endTicks }));
+    for (const [a, b] of [[95, 110], [100, 115], [105, 105], [NaN, 110]]) {
+      expect(() => s.host.call("gcutApplyCutsMulti", { sequenceId: "seq-1", startTicks: String(a * TICKS), endTicks: String(b * TICKS), items, cuts }))
+        .toThrow(/changed since Analyse\. Analyse again\./);
+    }
+    expect(layout(s.seq.videoTracks[0])).toEqual([[100, 110]]);
+    expect(layout(s.seq.audioTracks[0])).toEqual([[100, 110]]);
   });
 
   it("a J/L cut (linked audio runs past the video) keeps its tail, slid left by the cuts", () => {
@@ -521,6 +533,17 @@ describe("gcutSnapshotSelection (timeline model)", () => {
     s.a1.selected = false;
     s.seq.audioTracks[1].add(new ProjectItem("mic.wav", "node-m2", 900, "seconds", false), 100, 0, 10).selected = true;
     expect(snapshot(s).problems).toContain("A1 is linked to V1 but isn't selected. Select it too, or unlink it.");
+  });
+  it("flags unselected audio under the selected video clips (a music bed), because the rebuild could overwrite it", () => {
+    const s = georgScene();
+    s.seq.audioTracks[2].add(new ProjectItem("music.wav", "node-x", 300, "seconds", false), 90, 0, 40);
+    expect(snapshot(s).problems).toEqual([
+      "A3 (music.wav) sits under the selected video clips, and rebuilding them could overwrite it. Select it too, or move it off the clips' time, then Analyse again."]);
+  });
+  it("doesn't flag unselected audio that lies outside the selected video clips' time", () => {
+    const s = georgScene();
+    s.seq.audioTracks[2].add(new ProjectItem("sfx.wav", "node-x", 30, "seconds", false), 110, 0, 5); // starts where the video ends
+    expect(snapshot(s).problems).toEqual([]);
   });
   it("doesn't count audio from a selected clip's source that lies elsewhere on the timeline as linked", () => {
     const s = multiScene({ music: false });
@@ -668,14 +691,15 @@ describe("gcutApplyCutsMulti", () => {
     expect(() => applyCuts(s)).toThrow(/V2.*24 fps.*25 fps/);
   });
 
-  it("refuses audio added under the clips since Analyse, naming the track, before changing anything", () => {
+  it("refuses unrecorded audio under the clips (here added after Analyse), naming it, before changing anything", () => {
     const s = multiScene({ music: false });
     const snap = snapshot(s);
     // An angle's linked audio would land on A2 (sim) and destroy it, so it must be caught up front.
     s.seq.audioTracks[1].add(new ProjectItem("sfx.wav", "node-x", 5, "seconds", false), 103, 0, 1);
     const all = () => [...[0, 1, 2, 3].map((t) => pieces(s.seq.videoTracks[t])), ...[0, 1, 2].map((t) => pieces(s.seq.audioTracks[t]))];
     const before = all();
-    expect(() => applyCuts(s, cuts, snap)).toThrow("Something was added under the clips on A2 since Analyse. Analyse again.");
+    expect(() => applyCuts(s, cuts, snap)).toThrow(
+      "A2 (sfx.wav) sits under the selected video clips, and rebuilding them could overwrite it. Select it too, or move it off the clips' time, then Analyse again.");
     expect(all()).toEqual(before);
     expect(pieces(s.seq.audioTracks[1])).toEqual([[103, 104, 0]]);
   });
@@ -800,7 +824,7 @@ describe("gcutApplyCutsMulti (timeline mapping)", () => {
     expect([0, 1, 2].map((t) => span(s.seq.videoTracks[t]))).toEqual(before);
   });
 
-  it("leaves unselected clips alone (the title on V4, unselected music)", () => {
+  it("leaves unselected clips alone (the title on V4)", () => {
     const s = georgScene();
     applyCuts(s, cuts);
     expect(span(s.seq.videoTracks[3])).toEqual([[112, 115, 0]]);
@@ -816,6 +840,24 @@ describe("gcutApplyCutsMulti (timeline mapping)", () => {
 
   it("refuses an empty cut list", () => {
     expect(() => applyCuts(georgScene(), [])).toThrow(/nothing to cut/);
+  });
+
+  it("Restore leaves an unselected clip of a recorded source alone (a razored head on V2)", () => {
+    const s = georgScene();
+    s.seq.videoTracks[1].add(s.b, 99.5, 29.26, 30); // node-b, unselected, ends where V2's selected part starts
+    expect(applyCuts(s, cuts)).toMatchObject({ ok: true });
+    expect(span(s.seq.videoTracks[1])).toEqual([[99.5, 100.24, 29.26], [100.24, 102, 30], [102, 106, 32.76], [106, 107.84, 37.76]]);
+    expect(s.host.call("gcutRestoreMulti", { startTicks: START })).toEqual({ ok: true });
+    expect(span(s.seq.videoTracks[1])).toEqual([[99.5, 100.24, 29.26], [100.24, 109.84, 30]]);
+  });
+
+  it("two selected parts of one source on one track are each cut and slid (no false 'didn't come off')", () => {
+    const s = georgScene();
+    s.seq.videoTracks[0].items = [];
+    for (const x of [s.seq.videoTracks[0].add(s.a, 100, 10, 15), s.seq.videoTracks[0].add(s.a, 105, 15, 20)]) x.selected = true;
+    expect(applyCuts(s, [{ start: 2, end: 3 }])).toMatchObject({ ok: true, clipCount: 5 });
+    expect(span(s.seq.videoTracks[0])).toEqual([[100, 102, 10], [102, 104, 13], [104, 109, 15]]);
+    expect(span(s.seq.audioTracks[0])).toEqual([[99, 102, 50], [102, 110, 54]]);
   });
 
   it("records each item's own original place, and Restore puts every one back there", () => {

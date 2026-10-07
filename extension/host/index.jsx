@@ -208,6 +208,18 @@ function gcutKindTracks(seq, kind) { return kind === "audio" ? seq.audioTracks :
 function gcutLabel(kind, index) { return (kind === "audio" ? "A" : "V") + (index + 1); }
 function gcutSeqId(seq) { return String(seq.sequenceID || seq.name || ""); }
 
+/** True if [s, e) overlaps [fromT, toT) by more than half a frame. */
+function gcutOverlaps(s, e, fromT, toT, clock) { return e > fromT + clock.half && s < toT - clock.half; }
+
+/**
+ * Unrecorded audio under the selected video: an angle's linked audio may land on its track and
+ * overwrite it (seen only afterwards), so it's refused, at Analyse and again at Apply.
+ */
+function gcutUnderMessage(label, name) {
+    return label + " (" + name + ") sits under the selected video clips, and rebuilding them could overwrite it. " +
+        "Select it too, or move it off the clips' time, then Analyse again.";
+}
+
 function gcutItemRecord(kind, trackIndex, it) {
     var fx = [];
     gcutEffects(it, kind === "audio" ? GCUT_AUDIO_INTRINSIC : GCUT_VIDEO_INTRINSIC, fx);
@@ -268,14 +280,18 @@ function gcutSnapshotSelection(nameJson) {
                 }
                 // An unselected item from a selected clip's own source, under it: the rebuild of
                 // that clip would bring it along, so it has to be cut too, or unlinked.
+                var linked = false;
                 for (var k = 0; k < video.length; k++) {
                     var vi = video[k].item;
                     if (gcutNode(it) === gcutNode(vi) && e > gcutT(vi.start) + clock.half && s < gcutT(vi.end) - clock.half) {
                         problems.push(gcutLabel("audio", t) + " is linked to " + gcutLabel("video", video[k].track) +
                             " but isn't selected. Select it too, or unlink it.");
+                        linked = true;
                         break;
                     }
                 }
+                // Any other unselected audio under the video: Apply refuses it (gcutAudioUnder), so say so now.
+                if (!linked && gcutOverlaps(s, e, vStart, vEnd, clock)) problems.push(gcutUnderMessage(gcutLabel("audio", t), it.name));
             }
         }
         var startT = vStart, endT = vEnd; // R; falls back to the video span when there is none
@@ -350,22 +366,41 @@ function gcutRecorded(found, kind, trackIndex, startT) {
 
 /**
  * Refuse if any audio under [startT, endT) (the video clips), on any audio track, wasn't recorded
- * at Analyse: an angle's linked audio may land on that track and overwrite it, and that's only
- * seen afterwards.
+ * at Analyse (see gcutUnderMessage). The snapshot keeps no unselected items, so whether it was
+ * there at Analyse or added since can't be told: one message for both.
  */
-function gcutAudioAdded(seq, spec, startT, endT, clock) {
+function gcutAudioUnder(seq, spec, startT, endT, clock) {
     for (var t = 0; t < seq.audioTracks.numTracks; t++) {
         var items = gcutItems(seq.audioTracks[t]);
         for (var i = 0; i < items.length; i++) {
-            var it = items[i], s = gcutT(it.start), recorded = false;
-            if (gcutT(it.end) <= startT + clock.half || s >= endT - clock.half) continue;
+            var it = items[i], recorded = false;
+            if (!gcutOverlaps(gcutT(it.start), gcutT(it.end), startT, endT, clock)) continue;
             for (var j = 0; j < spec.items.length; j++) {
                 var x = spec.items[j];
                 if (x.kind === "audio" && x.trackIndex === t && it.start.ticks === String(x.startTicks)) recorded = true;
             }
-            if (!recorded) throw new Error("Something was added under the clips on " + gcutLabel("audio", t) + " since Analyse. Analyse again.");
+            if (!recorded) throw new Error(gcutUnderMessage(gcutLabel("audio", t), it.name));
         }
     }
+}
+
+/** The pieces each recorded item is cut into: plan[i] for items[i]. */
+function gcutPlan(items, cutsT) {
+    var plan = [];
+    for (var i = 0; i < items.length; i++) plan.push(gcutItemPieces(items[i], cutsT, items[i].srcFrameS));
+    return plan;
+}
+
+/** True if `it`, on this kind's track, is exactly one of the planned pieces of a recorded item there. */
+function gcutAtPlanned(items, plan, kind, trackIndex, it, clock) {
+    var s = gcutT(it.start), d = gcutT(it.end) - s, n = gcutNode(it);
+    for (var k = 0; k < items.length; k++) {
+        if (items[k].kind !== kind || items[k].trackIndex !== trackIndex || items[k].node !== n) continue;
+        for (var p = 0; p < plan[k].length; p++) {
+            if (gcutNear(s, plan[k][p].atT, clock.half) && gcutNear(d, plan[k][p].durT, clock.half)) return true;
+        }
+    }
+    return false;
 }
 
 /**
@@ -584,13 +619,15 @@ function gcutLayAll(seq, found, plan, fromT, toT, clock, others) {
 
 /**
  * True if `f`'s source still sits on its own track inside [fromT, toT), the stretch it vacated
- * at its end: an original whose remove() silently did nothing leaves its tail there.
+ * at its end: an original whose remove() silently did nothing leaves its tail there. A planned
+ * piece of another recorded item of the same source on that track may rightly sit there.
  */
-function gcutTailLeft(seq, f, fromT, toT, clock) {
+function gcutTailLeft(seq, f, fromT, toT, clock, found, plan) {
     var items = gcutItems(gcutKindTracks(seq, f.kind)[f.trackIndex]);
     for (var i = 0; i < items.length; i++) {
         var it = items[i];
-        if (gcutNode(it) === f.node && gcutT(it.start) < toT - clock.half && gcutT(it.end) > fromT + clock.half) return true;
+        if (gcutNode(it) === f.node && gcutOverlaps(gcutT(it.start), gcutT(it.end), fromT, toT, clock) &&
+            !gcutAtPlanned(found, plan, f.kind, f.trackIndex, it, clock)) return true;
     }
     return false;
 }
@@ -646,15 +683,17 @@ function gcutApplyCutsMulti(specJson) {
         var startT = Number(spec.startTicks), endT = Number(spec.endTicks);
         var found = gcutRefind(seq, spec, clock);
         var vSpan = gcutSpan(found, "video");
-        if (vSpan) gcutAudioAdded(seq, spec, vSpan.fromT, vSpan.toT, clock);
+        // R lies inside the video clips (the snapshot made it so); a range outside them would lay
+        // pieces before the stretch that the checks and the rollback look at.
+        if (!vSpan || !(vSpan.fromT <= startT && startT < endT && endT <= vSpan.toT)) {
+            throw new Error("The selected clips changed since Analyse. Analyse again.");
+        }
+        gcutAudioUnder(seq, spec, vSpan.fromT, vSpan.toT, clock);
         var cutsT = gcutCutTicks(spec.cuts, startT, clock, endT);
         gcutCovers(seq, found, cutsT, clock);
         // Every piece lands inside span: an item only ever slides left, and never past the first cut.
-        var span = gcutSpan(found), plan = [], removedT = gcutRemovedBefore(cutsT, endT), rebuiltEndT = span.fromT;
-        for (k = 0; k < found.length; k++) {
-            plan.push(gcutItemPieces(found[k], cutsT, found[k].srcFrameS));
-            rebuiltEndT = Math.max(rebuiltEndT, gcutNewEnd(found[k], cutsT));
-        }
+        var span = gcutSpan(found), plan = gcutPlan(found, cutsT), removedT = gcutRemovedBefore(cutsT, endT), rebuiltEndT = span.fromT;
+        for (k = 0; k < found.length; k++) rebuiltEndT = Math.max(rebuiltEndT, gcutNewEnd(found[k], cutsT));
         var others = gcutOthers(seq, found, span.fromT, span.toT);
         for (k = 0; k < found.length; k++) {
             var seen = false;
@@ -677,7 +716,7 @@ function gcutApplyCutsMulti(specJson) {
             for (k = 0; k < found.length; k++) {
                 var bad = gcutVerifyItems(seq, found[k], plan[k], clock);
                 if (bad) throw new Error(bad);
-                if (gcutTailLeft(seq, found[k], gcutNewEnd(found[k], cutsT), found[k].endT, clock)) {
+                if (gcutTailLeft(seq, found[k], gcutNewEnd(found[k], cutsT), found[k].endT, clock, found, plan)) {
                     throw new Error("The original clip on " + found[k].label + " didn't come off the timeline: part of it is still in the gap.");
                 }
             }
@@ -720,18 +759,22 @@ function gcutRecord(seq, spec, missing) {
     return rec;
 }
 
-/** Our rebuilt pieces on the timeline now: each recorded source on its own track inside [fromT, toT]. */
-function gcutOursNow(seq, rec, fromT, toT, clock) {
-    var ours = [];
+/**
+ * Our rebuilt pieces on the timeline now: only clips sitting exactly where Apply planned a piece
+ * of a recorded item, on its own track, and never one that was there at Apply (rec.others). Any
+ * other clip of a recorded source (a razored head, a second copy) is someone else's: it ends up
+ * among the others, so Restore keeps it, or refuses rather than overwrite it.
+ */
+function gcutOursNow(seq, rec, clock) {
+    var ours = [], plan = gcutPlan(rec.items, rec.cutsT), nV = seq.videoTracks.numTracks;
     for (var i = 0; i < rec.items.length; i++) {
-        var f = rec.items[i], tracks = gcutKindTracks(seq, f.kind);
+        var f = rec.items[i], tracks = gcutKindTracks(seq, f.kind), t = (f.kind === "audio" ? nV : 0) + f.trackIndex;
         if (f.trackIndex >= tracks.numTracks) throw new Error(f.label + " no longer exists. Use Premiere's Undo instead.");
         var items = gcutItems(tracks[f.trackIndex]);
         for (var j = 0; j < items.length; j++) {
             var it = items[j], s = gcutT(it.start);
-            if (gcutNode(it) === f.node && s >= fromT - clock.half && gcutT(it.end) <= toT + clock.half) {
-                ours.push({ kind: f.kind, trackIndex: f.trackIndex, startT: s });
-            }
+            if (gcutNode(it) !== f.node || gcutKept(rec.others, t, s, f.node)) continue;
+            if (gcutAtPlanned([f], [plan[i]], f.kind, f.trackIndex, it, clock)) ours.push({ kind: f.kind, trackIndex: f.trackIndex, startT: s });
         }
     }
     return ours;
@@ -769,7 +812,7 @@ function gcutRestoreMulti(specJson) {
         rec = gcutRecord(seq, spec, "There's no Genius Cut edit to restore on these clips in this session. Use Premiere's Undo instead.");
         if (rec.gapClosed) throw new Error("The gap was already closed, so restoring would overlap what moved. Use Premiere's Undo instead.");
         var span = gcutSpan(rec.items); // every piece of ours and every original place lies inside it
-        var ours = gcutOursNow(seq, rec, span.fromT, span.toT, clock);
+        var ours = gcutOursNow(seq, rec, clock);
         var others = gcutOthers(seq, ours, span.fromT, span.toT);
         var blocked = gcutInTheWay(seq, rec, others, clock);
         if (blocked) throw new Error(blocked);

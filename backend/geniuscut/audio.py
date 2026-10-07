@@ -82,3 +82,15 @@ def mix_wavs(paths: list[Path], out: Path) -> Path:
     if result.returncode != 0 or not Path(out).exists():
         raise FfmpegError(f"ffmpeg could not mix the audio: {result.stderr.strip()}")
     return Path(out)
+
+
+def place_in_range(wav: Path, offset_s: float, total_s: float, out: Path) -> Path:
+    """Put a source's part at its place inside the range: silence before and after, exactly
+    total_s long, so word times line up with the range for every source."""
+    cmd = [find_tool("ffmpeg"), "-nostdin", "-y", "-hide_banner", "-loglevel", "error", "-i", str(wav),
+           "-af", f"adelay={int(round(offset_s * 1000))}:all=1,apad,atrim=0:{total_s:.6f}",
+           "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(out)]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0 or not Path(out).exists():
+        raise FfmpegError(f"ffmpeg could not place the audio in the range: {result.stderr.strip()}")
+    return Path(out)

@@ -48,6 +48,7 @@ def run_trim(
     extract: Callable = audio.extract_span,
     refine: Callable = boundaries.refine,
     mix: Callable = audio.mix_wavs,
+    place: Callable = audio.place_in_range,
 ) -> TrimResponse:
     work = Path(tempfile.mkdtemp(prefix="geniuscut-"))
     env = None
@@ -57,7 +58,11 @@ def run_trim(
         for i, src in enumerate(req.audio):
             d = work / f"src{i}"
             d.mkdir()
-            wavs.append(extract(src.media_path, src.in_s, src.in_s + duration, out_dir=d))
+            part = src.duration_s if src.duration_s is not None else duration - src.offset_s
+            wav_i = extract(src.media_path, src.in_s, src.in_s + part, out_dir=d)
+            if src.offset_s > 0 or part < duration - 0.001:
+                wav_i = place(wav_i, src.offset_s, duration, d / "placed.wav")
+            wavs.append(wav_i)
         wav = wavs[0] if len(wavs) == 1 else mix(wavs, work / "mix.wav")
         words = transcriber.transcribe(wav)
         try:

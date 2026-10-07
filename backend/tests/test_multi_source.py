@@ -84,3 +84,36 @@ def test_mix_wavs_keeps_both_voices_at_full_level(tmp_path):
     x = read_wav_16k_mono(out)
     # lavfi sine peaks at 0.125, x0.3 = 0.0375 per tone: summed ~0.075, a normalised (halved) mix would be ~0.0375
     assert abs(x[:16000]).max() > 0.06  # both tones present and not halved (normalize=0)
+
+
+def test_a_part_range_source_is_extracted_for_its_part_and_placed_at_its_offset(tmp_path):
+    seen = []
+    req = TrimRequest(duration_s=10.0, range_start_seq_s=100.0, cut_pauses=False,
+                      audio=[{"media_path": "C:/a.wav", "in_s": 3.0, "offset_s": 2.0, "duration_s": 6.0}])
+
+    def fake_extract(media_path, in_s, out_s, out_dir=None):
+        seen.append((media_path, in_s, out_s))
+        out = Path(out_dir) / "span.wav"; out.write_bytes(b"RIFF"); return out
+
+    def fake_place(wav, offset_s, total_s, out):
+        seen.append(("place", offset_s, total_s)); out.write_bytes(b"RIFF"); return out
+
+    trim.run_trim(req, FakeTranscriber(), tmp_path, propose=lambda w, f, i: [], extract=fake_extract,
+                  refine=lambda c, w, d, env=None: c, mix=lambda p, o: p[0], place=fake_place)
+    assert seen == [("C:/a.wav", 3.0, 9.0), ("place", 2.0, 10.0)]
+
+
+def test_a_source_must_fit_inside_the_range():
+    with pytest.raises(ValueError):
+        TrimRequest(duration_s=10.0, audio=[{"media_path": "a", "in_s": 0, "offset_s": 5.0, "duration_s": 6.0}])
+
+
+def test_a_part_range_source_is_padded_to_the_range(tmp_path):
+    a = _tone(tmp_path / "a.wav", 220, 2, 0.3)
+    out = audio.place_in_range(a, 3.0, 6.0, tmp_path / "placed.wav")
+    from geniuscut.stt import read_wav_16k_mono
+    x = read_wav_16k_mono(out)
+    assert abs(len(x) / 16000 - 6.0) < 0.01
+    assert abs(x[: 3 * 16000 - 800]).max() < 1e-3        # silence before the offset
+    assert abs(x[3 * 16000 + 800: 5 * 16000 - 800]).max() > 0.02  # the tone, 3-5 s
+    assert abs(x[5 * 16000 + 800:]).max() < 1e-3          # silence after it

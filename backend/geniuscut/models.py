@@ -35,10 +35,13 @@ PAUSE_KEEP_S = 0.25  # breathing room left next to speech when a pause is cut
 
 
 class AudioSource(BaseModel):
-    """One audio clip on the timeline: its file and its source time at the range start."""
+    """One selected audio clip: its file, its source time where its part of the range starts,
+    and where that part sits inside the range (offset/duration; default: the whole range)."""
 
     media_path: str
-    in_s: float = Field(ge=0, allow_inf_nan=False, description="Source time at the range start")
+    in_s: float = Field(ge=0, allow_inf_nan=False, description="Source time where this source's part starts")
+    offset_s: float = Field(default=0.0, ge=0, allow_inf_nan=False, description="Where that part starts in the range")
+    duration_s: float | None = Field(default=None, gt=0, allow_inf_nan=False, description="How long that part is")
 
 
 class TrimRequest(BaseModel):
@@ -68,6 +71,14 @@ class TrimRequest(BaseModel):
             d["range_start_seq_s"] = d.pop("clip_start_s", 0.0)
             return d
         return data
+
+    @model_validator(mode="after")
+    def _sources_fit_the_range(self):
+        for s in self.audio:
+            part = s.duration_s if s.duration_s is not None else self.duration_s - s.offset_s
+            if part <= 0 or s.offset_s + part > self.duration_s + 0.001:
+                raise ValueError(f"Audio source {s.media_path} doesn't fit inside the {self.duration_s}s range")
+        return self
 
     @model_validator(mode="after")
     def _pause_leaves_breathing_room(self):

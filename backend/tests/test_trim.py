@@ -194,3 +194,13 @@ def test_the_loader_reports_downloading_only_for_a_model_that_isnt_cached(monkey
     assert server.load_phase() == "loading"
     monkeypatch.setattr(stt, "model_is_cached", lambda name: False)
     assert server.load_phase() == "downloading"
+
+
+def test_health_reports_the_api_version_and_process_id(tmp_path):
+    # The panel restarts a backend left running from an older version (Checkpoint B, 2026-10-08:
+    # a day-old backend answered the new panel's requests with "Field required" x4).
+    import os
+    from geniuscut import config
+    body = _health(tmp_path, "cuda", None)
+    assert body["api"] == config.API_VERSION and isinstance(body["api"], int)
+    assert body["pid"] == os.getpid()

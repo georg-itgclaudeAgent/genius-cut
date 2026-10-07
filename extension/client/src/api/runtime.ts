@@ -2,7 +2,7 @@
 import { createBackend } from "./backend";
 import { cepHost } from "./host";
 import { mockHost, mockTransport } from "./mock";
-import { evalScript, isCEP, logPath, nodeTransport, readToken, spawnBackend } from "./cep";
+import { evalScript, isCEP, killProcess, logPath, nodeTransport, readToken, spawnBackend } from "./cep";
 import { pickMode } from "../lib/mode";
 
 export const mode = pickMode({ inPremiere: isCEP(), previewBuild: import.meta.env.VITE_GENIUSCUT_PREVIEW === "1" });
@@ -14,6 +14,7 @@ export const runtime = mode === "live"
       backend: createBackend({ transport: nodeTransport, token: readToken }),
       host: cepHost(evalScript),
       spawn: spawnBackend,
+      kill: killProcess,
       logPath,
     }
   : {
@@ -22,5 +23,6 @@ export const runtime = mode === "live"
       backend: createBackend({ transport: mockTransport, token: () => "sample" }),
       host: mockHost,
       spawn: () => {},
+      kill: (_pid: number) => {},
       logPath: () => "(sample mode)",
     };

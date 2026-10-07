@@ -25,6 +25,7 @@ if _here not in _sys.path:
     _sys.path.insert(0, _here)
 
 import hmac
+import os
 import logging
 import threading
 from pathlib import Path
@@ -100,7 +101,8 @@ def create_app(
 
     @app.get("/health")
     def health() -> dict:
-        body = {"status": "ok", "version": config.VERSION, "stt_device": stt_device(), "ai": ai_status()}
+        body = {"status": "ok", "version": config.VERSION, "api": config.API_VERSION, "pid": os.getpid(),
+                "stt_device": stt_device(), "ai": ai_status()}
         if body["stt_device"] == "loading":
             body["stt_phase"] = stt_phase() or "loading"  # "downloading" only when it really is
         err = load_error()

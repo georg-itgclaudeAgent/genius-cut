@@ -5,6 +5,9 @@ import secrets
 from pathlib import Path
 
 VERSION = "0.1.0"
+# Bumped whenever the panel <-> backend contract changes, so a panel can tell an outdated
+# backend left running from an earlier version and restart it.
+API_VERSION = 2
 HOST = "127.0.0.1"
 PORT = 8791
 

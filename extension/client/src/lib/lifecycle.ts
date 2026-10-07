@@ -4,6 +4,14 @@
  */
 import type { Health } from "../api/types";
 
+/** The backend contract this panel speaks (backend/geniuscut/config.py API_VERSION). A backend
+ *  left running from an older version is stopped and replaced (Checkpoint B, 2026-10-08: a
+ *  day-old backend answered the new panel with "Field required" x4). */
+export const API_VERSION = 2;
+
+export const OUTDATED_BACKEND =
+  "An older Genius Cut backend is still running. Restart Premiere, or end its python.exe in Task Manager, then try again.";
+
 export type BackendState =
   | { kind: "ready"; health: Health }
   | { kind: "starting"; health: Health }
@@ -12,6 +20,8 @@ export type BackendState =
 interface Deps {
   health: () => Promise<Health>;
   spawn: () => void;
+  /** Stop a process by id (an outdated backend). */
+  kill?: (pid: number) => void;
   sleep: (ms: number) => Promise<void>;
   attempts?: number;
   intervalMs?: number;
@@ -23,10 +33,21 @@ function classify(h: Health): BackendState {
   return { kind: "ready", health: h };
 }
 
-export async function ensureBackend({ health, spawn, sleep, attempts = 30, intervalMs = 500 }: Deps): Promise<BackendState> {
+export async function ensureBackend({ health, spawn, kill, sleep, attempts = 30, intervalMs = 500 }: Deps): Promise<BackendState> {
   const probe = async () => { try { return await health(); } catch { return null; } };
   const first = await probe();
-  if (first) return classify(first);
+  if (first && first.api === API_VERSION) return classify(first);
+  if (first) {
+    // A backend from an older version: stop it, wait for the port to free, then start ours.
+    if (typeof first.pid !== "number" || !kill) return { kind: "failed", message: OUTDATED_BACKEND };
+    try { kill(first.pid); } catch { return { kind: "failed", message: OUTDATED_BACKEND }; }
+    let gone = false;
+    for (let i = 0; i < attempts && !gone; i++) {
+      await sleep(intervalMs);
+      gone = (await probe()) === null;
+    }
+    if (!gone) return { kind: "failed", message: OUTDATED_BACKEND };
+  }
   try {
     spawn();
   } catch (e: any) {

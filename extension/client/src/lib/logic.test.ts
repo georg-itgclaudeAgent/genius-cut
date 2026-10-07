@@ -3,7 +3,7 @@ import { removedSpans, reviewSummary } from "./review";
 import { parseClipName, submitsPrompt } from "./prompt";
 import { formatTimecode, formatDuration } from "./timecode";
 import { backendPaths, parseRuntimePointer, liveRuntimePython } from "./paths";
-import { ensureBackend, startingMessage } from "./lifecycle";
+import { API_VERSION, ensureBackend, startingMessage } from "./lifecycle";
 import type { Health, SequenceCut } from "../api/types";
 
 const cut = (start: number, end: number, reason = "filler"): SequenceCut => ({
@@ -120,7 +120,7 @@ describe("parseRuntimePointer", () => {
 });
 
 describe("ensureBackend", () => {
-  const ready: Health = { status: "ok", version: "0.1.0", stt_device: "cuda" };
+  const ready: Health = { status: "ok", version: "0.1.0", stt_device: "cuda", api: API_VERSION };
   it("reuses a backend that already answers, without spawning", async () => {
     let spawned = 0;
     const r = await ensureBackend({ health: async () => ready, spawn: () => { spawned++; }, sleep: async () => {} });
@@ -164,7 +164,7 @@ describe("ensureBackend", () => {
   });
   it("a load error from /health is a failure, not a spinner", async () => {
     const r = await ensureBackend({
-      health: async (): Promise<Health> => ({ status: "error", version: "0.1.0", stt_device: "failed", error: "disk full" }),
+      health: async (): Promise<Health> => ({ status: "error", version: "0.1.0", stt_device: "failed", error: "disk full", api: API_VERSION }),
       spawn: () => {}, sleep: async () => {},
     });
     expect(r).toEqual({ kind: "failed", message: expect.stringContaining("disk full") });
@@ -205,4 +205,30 @@ describe("submitsPrompt", () => {
   it("Shift+Enter adds a line", () => expect(submitsPrompt({ key: "Enter", shiftKey: true, isComposing: false })).toBe(false));
   it("Enter while an IME is composing doesn't submit", () => expect(submitsPrompt({ key: "Enter", shiftKey: false, isComposing: true })).toBe(false));
   it("other keys don't submit", () => expect(submitsPrompt({ key: "a", shiftKey: false, isComposing: false })).toBe(false));
+});
+
+describe("ensureBackend with an outdated backend", () => {
+  const current: Health = { status: "ok", version: "0.1.0", stt_device: "cuda", api: API_VERSION, pid: 2 };
+  const old: Health = { status: "ok", version: "0.1.0", stt_device: "cuda", api: API_VERSION - 1, pid: 1 };
+  it("stops a backend from an older version and starts a fresh one", async () => {
+    let state: "old" | "down" | "new" = "old";
+    const killed: number[] = []; let spawned = 0;
+    const r = await ensureBackend({
+      health: async () => { if (state === "old") return old; if (state === "down") throw new Error("ECONNREFUSED"); return current; },
+      kill: (pid) => { killed.push(pid); state = "down"; },
+      spawn: () => { spawned++; state = "new"; }, sleep: async () => {},
+    });
+    expect(killed).toEqual([1]);
+    expect(spawned).toBe(1);
+    expect(r).toEqual({ kind: "ready", health: current });
+  });
+  it("says so plainly when the old backend can't be stopped (no process id)", async () => {
+    const r = await ensureBackend({ health: async () => ({ ...old, pid: undefined, api: undefined }), kill: () => {}, spawn: () => {}, sleep: async () => {} });
+    expect(r).toEqual({ kind: "failed", message: "An older Genius Cut backend is still running. Restart Premiere, or end its python.exe in Task Manager, then try again." });
+  });
+  it("reuses a backend on the current version", async () => {
+    let spawned = 0;
+    const r = await ensureBackend({ health: async () => current, kill: () => { throw new Error("no"); }, spawn: () => { spawned++; }, sleep: async () => {} });
+    expect(r.kind).toBe("ready"); expect(spawned).toBe(0);
+  });
 });

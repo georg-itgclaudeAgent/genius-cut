@@ -90,6 +90,9 @@ export interface Health {
   status: "ok" | "error";
   version: string;
   stt_device: string;     // "cuda" | "cpu" | "loading" | "failed"
+  /** Panel <-> backend contract version, and the backend's process id (both absent on old backends). */
+  api?: number;
+  pid?: number;
   /** While stt_device is "loading": "downloading" only when the model isn't on this PC yet. */
   stt_phase?: "loading" | "downloading";
   error?: string;

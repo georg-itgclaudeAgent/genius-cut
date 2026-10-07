@@ -3,6 +3,7 @@
  * The transcript is from the committed synthetic fixture; the cuts are illustrative,
  * not produced by the AI, and the costs are plausible, not billed. The panel shows a "Sample data" banner in this mode.
  */
+import { API_VERSION } from "../lib/lifecycle";
 import type { Transport } from "./backend";
 import type { Host } from "./host";
 import type { AiStatus, Health, Library, RunCost, SequenceCut, Snapshot, SnapshotItem, Span, StyleExample, TrimResponse, Word } from "./types";
@@ -63,7 +64,7 @@ let bootedAt = Date.now();
 export const mockTransport: Transport = async (req) => {
   const ok = (body: unknown) => ({ status: 200, body: JSON.stringify(body) });
   if (req.path === "/health") {
-    const health: Health = { status: "ok", version: "0.1.0", stt_device: Date.now() - bootedAt < 1500 ? "loading" : "cuda",
+    const health: Health = { status: "ok", version: "0.1.0", api: API_VERSION, stt_device: Date.now() - bootedAt < 1500 ? "loading" : "cuda",
       ai: aiStatus() };
     return ok(health);
   }

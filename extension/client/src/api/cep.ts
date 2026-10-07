@@ -83,6 +83,11 @@ export function spawnBackend(): void {
     .unref();
 }
 
+/** Stop a process by id: used only for an outdated Genius Cut backend found on our port. */
+export function killProcess(pid: number): void {
+  node("process").kill(pid);
+}
+
 export function evalScript(script: string): Promise<string> {
   return new Promise((resolve) => new window.CSInterface!().evalScript(script, resolve));
 }

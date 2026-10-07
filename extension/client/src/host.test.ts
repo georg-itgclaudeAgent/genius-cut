@@ -624,3 +624,85 @@ describe("gcutApplyCutsMulti", () => {
     expect(() => applyMulti(s)).toThrow(/V2.*24 fps.*25 fps/);
   });
 });
+
+describe("gcutApplyCutsMulti: items that don't cover the whole range", () => {
+  it("refuses a short audio item inside the range, in the snapshot and in apply, changing nothing", () => {
+    const s = multiScene({ music: false });
+    s.seq.audioTracks[1].add(s.close, 104, 50, 52); // B-roll audio on A2, 104–106 s
+    const snap = snapshot(s);
+    expect(snap.problems.join(" ")).toMatch(/A2 doesn't start and end with the video clips/);
+    expect(snap.problems.join(" ")).not.toMatch(/A2 runs past/);
+    const before = [0, 1, 2].map((t) => pieces(s.seq.videoTracks[t]));
+    expect(() => applyMulti(s, rel, snap)).toThrow(/A2 doesn't start and end with the video clips/);
+    expect([0, 1, 2].map((t) => pieces(s.seq.videoTracks[t]))).toEqual(before);
+    expect(pieces(s.seq.audioTracks[1])).toEqual([[104, 106, 50]]);
+  });
+
+  it("refuses two back-to-back audio clips on one track", () => {
+    const s = multiScene({ music: false });
+    s.a1.end = Time.k(105 * TICKS); s.a1.outPoint = Time.s(15);
+    s.seq.audioTracks[0].add(s.wide, 105, 15, 20);
+    const snap = snapshot(s);
+    expect(snap.problems.join(" ")).toMatch(/A1 doesn't start and end with the video clips/);
+    expect(() => applyMulti(s, rel, snap)).toThrow(/A1 doesn't start and end/);
+    expect(pieces(s.seq.audioTracks[0])).toEqual([[100, 105, 10], [105, 110, 15]]);
+  });
+});
+
+describe("gcutApplyCutsMulti: stash and rollback safety", () => {
+  const stash = (s: ReturnType<typeof multiScene>) => (s.host.ctx as any).$.global.gcutStash;
+
+  it("a re-apply at the same start that rolls back keeps the first edit's Restore record", () => {
+    const s = multiScene({ music: false });
+    expect(applyMulti(s)).toMatchObject({ ok: true });
+    const first = stash(s)["m@" + START];
+    expect(first).toBeTruthy();
+    // Analyse the first pieces of the cut timeline (100–102 s) and apply again; it fails.
+    for (const t of [0, 1, 2]) s.seq.videoTracks[t].clips[0].selected = true;
+    const snap2 = snapshot(s);
+    expect(snap2).toMatchObject({ found: true, startTicks: START, problems: [] });
+    s.seq.dropSpanIndex = 12; // 12 placements so far: the re-apply's first one silently fails
+    expect(applyMulti(s, [{ start: 0, end: 1 }], snap2)).toMatchObject({ ok: false, rolledBack: true });
+    const rec = stash(s)["m@" + START];
+    expect(rec).toBe(first);
+    expect([rec.startT, rec.endT, rec.rebuiltEndT]).toEqual([100 * TICKS, 110 * TICKS, 108 * TICKS]);
+    expect(rec.items.map((i: any) => [i.label, i.inS])).toEqual([["V1", 10], ["V2", 12], ["V3", 5], ["A1", 10]]);
+  });
+
+  it("stray audio that won't come off fails the apply, naming the track, and says it couldn't be put back", () => {
+    const s = multiScene({ music: false });
+    const orig = TrackItem.prototype.remove;
+    TrackItem.prototype.remove = function (this: TrackItem, r: boolean, a: boolean) {
+      return this.track === s.seq.audioTracks[1] ? 0 : orig.call(this, r, a);
+    };
+    try {
+      const r = applyMulti(s);
+      expect(r).toMatchObject({ ok: false, rolledBack: false });
+      expect(r.message).toMatch(/A2/);
+      expect(r.message).toMatch(/couldn't be put back automatically: use Premiere's Undo/);
+    } finally {
+      TrackItem.prototype.remove = orig;
+    }
+  });
+
+  it("an original whose remove does nothing (its tail left in the gap) fails and rolls back", () => {
+    const s = multiScene({ music: false });
+    s.v1.remove = () => 0;
+    const r = applyMulti(s);
+    expect(r).toMatchObject({ ok: false, rolledBack: true });
+    expect(r.message).toMatch(/V1/);
+    for (const [t, inS] of [[0, 10], [1, 12], [2, 5]] as const) expect(pieces(s.seq.videoTracks[t])).toEqual([[100, 110, inS]]);
+    expect(pieces(s.seq.audioTracks[0])).toEqual([[100, 110, 10]]);
+  });
+
+  it("a failure mid-lay rolls back pieces that reached a frame past the range", () => {
+    const s = multiScene({ music: false });
+    const v2 = s.seq.videoTracks[1], real = v2.overwriteClip.bind(v2);
+    let calls = 0;
+    v2.overwriteClip = (pi: ProjectItem, ticks: string) => { if (calls++ === 0) throw new Error("Premiere refused"); return real(pi, ticks); };
+    const r = applyMulti(s, [{ start: 0, end: 10.04 }]); // V1 is laid 100–110.04 before V2 throws
+    expect(r).toMatchObject({ ok: false, rolledBack: true });
+    for (const [t, inS] of [[0, 10], [1, 12], [2, 5]] as const) expect(pieces(s.seq.videoTracks[t])).toEqual([[100, 110, inS]]);
+    expect(pieces(s.seq.audioTracks[0])).toEqual([[100, 110, 10]]);
+  });
+});

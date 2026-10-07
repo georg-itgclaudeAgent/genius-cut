@@ -261,6 +261,12 @@ function gcutKindTracks(seq, kind) { return kind === "audio" ? seq.audioTracks :
 function gcutLabel(kind, index) { return (kind === "audio" ? "A" : "V") + (index + 1); }
 function gcutSeqId(seq) { return String(seq.sequenceID || seq.name || ""); }
 
+/** Every item is cut as if it spans the whole range, so one that covers only part of it is refused. */
+function gcutPartialMessage(label) {
+    return label + " doesn't start and end with the video clips. Genius Cut needs every clip it cuts, " +
+        "audio too, to cover the same stretch of the timeline.";
+}
+
 function gcutItemRecord(kind, trackIndex, it) {
     var fx = [];
     gcutEffects(it, kind === "audio" ? GCUT_AUDIO_INTRINSIC : GCUT_VIDEO_INTRINSIC, fx);
@@ -315,6 +321,8 @@ function gcutSnapshotSelection(nameJson) {
                 if (s < startT - clock.half || e > endT + clock.half) {
                     problems.push(gcutLabel("audio", t) + " runs past the clips (a J/L cut or a music bed). " +
                         "Genius Cut can't rebuild that safely yet: trim it to the clips, or move it to after the edit.");
+                } else if (!gcutNear(s, startT, clock.half) || !gcutNear(e, endT, clock.half)) {
+                    problems.push(gcutPartialMessage(gcutLabel("audio", t)));
                 }
                 out.audio.push(gcutItemRecord("audio", t, it));
             }
@@ -344,6 +352,9 @@ function gcutRefind(seq, spec, clock) {
         for (j = 0; j < items.length; j++) if (items[j].start.ticks === String(x.startTicks)) it = items[j];
         if (!it || !it.projectItem || it.end.ticks !== String(x.endTicks)) {
             throw new Error(label + "'s clip changed since Analyse. Analyse again.");
+        }
+        if (!gcutNear(gcutT(it.start), Number(spec.startTicks), clock.half) || !gcutNear(gcutT(it.end), Number(spec.endTicks), clock.half)) {
+            throw new Error(gcutPartialMessage(label));
         }
         if (typeof track.isLocked === "function" && track.isLocked()) throw new Error(label + " is locked. Unlock it to apply.");
         if (Math.abs(gcutSpeed(it) - 1) > 1e-6) throw new Error(label + " isn't at 100% speed. Nothing was changed.");
@@ -423,10 +434,15 @@ function gcutRemoveRange(seq, nodes, fromT, toT, clock, keep) {
     }
 }
 
-/** Lay one recorded item's pieces back to back on its own track, from its own source. */
-function gcutLayItem(seq, f, pieces, startT, clock) {
+/**
+ * Lay one recorded item's pieces back to back on its own track, from its own source. `rec`
+ * (optional) has rebuiltEndT pushed out before each piece, so a failure part-way rolls back
+ * everything laid so far, even a piece reaching a frame past the range.
+ */
+function gcutLayItem(seq, f, pieces, startT, clock, rec) {
     var track = gcutKindTracks(seq, f.kind)[f.trackIndex], cursorT = startT;
     for (var p = 0; p < pieces.length; p++) {
+        if (rec) rec.rebuiltEndT = Math.max(rec.rebuiltEndT, cursorT + pieces[p].durT);
         // Premiere rounds set points down to the source frame grid, so aim at a source frame;
         // a quarter frame later is the fallback when floating-point error rounds it a frame low.
         var srcIn = Math.round((f.inS + pieces[p].t0S) / f.srcFrameS) * f.srcFrameS;
@@ -479,13 +495,26 @@ function gcutStrayLeft(seq, found, fromT, toT, clock, others) {
 }
 
 /** Lay every item: video first, then remove stray audio the video brought along, then audio. */
-function gcutLayAll(seq, found, pieces, startT, endT, clock, others) {
+function gcutLayAll(seq, found, pieces, startT, endT, clock, others, rec) {
     var nodes = [], i, endAt = startT;
     for (i = 0; i < found.length; i++) nodes.push(found[i].node);
-    for (i = 0; i < found.length; i++) if (found[i].kind === "video") endAt = gcutLayItem(seq, found[i], pieces, startT, clock);
+    for (i = 0; i < found.length; i++) if (found[i].kind === "video") endAt = gcutLayItem(seq, found[i], pieces, startT, clock, rec);
     gcutRemoveStrayAudio(seq, nodes, startT, Math.max(endAt, endT), clock, others);
-    for (i = 0; i < found.length; i++) if (found[i].kind === "audio") endAt = gcutLayItem(seq, found[i], pieces, startT, clock);
+    for (i = 0; i < found.length; i++) if (found[i].kind === "audio") endAt = gcutLayItem(seq, found[i], pieces, startT, clock, rec);
     return endAt;
+}
+
+/**
+ * True if `f`'s source still sits on its own track inside the gap [fromT, toT): an original
+ * whose remove() silently did nothing leaves its tail there, and Close gap would then move it.
+ */
+function gcutTailLeft(seq, f, fromT, toT, clock) {
+    var items = gcutItems(gcutKindTracks(seq, f.kind)[f.trackIndex]);
+    for (var i = 0; i < items.length; i++) {
+        var it = items[i];
+        if (gcutNode(it) === f.node && gcutT(it.start) < toT - clock.half && gcutT(it.end) > fromT + clock.half) return true;
+    }
+    return false;
 }
 
 /** Remove audio of our sources in [fromT, toT] that isn't in `others` (it gets re-laid next). */
@@ -507,7 +536,7 @@ function gcutRelayAll(seq, rec, clock, others) {
     var nodes = [], i, whole = [{ t0S: 0, durT: rec.endT - rec.startT }];
     for (i = 0; i < rec.items.length; i++) nodes.push(rec.items[i].node);
     gcutRemoveRange(seq, nodes, rec.startT, Math.max(rec.rebuiltEndT, rec.endT), clock, others);
-    gcutLayAll(seq, rec.items, whole, rec.startT, rec.endT, clock, others);
+    gcutLayAll(seq, rec.items, whole, rec.startT, rec.endT, clock, others, rec);
     for (i = 0; i < rec.items.length; i++) if (gcutVerifyItems(seq, rec.items[i], whole, rec.startT, clock)) return false;
     return !gcutStrayLeft(seq, rec.items, rec.startT, rec.endT, clock, others);
 }
@@ -537,29 +566,35 @@ function gcutApplyCutsMulti(specJson) {
         }
         var key = "m@" + spec.startTicks;
         var rec = { startT: startT, endT: endT, rebuiltEndT: endT, gapClosed: false, items: found };
-        gcutState().gcutStash[key] = rec; // written before anything changes, so it can always be rolled back
+        // A new Apply at the same start replaces the earlier record (that Restore is meaningless once
+        // the timeline changed again); if this one rolls back cleanly, the earlier record comes back.
+        var stash = gcutState().gcutStash, hadPrev = stash.hasOwnProperty(key), prev = stash[key];
+        stash[key] = rec; // written before anything changes, so it can always be rolled back
         try {
             for (k = 0; k < found.length; k++) found[k].item.remove(false, false);
             var nodes = [];
             for (k = 0; k < found.length; k++) nodes.push(found[k].node);
             gcutRemoveRange(seq, nodes, startT, endT, clock, others); // linked partners some builds leave behind
-            var endAt = gcutLayAll(seq, found, pieces, startT, endT, clock, others);
-            rec.rebuiltEndT = Math.max(endAt, startT);
+            var endAt = gcutLayAll(seq, found, pieces, startT, endT, clock, others, rec);
             for (k = 0; k < found.length; k++) {
                 var bad = gcutVerifyItems(seq, found[k], pieces, startT, clock);
                 if (bad) throw new Error(bad);
+                if (gcutTailLeft(seq, found[k], endAt, endT, clock)) {
+                    throw new Error("The original clip on " + found[k].label + " didn't come off the timeline: part of it is still in the gap.");
+                }
             }
             var stray = gcutStrayLeft(seq, found, startT, Math.max(endAt, endT), clock, others);
             if (stray) throw new Error("Audio a camera angle brought along couldn't be removed from " + stray + ".");
             var hit = gcutSnapshotIntact(seq, others, clock);
             if (hit) throw new Error("The rebuild overwrote something on " + hit + ".");
+            rec.rebuiltEndT = Math.max(endAt, startT); // verified: the rebuild ends exactly here
             return gcutOk({ ok: true, appliedCount: pieces.length, clipCount: found.length,
                 expectedDuration: (endAt - startT) / GCUT_TICKS, actualDuration: (endAt - startT) / GCUT_TICKS,
                 trailingGapS: (endT - endAt) / GCUT_TICKS });
         } catch (inner) {
             var back = false;
             try { back = gcutRelayAll(seq, rec, clock, others); } catch (ignored) { back = false; }
-            if (back) delete gcutState().gcutStash[key];
+            if (back) { if (hadPrev) stash[key] = prev; else delete stash[key]; }
             var damage = gcutSnapshotIntact(seq, others, clock);
             return gcutOk({ ok: false, rolledBack: back, appliedCount: 0, clipCount: 0, expectedDuration: 0,
                 actualDuration: 0, trailingGapS: 0,

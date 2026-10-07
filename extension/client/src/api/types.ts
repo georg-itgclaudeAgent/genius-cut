@@ -46,7 +46,8 @@ export interface Snapshot {
 
 export interface NotFound { found: false; message: string }
 
-export interface AudioSource { media_path: string; in_s: number }
+/** One audio clip's place in the range: where it starts (offset_s from the range start), how long, and its in point there. */
+export interface AudioSource { media_path: string; in_s: number; offset_s: number; duration_s: number }
 
 export interface TrimRequest {
   duration_s: number;

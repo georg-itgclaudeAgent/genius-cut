@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { keptSpans, reviewSummary } from "./review";
+import { removedSpans, reviewSummary } from "./review";
 import { parseClipName, submitsPrompt } from "./prompt";
 import { formatTimecode, formatDuration } from "./timecode";
 import { backendPaths, parseRuntimePointer, liveRuntimePython } from "./paths";
@@ -10,23 +10,13 @@ const cut = (start: number, end: number, reason = "filler"): SequenceCut => ({
   start, end, text: "x", reason, start_seq_s: start, end_seq_s: end,
 });
 
-describe("keptSpans — mirrors backend trim.kept_spans (range-relative)", () => {
-  it("is the complement of the checked cuts", () => {
-    const cuts = [cut(0.5, 0.8), cut(2.0, 2.2)];
-    expect(keptSpans(cuts, [true, true], 4)).toEqual([
-      { start: 0, end: 0.5 }, { start: 0.8, end: 2 }, { start: 2.2, end: 4 },
-    ]);
+describe("removedSpans", () => {
+  it("merges the ticked cuts", () => {
+    expect(removedSpans([cut(2, 3), cut(2.5, 4), cut(7, 8)], [true, true, false])).toEqual([{ start: 2, end: 4 }]);
   });
-  it("unticked cuts stay in the clip", () => {
-    const cuts = [cut(0.5, 0.8), cut(2.0, 2.2)];
-    expect(keptSpans(cuts, [false, true], 4)).toEqual([{ start: 0, end: 2 }, { start: 2.2, end: 4 }]);
-    expect(keptSpans([cut(0.5, 0.8)], [true], 4)).toEqual([{ start: 0, end: 0.5 }, { start: 0.8, end: 4 }]);
-  });
-  it("clamps cuts past the range edges and never emits zero-length spans", () => {
-    expect(keptSpans([cut(0, 0.3), cut(3.5, 4.5)], [true, true], 4)).toEqual([{ start: 0.3, end: 3.5 }]);
-  });
-  it("keeps everything when nothing is ticked", () => {
-    expect(keptSpans([cut(1, 2)], [false], 4)).toEqual([{ start: 0, end: 4 }]);
+  it("sorts, keeps separate cuts apart and returns nothing when none is ticked", () => {
+    expect(removedSpans([cut(5, 6), cut(1, 2)], [true, true])).toEqual([{ start: 1, end: 2 }, { start: 5, end: 6 }]);
+    expect(removedSpans([cut(1, 2)], [false])).toEqual([]);
   });
 });
 

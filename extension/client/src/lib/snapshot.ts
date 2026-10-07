@@ -1,5 +1,9 @@
 import type { AudioSource, Snapshot, SnapshotItem, TrimRequest } from "../api/types";
 import { formatDuration } from "./timecode";
+import { round3 } from "./review";
+
+/** Premiere ticks per second. */
+const TICKS = 254016000000;
 
 export function snapshotSummary(s: Snapshot): string {
   const len = formatDuration(s.durationS);
@@ -28,7 +32,12 @@ export function audioChoice(s: Snapshot, remembered: string | null): AudioChoice
 }
 
 export function trimRequestFor(s: Snapshot, sources: SnapshotItem[], prompt: string): TrimRequest {
-  const audio: AudioSource[] = sources.map((a) => ({ media_path: a.mediaPath, in_s: a.inS }));
+  const r0 = s.startS, r1 = r0 + s.durationS;
+  const audio: AudioSource[] = sources.map((a) => {
+    const aStart = Number(a.startTicks) / TICKS, aEnd = Number(a.endTicks) / TICKS;
+    const from = Math.max(aStart, r0), to = Math.min(aEnd, r1);
+    return { media_path: a.mediaPath, in_s: round3(a.inS + (from - aStart)), offset_s: round3(from - r0), duration_s: round3(to - from) };
+  });
   return { duration_s: s.durationS, range_start_seq_s: s.startS, audio, prompt };
 }
 

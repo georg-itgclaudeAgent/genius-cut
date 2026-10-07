@@ -101,11 +101,12 @@ export const mockTransport: Transport = async (req) => {
 
 export const mockHost: Host = {
   async snapshotSelection() { await delay(300); return SNAPSHOT; },
-  async applyCuts(snap, spans) {
+  async applyCuts(snap, removed) {
     await delay(1200);
-    const expected = spans.reduce((a, s) => a + (s.end - s.start), 0);
-    return { ok: true, appliedCount: spans.length, clipCount: snap.video.length + snap.audio.length, expectedDuration: expected, actualDuration: expected,
-      trailingGapS: snap.durationS - expected };
+    const gone = removed.reduce((a, s) => a + (s.end - s.start), 0);
+    const expected = snap.durationS - gone;
+    return { ok: true, appliedCount: removed.length, clipCount: snap.video.length + snap.audio.length, expectedDuration: expected, actualDuration: expected,
+      trailingGapS: gone };
   },
   async closeGap() { await delay(300); },
   async restore() { await delay(500); },

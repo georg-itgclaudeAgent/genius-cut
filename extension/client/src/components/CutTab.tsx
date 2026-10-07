@@ -5,7 +5,7 @@ import type { AiStatus, Health, Snapshot, SnapshotItem, TrimResponse } from "../
 import { afterTrimRefresh, watchAiStatus } from "../lib/aiStatus";
 import { budgetEstimate } from "../lib/cost";
 import { parseClipName, submitsPrompt } from "../lib/prompt";
-import { keptSpans } from "../lib/review";
+import { removedSpans } from "../lib/review";
 import { audioChoice, recalledAudio, rememberAudio, snapshotSummary, trimRequestFor } from "../lib/snapshot";
 import { formatDuration } from "../lib/timecode";
 import { CostEstimate } from "./Cost";
@@ -129,7 +129,7 @@ export function CutTab({ health, ready, onTrimmed }: {
     const { snap: c, res, checked } = phase;
     go({ k: "applying", snap: c, res, checked });
     try {
-      const result = await runtime.host.applyCuts(c, keptSpans(res.cuts, checked, c.durationS));
+      const result = await runtime.host.applyCuts(c, removedSpans(res.cuts, checked));
       if (!result.ok) {
         go({ k: "error", snap: c, restorable: offersRestore(result), message: result.message ||
           `The rebuilt clip is ${result.actualDuration.toFixed(2)} s, expected ${result.expectedDuration.toFixed(2)} s. ` +

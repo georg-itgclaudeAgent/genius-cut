@@ -47,13 +47,13 @@ describe("cepHost", () => {
     expect(argOf(script, "gcutSnapshotSelection")).toBe("");
   });
 
-  it("applyCuts sends the range, every clip's track and the spans", async () => {
+  it("applyCuts sends the range, every clip's track and the removed cuts", async () => {
     let script = "";
     const host = cepHost(async (s) => { script = s; return JSON.stringify({ ok: true, appliedCount: 2, clipCount: 2 }); });
-    const spans = [{ start: 0, end: 1 }, { start: 2, end: 5 }];
-    await expect(host.applyCuts(SNAP, spans)).resolves.toMatchObject({ ok: true, clipCount: 2 });
+    const cuts = [{ start: 2, end: 3 }];
+    await expect(host.applyCuts(SNAP, cuts)).resolves.toMatchObject({ ok: true, clipCount: 2 });
     expect(argOf(script, "gcutApplyCutsMulti")).toEqual({
-      sequenceId: "seq-1", startTicks: "100", endTicks: "900", spans,
+      sequenceId: "seq-1", startTicks: "100", endTicks: "900", cuts,
       items: [
         { kind: "video", trackIndex: 0, startTicks: "100", endTicks: "900" },
         { kind: "audio", trackIndex: 2, startTicks: "100", endTicks: "900" },

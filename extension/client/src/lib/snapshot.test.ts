@@ -44,8 +44,20 @@ describe("audioChoice", () => {
 });
 
 describe("trimRequestFor", () => {
+  const T = 254016000000;
   it("sends the range and the chosen audio sources", () => {
-    expect(trimRequestFor(three, three.audio, "trim it")).toEqual({
-      duration_s: 647.4, range_start_seq_s: 95.5, audio: [{ media_path: "D:/wide.mov", in_s: 10 }], prompt: "trim it" });
+    const a = { ...three.audio[0], startTicks: String(95.5 * T), endTicks: String(742.9 * T) };
+    expect(trimRequestFor(three, [a], "trim it")).toEqual({
+      duration_s: 647.4, range_start_seq_s: 95.5, audio: [{ media_path: "D:/wide.mov", in_s: 10, offset_s: 0, duration_s: 647.4 }], prompt: "trim it" });
+  });
+
+  it("each source covers its overlap with the range, placed at its offset", () => {
+    const a = { ...item("audio", 0, "mic.wav", 50), startTicks: String(99 * T), endTicks: String(111 * T) };
+    const b = { ...item("audio", 1, "lav.wav", 7), startTicks: String(103 * T), endTicks: String(108 * T) };
+    const s = { ...snap([item("video", 0, "A.mov", 10)], [a, b]), startS: 100, durationS: 10 };
+    expect(trimRequestFor(s, [a, b], "x").audio).toEqual([
+      { media_path: "D:/mic.wav", in_s: 51, offset_s: 0, duration_s: 10 },
+      { media_path: "D:/lav.wav", in_s: 7, offset_s: 3, duration_s: 5 },
+    ]);
   });
 });

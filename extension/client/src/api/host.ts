@@ -26,8 +26,8 @@ export interface ApplyResult {
 
 export interface Host {
   snapshotSelection(name: string | null): Promise<Snapshot | NotFound>;
-  /** keptSpans are range-relative seconds. */
-  applyCuts(snap: Snapshot, keptSpans: Span[]): Promise<ApplyResult>;
+  /** removed are the cut timeline ranges, in seconds relative to the range start. */
+  applyCuts(snap: Snapshot, removed: Span[]): Promise<ApplyResult>;
   /** Put the original clips back. Throws the host's message if it can't. */
   restore(snap: Snapshot): Promise<void>;
   /** Close the gap the cuts left at the end. Throws the host's message if it can't. */
@@ -53,10 +53,10 @@ export function cepHost(evalScript: (s: string) => Promise<string>): Host {
   };
   return {
     snapshotSelection: (name) => call("gcutSnapshotSelection", name ?? ""),
-    applyCuts: (snap, spans) => call("gcutApplyCutsMulti", {
+    applyCuts: (snap, removed) => call("gcutApplyCutsMulti", {
       sequenceId: snap.sequenceId, startTicks: snap.startTicks, endTicks: snap.endTicks,
       items: [...snap.video, ...snap.audio].map((x) => ({ kind: x.kind, trackIndex: x.trackIndex, startTicks: x.startTicks, endTicks: x.endTicks })),
-      spans,
+      cuts: removed,
     }),
     restore: async (snap) => refusal(await call("gcutRestoreMulti", { startTicks: snap.startTicks })),
     closeGap: async (snap) => refusal(await call("gcutCloseGapMulti", { startTicks: snap.startTicks })),

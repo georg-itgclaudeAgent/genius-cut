@@ -1,6 +1,6 @@
 /**
- * Review maths, recomputed live as the editor unticks cuts. `keptSpans` must
- * agree with backend/geniuscut/trim.py `kept_spans`: it is what the host re-lays.
+ * Review maths, recomputed live as the editor unticks cuts. `removedSpans` is what
+ * the host takes out of the timeline.
  */
 import type { SequenceCut, Span } from "../api/types";
 
@@ -34,8 +34,15 @@ function keptRelative(cuts: SequenceCut[], checked: boolean[], duration: number)
   return kept.filter((s) => s.end - s.start > EPS);
 }
 
-export function keptSpans(cuts: SequenceCut[], checked: boolean[], durationS: number): Span[] {
-  return keptRelative(cuts, checked, durationS).map((s) => ({ start: ms(s.start), end: ms(s.end) }));
+/** The ticked cuts as sorted, merged removed ranges, range-relative seconds (what the host removes). */
+export function removedSpans(cuts: SequenceCut[], checked: boolean[]): Span[] {
+  const out: Span[] = [];
+  for (const c of cuts.filter((_, i) => checked[i]).sort((x, y) => x.start - y.start)) {
+    const last = out[out.length - 1];
+    if (last && c.start <= last.end) last.end = Math.max(last.end, ms(c.end));
+    else out.push({ start: ms(c.start), end: ms(c.end) });
+  }
+  return out;
 }
 
 export interface ReviewSummary {

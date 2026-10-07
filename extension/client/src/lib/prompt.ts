@@ -27,3 +27,9 @@ export function parseClipName(input: string): string | null {
   if (trim) return clean(trim[1]);
   return /\s/.test(text) ? null : clean(text);
 }
+
+/** The instruction box works like a chat prompt: Enter runs it, Shift+Enter starts a new line,
+ *  and Enter that confirms an input-method composition (e.g. Japanese, Chinese) does neither. */
+export function submitsPrompt(k: { key: string; shiftKey: boolean; isComposing: boolean }): boolean {
+  return k.key === "Enter" && !k.shiftKey && !k.isComposing;
+}

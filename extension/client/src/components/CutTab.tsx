@@ -4,7 +4,7 @@ import { HostUnavailable, type ApplyResult } from "../api/host";
 import type { AiStatus, Health, Snapshot, SnapshotItem, TrimResponse } from "../api/types";
 import { afterTrimRefresh, watchAiStatus } from "../lib/aiStatus";
 import { budgetEstimate } from "../lib/cost";
-import { parseClipName } from "../lib/prompt";
+import { parseClipName, submitsPrompt } from "../lib/prompt";
 import { keptSpans } from "../lib/review";
 import { audioChoice, recalledAudio, rememberAudio, snapshotSummary, trimRequestFor } from "../lib/snapshot";
 import { formatDuration } from "../lib/timecode";
@@ -58,6 +58,7 @@ export function CutTab({ health, ready, onTrimmed }: {
   onTrimmed: (snap: Snapshot, res: TrimResponse, checked: boolean[]) => void;
 }) {
   const [instruction, setInstruction] = useState("trim the selected clip");
+  const formRef = useRef<HTMLFormElement>(null);
   const [phase, setPhase] = useState<Phase>({ k: "idle" });
   // /health is read once at connect; this re-reads its ai block after every trim attempt
   // and on focus/visibility, so the month and the limit (the source of truth) stay current.
@@ -171,6 +172,8 @@ export function CutTab({ health, ready, onTrimmed }: {
   const monthUsd = ai?.month_usd ?? null;
   const clipS = snap ? snap.durationS : null;
   const overLimit = ai ? budgetEstimate(ai, clipS, monthUsd).over : false;
+  // One rule for the button and for Enter: submitting from code ignores a disabled button.
+  const canAnalyse = ready && !working && !overLimit && phase.k !== "applying" && phase.k !== "applied";
 
   return (
     <>
@@ -191,74 +194,83 @@ export function CutTab({ health, ready, onTrimmed }: {
 
       <div className="sec">
         <div className="sec-hd"><span className="lbl">Instruction</span></div>
-        <form className="prompt" onSubmit={(e) => { e.preventDefault(); analyse(); }}>
-          <input value={instruction} onChange={(e) => setInstruction(e.target.value)} aria-label="Instruction" />
+        <form className="prompt" ref={formRef} onSubmit={(e) => { e.preventDefault(); if (canAnalyse) analyse(); }}>
+          <textarea value={instruction} onChange={(e) => setInstruction(e.target.value)} aria-label="Instruction" rows={3}
+            onKeyDown={(e) => {
+              if (submitsPrompt({ key: e.key, shiftKey: e.shiftKey, isComposing: e.nativeEvent.isComposing })) {
+                e.preventDefault();
+                formRef.current?.requestSubmit();
+              }
+            }} />
           <button className="btn btn-p" type="submit"
-            disabled={!ready || working || overLimit || phase.k === "applying" || phase.k === "applied"}
+            disabled={!canAnalyse}
             title={overLimit ? "Monthly AI limit reached" : undefined}>Analyse</button>
         </form>
         {ai && <CostEstimate ai={ai} clipS={clipS} monthUsd={monthUsd} />}
       </div>
 
-      {working && (
-        <div className="sec">
-          <div className="stages">
-            <Stage state={phase.k === "finding" ? "run" : "done"} label="Find the clips in the timeline" />
-            <Stage state={phase.k === "analysing" ? "run" : "wait"} label="Transcribe on this machine, then propose cuts" />
-          </div>
-          {health && <Telemetry device={health.stt_device} />}
-        </div>
-      )}
-
-      {phase.k === "error" && (
-        <div className="sec">
-          <div className={`note ${phase.notYet ? "" : "bad"}`}>
-            {phase.message}
-            <div className="actions-row">
-              {phase.restorable && phase.snap && (
-                <button className="btn btn-g" onClick={() => restore(phase.snap!)}>Restore original</button>
-              )}
-              <button className="btn btn-g" onClick={() => go({ k: "idle" })}>Dismiss</button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {phase.k === "choosing" && (
-        <AudioPicker snap={phase.snap} preselect={phase.preselect} onCancel={() => go({ k: "idle" })}
-          onPick={(key, sources) => { rememberAudio(phase.snap.sequenceId, key); run(phase.snap, sources); }} />
-      )}
-
-      {(phase.k === "review" || phase.k === "applying") && (
-        <CutReview key={`${phase.snap.sequenceId}@${phase.snap.startTicks}`} snap={phase.snap} res={phase.res} checked={phase.checked} busy={phase.k === "applying"}
-          onToggle={toggle} onToggleAll={toggleAll} onApply={apply} onDiscard={() => go({ k: "idle" })} />
-      )}
-
-      {phase.k === "applied" && (
-        <>
+      <div className="result" aria-label="Result">
+        {phase.k === "idle" && <div className="result-empty">Result</div>}
+        {working && (
           <div className="sec">
-            <div className="verdict"><span className="tick">✓</span><span className="t">Applied and verified</span></div>
-            <div className="durline" style={{ marginTop: 0 }}>
-              <span>{formatDuration(phase.snap.durationS)}</span><span className="muted">→</span>
-              <span className="to">{formatDuration(phase.result.actualDuration)}</span>
-              <span style={{ marginLeft: "auto", color: "var(--blue)" }}>{phase.result.appliedCount} spans rebuilt in {phase.result.clipCount} {phase.result.clipCount === 1 ? "clip" : "clips"}</span>
+            <div className="stages">
+              <Stage state={phase.k === "finding" ? "run" : "done"} label="Find the clips in the timeline" />
+              <Stage state={phase.k === "analysing" ? "run" : "wait"} label="Transcribe on this machine, then propose cuts" />
             </div>
+            {health && <Telemetry device={health.stt_device} />}
           </div>
-          {phase.result.trailingGapS > 0.01 && (
-            <div className="sec">
-              <div className="note">
-                {phase.gapClosed ? <b>Gap closed.</b> : <><b>{phase.result.trailingGapS.toFixed(1)}s of reclaimed time</b> is sitting
-                  as a gap after the clip, so nothing on other tracks moved.</>}
-                {!phase.gapClosed && <div className="actions-row"><button className="btn btn-g" onClick={closeGap} disabled={phase.busy}>Close gap</button></div>}
+        )}
+
+        {phase.k === "error" && (
+          <div className="sec">
+            <div className={`note ${phase.notYet ? "" : "bad"}`}>
+              {phase.message}
+              <div className="actions-row">
+                {phase.restorable && phase.snap && (
+                  <button className="btn btn-g" onClick={() => restore(phase.snap!)}>Restore original</button>
+                )}
+                <button className="btn btn-g" onClick={() => go({ k: "idle" })}>Dismiss</button>
               </div>
             </div>
-          )}
-          <div className="actions">
-            <button className="btn btn-g" onClick={() => restore(phase.snap)} disabled={phase.busy}>Restore original</button>
-            <button className="btn btn-p" onClick={() => go({ k: "idle" })} disabled={phase.busy}>Done</button>
           </div>
-        </>
-      )}
+        )}
+
+        {phase.k === "choosing" && (
+          <AudioPicker snap={phase.snap} preselect={phase.preselect} onCancel={() => go({ k: "idle" })}
+            onPick={(key, sources) => { rememberAudio(phase.snap.sequenceId, key); run(phase.snap, sources); }} />
+        )}
+
+        {(phase.k === "review" || phase.k === "applying") && (
+          <CutReview key={`${phase.snap.sequenceId}@${phase.snap.startTicks}`} snap={phase.snap} res={phase.res} checked={phase.checked} busy={phase.k === "applying"}
+            onToggle={toggle} onToggleAll={toggleAll} onApply={apply} onDiscard={() => go({ k: "idle" })} />
+        )}
+
+        {phase.k === "applied" && (
+          <>
+            <div className="sec">
+              <div className="verdict"><span className="tick">✓</span><span className="t">Applied and verified</span></div>
+              <div className="durline" style={{ marginTop: 0 }}>
+                <span>{formatDuration(phase.snap.durationS)}</span><span className="muted">→</span>
+                <span className="to">{formatDuration(phase.result.actualDuration)}</span>
+                <span style={{ marginLeft: "auto", color: "var(--blue)" }}>{phase.result.appliedCount} spans rebuilt in {phase.result.clipCount} {phase.result.clipCount === 1 ? "clip" : "clips"}</span>
+              </div>
+            </div>
+            {phase.result.trailingGapS > 0.01 && (
+              <div className="sec">
+                <div className="note">
+                  {phase.gapClosed ? <b>Gap closed.</b> : <><b>{phase.result.trailingGapS.toFixed(1)}s of reclaimed time</b> is sitting
+                    as a gap after the clip, so nothing on other tracks moved.</>}
+                  {!phase.gapClosed && <div className="actions-row"><button className="btn btn-g" onClick={closeGap} disabled={phase.busy}>Close gap</button></div>}
+                </div>
+              </div>
+            )}
+            <div className="actions">
+              <button className="btn btn-g" onClick={() => restore(phase.snap)} disabled={phase.busy}>Restore original</button>
+              <button className="btn btn-p" onClick={() => go({ k: "idle" })} disabled={phase.busy}>Done</button>
+            </div>
+          </>
+        )}
+      </div>
     </>
   );
 }

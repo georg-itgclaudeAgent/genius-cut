@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { keptSpans, reviewSummary } from "./review";
-import { parseClipName } from "./prompt";
+import { parseClipName, submitsPrompt } from "./prompt";
 import { formatTimecode, formatDuration } from "./timecode";
 import { backendPaths, parseRuntimePointer, liveRuntimePython } from "./paths";
 import { ensureBackend, startingMessage } from "./lifecycle";
@@ -207,4 +207,12 @@ describe("startingMessage", () => {
   it("falls back to loading for a backend that doesn't report a phase", () => {
     expect(startingMessage(h())).toBe("Loading the speech model (about 30 seconds)…");
   });
+});
+
+describe("submitsPrompt", () => {
+  // The instruction box works like a chat prompt: Enter runs, Shift+Enter is a new line.
+  it("Enter submits", () => expect(submitsPrompt({ key: "Enter", shiftKey: false, isComposing: false })).toBe(true));
+  it("Shift+Enter adds a line", () => expect(submitsPrompt({ key: "Enter", shiftKey: true, isComposing: false })).toBe(false));
+  it("Enter while an IME is composing doesn't submit", () => expect(submitsPrompt({ key: "Enter", shiftKey: false, isComposing: true })).toBe(false));
+  it("other keys don't submit", () => expect(submitsPrompt({ key: "a", shiftKey: false, isComposing: false })).toBe(false));
 });

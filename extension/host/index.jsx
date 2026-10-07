@@ -23,8 +23,9 @@
  *     clip back at its own original place. The bin items' own in/out marks are always restored.
  *   - What it can't do safely is refused before anything changes: retimed clips, and a slide
  *     that would cover a clip it didn't record.
- *   - Restore puts every recorded clip back; Close gap pulls everything after the edit left, on
- *     every track. Both work from the record Apply keeps for this session only.
+ *   - Restore puts every recorded clip back at its own place; Close gap slides every clip Apply
+ *     didn't rebuild that starts inside or after the range by the same mapping, on every track.
+ *     Both work from the record Apply keeps for this session only.
  *
  * Unverified against real Premiere until Checkpoint B (docs silent or contradictory):
  *   - setInPoint/setOutPoint units (docs say ticks for one, seconds for the other): set,
@@ -839,10 +840,28 @@ function gcutRestoreMulti(specJson) {
 
 // ── gcutCloseGapMulti ───────────────────────────────────────────────────────────────
 
+/** Sequence time as m:ss.s, for messages. */
+function gcutClockText(ticks) {
+    var tenths = Math.round(ticks / GCUT_TICKS * 10), m = Math.floor(tenths / 600), s = (tenths - m * 600) / 10;
+    return m + ":" + (s < 10 ? "0" : "") + s.toFixed(1);
+}
+
+/** True if a rebuilt piece (from gcutOursNow) sits on this track at exactly this start. */
+function gcutOurs(ours, track, startT) {
+    for (var k = 0; k < ours.length; k++) {
+        if ((ours[k].kind === "audio") === track.audio && ours[k].trackIndex === track.index && ours[k].startT === startT) return true;
+    }
+    return false;
+}
+
 /**
- * Ripple everything after the gap left by the gap's length, on every track, so sync holds
- * across tracks. Refuses if anything sits inside the gap or a track with later clips is
- * locked. Items already moved as a linked partner are not moved twice.
+ * Slide every clip Apply didn't rebuild that starts at or after the range start left by what the
+ * cuts removed before it (t -> t - removedBefore(t)), on every track: the mapping the recorded
+ * clips already got, so titles, B-roll and music stay in step with the speech. The rebuilt pieces
+ * are already in place and never move; clips starting before the range never move. Refuses,
+ * before moving anything, a clip that crosses a cut (it would need cutting itself), a locked track
+ * with a clip to move, and a slide that would land on a clip. Items already moved as a linked
+ * partner are not moved twice.
  * spec: { startTicks } — the range start recorded at Analyse.
  */
 function gcutCloseGapMulti(specJson) {
@@ -851,28 +870,49 @@ function gcutCloseGapMulti(specJson) {
         var seq = gcutSequence(), clock = gcutClock(seq);
         var rec = gcutRecord(seq, spec, "There's no Genius Cut edit on these clips in this session.");
         if (rec.gapClosed) return gcutOk({ ok: true, movedCount: 0 });
-        var gapStartT = rec.rebuiltEndT, gapEndT = rec.endT, gapT = gapEndT - gapStartT;
-        if (gapT <= clock.half) return gcutOk({ ok: true, movedCount: 0 });
 
-        var movers = [], tracks = gcutTracks(seq), t, i, it;
+        var ours = gcutOursNow(seq, rec, clock), movers = [], finals = [], tracks = gcutTracks(seq), t, i, j, c, it;
         for (t = 0; t < tracks.length; t++) {
             var items = gcutItems(tracks[t].track), later = false;
+            finals.push([]); // where each clip on this track ends up
             for (i = 0; i < items.length; i++) {
                 it = items[i];
-                var s = gcutT(it.start), e = gcutT(it.end);
-                if (e > gapStartT + clock.half && s < gapEndT - clock.half) {
-                    throw new Error("Something on " + tracks[t].label + " sits inside the gap, so it wasn't closed. Close it by hand.");
+                var s = gcutT(it.start), e = gcutT(it.end), shift = 0;
+                if (s >= rec.startT - clock.half && !gcutOurs(ours, tracks[t], s)) {
+                    for (c = 0; c < rec.cutsT.length; c++) {
+                        if (gcutOverlaps(s, e, rec.cutsT[c].startT, rec.cutsT[c].endT, clock)) {
+                            throw new Error(it.name + " on " + tracks[t].label + " crosses a cut at " + gcutClockText(rec.cutsT[c].startT) +
+                                ". Move it, or close the gap by hand.");
+                        }
+                    }
+                    shift = gcutRemovedBefore(rec.cutsT, s);
                 }
-                if (s >= gapEndT - clock.half) { movers.push({ item: it, target: s - gapT, label: tracks[t].label }); later = true; }
+                if (shift > clock.half) {
+                    movers.push({ item: it, startT: s, target: s - shift, label: tracks[t].label });
+                    later = true;
+                } else shift = 0;
+                finals[t].push({ startT: s - shift, endT: e - shift, moves: shift > 0 });
             }
             if (later && typeof tracks[t].track.isLocked === "function" && tracks[t].track.isLocked()) {
-                throw new Error(tracks[t].label + " is locked, so the gap wasn't closed. Unlock it and try again.");
+                throw new Error(tracks[t].label + " is locked. Unlock it or close the gap by hand.");
             }
         }
+        // The layout each track would end up with: a clip that moves may not overlap any other.
+        for (t = 0; t < tracks.length; t++) {
+            var fin = finals[t];
+            for (i = 0; i < fin.length; i++) {
+                for (j = i + 1; j < fin.length; j++) {
+                    if ((fin[i].moves || fin[j].moves) && gcutOverlaps(fin[i].startT, fin[i].endT, fin[j].startT, fin[j].endT, clock)) {
+                        throw new Error("Closing the gap would overlap a clip on " + tracks[t].label + ", so nothing was moved.");
+                    }
+                }
+            }
+        }
+        movers.sort(function (a, b) { return a.startT - b.startT; });
         rec.gapClosed = true; // from here on Restore must not run: later clips may have moved
-        var offset = gcutTimeFromTicks(-gapT);
         for (i = 0; i < movers.length; i++) {
-            if (!gcutNear(gcutT(movers[i].item.start), movers[i].target, clock.half)) movers[i].item.move(offset);
+            var now = gcutT(movers[i].item.start);
+            if (!gcutNear(now, movers[i].target, clock.half)) movers[i].item.move(gcutTimeFromTicks(movers[i].target - now));
         }
         for (i = 0; i < movers.length; i++) {
             if (!gcutNear(gcutT(movers[i].item.start), movers[i].target, clock.half)) {

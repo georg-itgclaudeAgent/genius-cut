@@ -494,9 +494,10 @@ describe("gcutCloseGapMulti: one clip", () => {
     expect(a[a.numItems - 1].start.seconds).toBeCloseTo(108, 1);
   });
 
-  it("refuses if anything on another track sits inside the gap", () => {
-    s.seq.audioTracks[1].add(new ProjectItem("music.wav", "node-3", 60), 109, 0, 0.5);
-    expect(() => closeGap(s)).toThrow(/A2 sits inside the gap/);
+  it("refuses, naming it, a clip on another track that crosses a cut, and moves nothing", () => {
+    s.seq.audioTracks[1].add(new ProjectItem("music.wav", "node-3", 60), 107.5, 0, 1); // 107.5–108.5 crosses 107–108
+    expect(() => closeGap(s)).toThrow("music.wav on A2 crosses a cut at 1:47.0. Move it, or close the gap by hand.");
+    expect(s.seq.videoTracks[0].clips.at(-1).start.seconds).toBeCloseTo(110, 1);
   });
 
   it("I4: refuses on a locked track before moving anything", () => {
@@ -934,7 +935,8 @@ describe("gcutRestoreMulti", () => {
     expect(() => restoreMulti(s)).toThrow(/Undo/);
     const rec = (s.host.ctx as any).$.global.gcutStash["m@" + START];
     expect([rec.rebuiltEndT, rec.gapClosed]).toEqual([108 * TICKS, false]);
-    expect(() => closeGapMulti(s)).toThrow(/inside the gap/);
+    // The clips that did go back whole aren't planned pieces, so Close gap sees them crossing the cuts.
+    expect(() => closeGapMulti(s)).toThrow(/close\.mov on V2 crosses a cut at 1:42\.0/);
   });
 });
 
@@ -952,11 +954,40 @@ describe("gcutCloseGapMulti", () => {
     expect(layout(s.seq.videoTracks[0]).at(-1)).toEqual([108, 113]);
     expect(layout(s.seq.audioTracks[2])).toEqual([[110, 112]]);
   });
-  it("refuses, naming the track, if something sits inside the gap", () => {
+  it("slides a clip placed after the last cut since Apply by the total", () => {
     const s = multiScene({ music: false });
     applyCuts(s);
     s.seq.audioTracks[2].add(new ProjectItem("hit.wav", "node-h", 5, "seconds", false), 108.5, 0, 1);
-    expect(() => closeGapMulti(s)).toThrow(/A3/);
+    expect(closeGapMulti(s)).toEqual({ ok: true, movedCount: 2 });
+    expect(layout(s.seq.audioTracks[2])).toEqual([[106.5, 107.5]]);
+    expect(layout(s.seq.videoTracks[3])).toEqual([[103, 105]]); // the title (104–106) had one cut before it
+  });
+  it("refuses, naming it, a clip that crosses a cut, and moves nothing", () => {
+    const s = multiScene({ music: false });
+    later(s);
+    applyCuts(s);
+    s.seq.audioTracks[2].add(new ProjectItem("hit.wav", "node-h", 5, "seconds", false), 107.5, 0, 1);
+    expect(() => closeGapMulti(s)).toThrow("hit.wav on A3 crosses a cut at 1:47.0. Move it, or close the gap by hand.");
+    expect(layout(s.seq.videoTracks[0]).at(-1)).toEqual([110, 115]);
+    expect(layout(s.seq.audioTracks[2])).toEqual([[107.5, 108.5], [112, 114]]);
+  });
+  it("refuses, naming the track, when a slid clip would overlap one that stays, and moves nothing", () => {
+    const s = multiScene({ music: false });
+    later(s);
+    applyCuts(s);
+    // Dropped into V1's gap after Apply: sliding it by 2 s lands it on V1's last piece (106–108).
+    s.seq.videoTracks[0].add(new ProjectItem("logo.png", "node-l", 5, "seconds", false), 108.5, 0, 0.5);
+    expect(() => closeGapMulti(s)).toThrow("Closing the gap would overlap a clip on V1, so nothing was moved.");
+    expect(layout(s.seq.videoTracks[0]).slice(-2)).toEqual([[108.5, 109], [110, 115]]);
+    expect(layout(s.seq.audioTracks[2])).toEqual([[112, 114]]);
+  });
+  it("leaves recorded pieces where Apply put them", () => {
+    const s = multiScene({ music: false });
+    later(s);
+    applyCuts(s);
+    closeGapMulti(s);
+    expect(pieces(s.seq.videoTracks[1])).toEqual([[100, 102, 12], [102, 106, 15], [106, 108, 20]]);
+    expect(pieces(s.seq.audioTracks[0])).toEqual([[100, 102, 10], [102, 106, 13], [106, 108, 18]]);
   });
   it("refuses a locked track before moving anything", () => {
     const s = multiScene({ music: false });
@@ -974,5 +1005,51 @@ describe("gcutCloseGapMulti", () => {
   });
   it("without an edit this session, says so", () => {
     expect(() => closeGapMulti(multiScene())).toThrow(/no Genius Cut edit/);
+  });
+});
+
+describe("Restore and Close gap (timeline mapping)", () => {
+  const cuts = [{ start: 2, end: 3 }, { start: 7, end: 8 }];
+  it("restore returns each item to its own place", () => {
+    const s = georgScene();
+    applyCuts(s, cuts);
+    expect(s.host.call("gcutRestoreMulti", { startTicks: START })).toEqual({ ok: true });
+    expect(span(s.seq.videoTracks[0])).toEqual([[100, 110, 10]]);
+    expect(span(s.seq.videoTracks[1])).toEqual([[100.24, 109.84, 30]]);
+    expect(span(s.seq.videoTracks[2])).toEqual([[100.28, 110, 5]]);
+    expect(span(s.seq.audioTracks[0])).toEqual([[99, 111, 50]]);
+  });
+  it("close gap slides unselected clips after the edit by the same amount", () => {
+    const s = georgScene();
+    applyCuts(s, cuts);
+    expect(s.host.call("gcutCloseGapMulti", { startTicks: START })).toMatchObject({ ok: true });
+    expect(span(s.seq.videoTracks[3])).toEqual([[110, 113, 0]]); // the title: 112 − 2
+  });
+  it("close gap refuses an unselected clip that crosses a cut, naming it", () => {
+    const s = georgScene();
+    s.seq.videoTracks[3].add(new ProjectItem("Lower third", "node-l", 30, "seconds", false), 101, 0, 2); // 101–103 crosses 102–103
+    applyCuts(s, cuts);
+    expect(() => s.host.call("gcutCloseGapMulti", { startTicks: START })).toThrow(/Lower third on V4 crosses a cut/);
+  });
+  it("close gap refuses a locked track before moving anything", () => {
+    const s = georgScene();
+    applyCuts(s, cuts);
+    s.seq.videoTracks[3].locked = true;
+    expect(() => s.host.call("gcutCloseGapMulti", { startTicks: START })).toThrow(/V4 is locked/);
+    expect(span(s.seq.videoTracks[3])).toEqual([[112, 115, 0]]);
+  });
+  it("close gap slides a clip between the cuts by only the cuts before it", () => {
+    const s = georgScene();
+    s.seq.videoTracks[3].add(new ProjectItem("Lower third", "node-l", 30, "seconds", false), 104, 0, 2); // 104–106: one cut before it
+    applyCuts(s, cuts);
+    expect(s.host.call("gcutCloseGapMulti", { startTicks: START })).toEqual({ ok: true, movedCount: 2 });
+    expect(span(s.seq.videoTracks[3])).toEqual([[103, 105, 0], [110, 113, 0]]);
+  });
+  it("close gap never moves a clip that starts before the range, even one over a cut", () => {
+    const s = georgScene();
+    s.seq.videoTracks[3].add(new ProjectItem("Logo", "node-l", 30, "seconds", false), 99, 0, 5); // 99–104
+    applyCuts(s, cuts);
+    expect(s.host.call("gcutCloseGapMulti", { startTicks: START })).toEqual({ ok: true, movedCount: 1 });
+    expect(span(s.seq.videoTracks[3])).toEqual([[99, 104, 0], [110, 113, 0]]);
   });
 });

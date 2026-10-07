@@ -347,23 +347,29 @@ function gcutRefind(seq, spec, clock) {
         if (typeof track.isLocked === "function" && track.isLocked()) throw new Error(label + " is locked. Unlock it to apply.");
         if (Math.abs(gcutSpeed(it) - 1) > 1e-6) throw new Error(label + " isn't at 100% speed. Nothing was changed.");
         // Audio has no frame rate of its own (Premiere may report the sample rate, or 0): its source
-        // points snap to the sequence's frames. Video must fit the sequence's frame rate.
-        var srcFrameS = clock.frameS;
+        // points snap to the sequence's frames. Video that fits the sequence's frame rate (the same,
+        // or a whole multiple) snaps to its own frames. Video that doesn't (a variable-frame-rate
+        // phone, 24 in 25) is "loose": cut on timeline time like audio, with one of its own frames
+        // of slack wherever Premiere floors a set point to them (gcutSlackS). Nothing is refused.
+        var srcFrameS = clock.frameS, loose = false, mediaFrameS = 0;
         if (x.kind !== "audio") {
             var srcFps = gcutSourceFps(it.projectItem, clock), ratio = srcFps / clock.fps;
-            if (Math.round(ratio) < 1 || Math.abs(ratio - Math.round(ratio)) > 1e-3) {
-                throw new Error(label + " is " + Math.round(srcFps * 1000) / 1000 + " fps but the sequence is " +
-                    Math.round(clock.fps * 1000) / 1000 + " fps. Genius Cut can only rebuild clips whose frame rate matches " +
-                    "the sequence (or is a whole multiple of it) for now. Nothing was changed.");
-            }
-            srcFrameS = 1 / srcFps;
+            if (Math.round(ratio) < 1 || Math.abs(ratio - Math.round(ratio)) > 1e-3) { loose = true; mediaFrameS = 1 / srcFps; }
+            else srcFrameS = 1 / srcFps;
         }
         found.push({ kind: x.kind, trackIndex: x.trackIndex, label: label, item: it, pi: it.projectItem,
                      node: it.projectItem.nodeId, startT: gcutT(it.start), endT: gcutT(it.end),
-                     inS: it.inPoint.seconds, outS: it.outPoint.seconds, srcFrameS: srcFrameS });
+                     inS: it.inPoint.seconds, outS: it.outPoint.seconds, srcFrameS: srcFrameS,
+                     loose: loose, mediaFrameS: mediaFrameS });
     }
     return found;
 }
+
+/**
+ * Extra tolerance, in seconds, for a recorded item's source points and piece lengths: one of its
+ * own frames for a loose item (Premiere floors set points to them), none for any other.
+ */
+function gcutSlackS(f) { return f.loose ? f.mediaFrameS : 0; }
 
 /** The stretch {fromT, toT} the recorded items cover (only those of `kind`, if given), or null. */
 function gcutSpan(found, kind) {
@@ -416,8 +422,9 @@ function gcutAtPlanned(items, plan, kind, trackIndex, it, clock) {
     var s = gcutT(it.start), d = gcutT(it.end) - s, n = gcutNode(it);
     for (var k = 0; k < items.length; k++) {
         if (items[k].kind !== kind || items[k].trackIndex !== trackIndex || items[k].node !== n) continue;
+        var durTol = clock.half + gcutSlackS(items[k]) * GCUT_TICKS;
         for (var p = 0; p < plan[k].length; p++) {
-            if (gcutNear(s, plan[k][p].atT, clock.half) && gcutNear(d, plan[k][p].durT, clock.half)) return true;
+            if (gcutNear(s, plan[k][p].atT, clock.half) && gcutNear(d, plan[k][p].durT, durTol)) return true;
         }
     }
     return false;
@@ -465,7 +472,8 @@ function gcutNewEnd(f, cutsT) { return f.endT - gcutRemovedBefore(cutsT, f.endT)
 /**
  * An item {startT, endT, inS}'s kept stretches [{fromT, durT, atT, srcIn}]: each lands at
  * atT = fromT - removedBefore(fromT), the same mapping for every item, from source in point
- * inS + (fromT - startT) snapped to the source frame grid (Premiere rounds set points down to it).
+ * inS + (fromT - startT) snapped to the grid srcFrameS: the source's frames (Premiere rounds set
+ * points down to them), or the sequence's for audio and loose video (see gcutRefind).
  */
 function gcutItemPieces(item, cutsT, srcFrameS) {
     var out = [], cursor = item.startT;
@@ -571,15 +579,19 @@ function gcutRemoveRange(seq, nodes, fromT, toT, clock, keep) {
 /**
  * Lay one recorded item's pieces ({durT, atT, srcIn}) on its own track, from its own source.
  * Pieces never reach outside the item's own [new start, original end], which the caller clears.
+ * A loose item's set points land up to one of its own frames early, so a piece could come out a
+ * frame short and leave a gap: every piece but its last is laid a sequence frame long, and the
+ * next piece's overwrite trims it back exactly. The last is laid exact.
  */
 function gcutLayItem(seq, f, pieces, clock) {
-    var track = gcutKindTracks(seq, f.kind)[f.trackIndex];
+    var track = gcutKindTracks(seq, f.kind)[f.trackIndex], tolS = clock.frameS / 2 + gcutSlackS(f);
     for (var p = 0; p < pieces.length; p++) {
         // srcIn is already on the source frame grid (Premiere rounds set points down to it); a
         // quarter frame later is the fallback when floating-point error rounds it a frame low.
         var srcIn = pieces[p].srcIn, srcOut = srcIn + pieces[p].durT / GCUT_TICKS, nudge = f.srcFrameS / 4;
-        try { gcutSetRange(f.pi, srcIn, srcOut, clock.frameS / 2); }
-        catch (rangeErr) { gcutSetRange(f.pi, srcIn + nudge, srcOut + nudge, clock.frameS / 2); }
+        if (f.loose && p < pieces.length - 1) srcOut += clock.frameS;
+        try { gcutSetRange(f.pi, srcIn, srcOut, tolS); }
+        catch (rangeErr) { gcutSetRange(f.pi, srcIn + nudge, srcOut + nudge, tolS); }
         track.overwriteClip(f.pi, String(pieces[p].atT));
     }
 }
@@ -587,13 +599,14 @@ function gcutLayItem(seq, f, pieces, clock) {
 /** null if every piece of `f` sits where planned; otherwise what's wrong. */
 function gcutVerifyItems(seq, f, pieces, clock) {
     var items = gcutItems(gcutKindTracks(seq, f.kind)[f.trackIndex]);
+    var slackS = gcutSlackS(f), durTol = clock.half + slackS * GCUT_TICKS, inTolS = clock.frameS / 2 + slackS;
     for (var p = 0; p < pieces.length; p++) {
         var ok = 0;
         for (var i = 0; i < items.length; i++) {
             var v = items[i];
             if (gcutNode(v) === f.node && gcutNear(gcutT(v.start), pieces[p].atT, clock.half) &&
-                gcutNear(gcutT(v.end) - gcutT(v.start), pieces[p].durT, clock.half) &&
-                gcutNear(v.inPoint.seconds, pieces[p].srcIn, clock.frameS / 2)) ok++;
+                gcutNear(gcutT(v.end) - gcutT(v.start), pieces[p].durT, durTol) &&
+                gcutNear(v.inPoint.seconds, pieces[p].srcIn, inTolS)) ok++;
         }
         if (ok !== 1) return "Kept span " + (p + 1) + " of " + pieces.length + " on " + f.label + " didn't land where or as expected.";
     }
@@ -690,7 +703,8 @@ function gcutRelayAll(seq, rec, clock, others) {
  *         cuts: [{start, end}] } — the gcutSnapshotSelection record (startTicks/endTicks are the
  * range R); cuts are removed ranges in seconds relative to startTicks. Stash: "m@" + startTicks,
  * { startT, endT, cutsT, rebuiltEndT, gapClosed, sequenceId, others, items } with each item's own
- * original startT/endT/inS.
+ * original startT/endT/inS, and whether it is loose (mediaFrameS: its own frame length), so
+ * Restore and Close gap use the same tolerances.
  */
 function gcutApplyCutsMulti(specJson) {
     var seq, clock, marks = [], k;

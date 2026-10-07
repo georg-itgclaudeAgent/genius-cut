@@ -323,14 +323,17 @@ describe("gcutApplyCutsMulti: one clip", () => {
     const s = scene();
     s.pi.floorToFrames = true; s.pi.mediaFps = 50;
     expect(applyCuts(s, [{ start: 2.49, end: 3.03 }, { start: 9.97, end: 10 }])).toMatchObject({ ok: true, appliedCount: 2 });
+    // A fitting source keeps the strict tolerances: it isn't recorded as loose.
+    const v1 = (s.host.ctx as any).$.global.gcutStash["m@" + START].items[0];
+    expect([v1.label, v1.loose, v1.srcFrameS]).toEqual(["V1", false, 1 / 50]);
   });
 
-  it("refuses, changing nothing, when the source frame rate doesn't fit the sequence's (24 fps in 25)", () => {
+  it("applies, on the timeline's frames, a source whose frame rate doesn't fit the sequence's (24 fps in 25)", () => {
+    // Was a refusal: since 2026-10-08 no clip is refused for its own frame rate.
     const s = scene();
     s.pi.mediaFps = 24;
-    const before = layout(s.seq.videoTracks[0]);
-    expect(() => applyCuts(s)).toThrow(/24 fps.*25 fps|frame rate/);
-    expect(layout(s.seq.videoTracks[0])).toEqual(before);
+    expect(applyCuts(s)).toMatchObject({ ok: true, appliedCount: 2 });
+    expect(layout(s.seq.videoTracks[0])).toEqual([[100, 102], [102, 106], [106, 108]]);
   });
 
   it("leaves the bin item's own in/out exactly as it found them", () => {
@@ -699,10 +702,11 @@ describe("gcutApplyCutsMulti", () => {
     expect(applyCuts(s, [{ start: 2.5, end: 3.03 }, { start: 6.27, end: 7.41 }, { start: 9.97, end: 10 }])).toMatchObject({ ok: true });
   });
 
-  it("refuses a source whose frame rate doesn't fit the sequence's", () => {
+  it("applies a source whose frame rate doesn't fit the sequence's (was a refusal)", () => {
     const s = multiScene({ music: false });
     s.close.mediaFps = 24;
-    expect(() => applyCuts(s)).toThrow(/V2.*24 fps.*25 fps/);
+    expect(applyCuts(s)).toMatchObject({ ok: true, clipCount: 4 });
+    expect(pieces(s.seq.videoTracks[1])).toEqual([[100, 102, 12], [102, 106, 15], [106, 108, 20]]);
   });
 
   it("refuses unrecorded audio under the clips (here added after Analyse), naming it, before changing anything", () => {
@@ -1092,10 +1096,88 @@ describe("audio items and the frame-rate check", () => {
       expect(Math.abs(frames - Math.round(frames))).toBeLessThan(1e-6);
     }
   });
-  it("still refuses a video item whose frame rate doesn't fit the sequence's", () => {
+  it("applies a video item whose frame rate doesn't fit the sequence's (was a refusal)", () => {
     const s = ntscScene(48000);
     s.cam.mediaFps = 25;
-    expect(() => applyCuts(s, [{ start: 2, end: 3 }])).toThrow(/V1 is 25 fps/);
+    expect(applyCuts(s, [{ start: 2, end: 3 }])).toMatchObject({ ok: true });
+    const v = s.seq.videoTracks[0].clips;
+    expect(v.numItems).toBe(2);
+    expect(v[1].start.t).toBe(v[0].end.t);
+  });
+});
+
+describe("a clip whose own frame rate doesn't fit the sequence (cut on timeline time)", () => {
+  const SRC_FPS = 17.364, SRC_FRAME = 1 / SRC_FPS; // Checkpoint B: Camera B, variable frame rate
+  /** georgScene, with Camera B (V2) at 17.364 fps and Premiere flooring set points to its frames. */
+  function looseScene() {
+    const s = georgScene();
+    s.b.mediaFps = SRC_FPS; s.b.floorToFrames = true;
+    return s;
+  }
+  const at = (sec: number) => Math.round(sec * FPS) * TPF; // a whole sequence frame, in ticks
+  const stash = (s: ReturnType<typeof georgScene>) => (s.host.ctx as any).$.global.gcutStash;
+  const fitting = (s: ReturnType<typeof georgScene>) => {
+    expect(span(s.seq.videoTracks[0])).toEqual([[100, 102, 10], [102, 106, 13], [106, 108, 18]]);
+    expect(span(s.seq.videoTracks[2])).toEqual([[100.28, 102, 5], [102, 106, 7.72], [106, 108, 12.72]]);
+    expect(span(s.seq.audioTracks[0])).toEqual([[99, 102, 50], [102, 106, 54], [106, 109, 59]]);
+  };
+  const original = (s: ReturnType<typeof georgScene>) => {
+    expect(span(s.seq.videoTracks[0])).toEqual([[100, 110, 10]]);
+    expect(span(s.seq.videoTracks[2])).toEqual([[100.28, 110, 5]]);
+    expect(span(s.seq.audioTracks[0])).toEqual([[99, 111, 50]]);
+    const v2 = s.seq.videoTracks[1].clips;
+    expect(v2.map((i: TrackItem) => [i.start.t, i.end.t])).toEqual([[at(100.24), at(109.84)]]);
+    expect(Math.abs(v2[0].inPoint.seconds - 30)).toBeLessThanOrEqual(SRC_FRAME);
+  };
+
+  it("applies, every V2 piece on the sequence's frames, back to back, from within one source frame of its planned in point", () => {
+    const s = looseScene();
+    expect(applyCuts(s, cuts)).toMatchObject({ ok: true, clipCount: 4 });
+    const v2 = s.seq.videoTracks[1].clips;
+    expect(v2.map((i: TrackItem) => i.start.t)).toEqual([at(100.24), at(102), at(106)]);
+    for (let i = 1; i < v2.numItems; i++) expect(v2[i].start.t).toBe(v2[i - 1].end.t); // no gaps, no overlaps
+    [30, 32.76, 37.76].forEach((want, i) => expect(Math.abs(v2[i].inPoint.seconds - want)).toBeLessThanOrEqual(SRC_FRAME));
+    fitting(s);
+    expect(span(s.seq.videoTracks[3])).toEqual([[112, 115, 0]]);
+  });
+
+  it("leaves no gap where Premiere's flooring would make a piece a frame short (laid a frame long, trimmed by the next)", () => {
+    // V2's piece 101.00–101.44 (from 30.76 s) floors to 0.40 s when laid exact: a one-frame gap before the next.
+    const s = looseScene();
+    expect(applyCuts(s, [{ start: 0.5, end: 1 }, { start: 1.44, end: 2 }])).toMatchObject({ ok: true });
+    const v2 = s.seq.videoTracks[1].clips;
+    expect(v2.map((i: TrackItem) => i.start.t)).toEqual([at(100.24), at(100.5), at(100.94)]);
+    for (let i = 1; i < v2.numItems; i++) expect(v2[i].start.t).toBe(v2[i - 1].end.t);
+  });
+
+  it("records which items are loose, with their own frame length, for Restore and Close gap", () => {
+    const s = looseScene();
+    applyCuts(s, cuts);
+    expect(stash(s)["m@" + START].items.map((i: any) => [i.label, i.loose, i.mediaFrameS]))
+      .toEqual([["V1", false, 0], ["V2", true, SRC_FRAME], ["V3", false, 0], ["A1", false, 0]]);
+  });
+
+  it("Restore puts V2 back at 100.24–109.84, its in point within one source frame of 30", () => {
+    const s = looseScene();
+    applyCuts(s, cuts);
+    expect(s.host.call("gcutRestoreMulti", { startTicks: START })).toEqual({ ok: true });
+    original(s);
+    expect(s.seq.audioTracks[1].clips.numItems + s.seq.audioTracks[2].clips.numItems).toBe(0);
+  });
+
+  it("a V2 piece landing wrong rolls every clip back to its own original place", () => {
+    const s = looseScene();
+    s.seq.dropSpanIndex = 4; // V1 lays 3 pieces first: the 5th placement is V2's second piece
+    expect(applyCuts(s, cuts)).toMatchObject({ ok: false, rolledBack: true });
+    original(s);
+  });
+
+  it("Close gap recognises the loose pieces and slides the title by the total", () => {
+    const s = looseScene();
+    applyCuts(s, cuts);
+    expect(s.host.call("gcutCloseGapMulti", { startTicks: START })).toEqual({ ok: true, movedCount: 1 });
+    expect(span(s.seq.videoTracks[3])).toEqual([[110, 113, 0]]);
+    expect(s.seq.videoTracks[1].clips.map((i: TrackItem) => i.start.t)).toEqual([at(100.24), at(102), at(106)]);
   });
 });
 

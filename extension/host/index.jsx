@@ -255,6 +255,81 @@ function gcutFindClip(nameJson) {
     }
 }
 
+// ── multi-clip: synced angles of one recording, cut together ────────────────────────
+
+function gcutKindTracks(seq, kind) { return kind === "audio" ? seq.audioTracks : seq.videoTracks; }
+function gcutLabel(kind, index) { return (kind === "audio" ? "A" : "V") + (index + 1); }
+function gcutSeqId(seq) { return String(seq.sequenceID || seq.name || ""); }
+
+function gcutItemRecord(kind, trackIndex, it) {
+    var fx = [];
+    gcutEffects(it, kind === "audio" ? GCUT_AUDIO_INTRINSIC : GCUT_VIDEO_INTRINSIC, fx);
+    return {
+        kind: kind, trackIndex: trackIndex, label: gcutLabel(kind, trackIndex),
+        startTicks: it.start.ticks, endTicks: it.end.ticks, name: it.name,
+        mediaPath: it.projectItem.getMediaPath(), inS: it.inPoint.seconds, outS: it.outPoint.seconds,
+        speed: gcutSpeed(it), effects: fx
+    };
+}
+
+/** name: "" = the selected clips. Records the selection so later edits never read it again. */
+function gcutSnapshotSelection(nameJson) {
+    try {
+        var name = gcutParse(nameJson) || "";
+        var seq = gcutSequence(), clock = gcutClock(seq);
+        var video = [], t, i, it, named = null;
+        for (t = 0; t < seq.videoTracks.numTracks; t++) {
+            var items = gcutItems(seq.videoTracks[t]);
+            for (i = 0; i < items.length; i++) {
+                it = items[i];
+                if (!it.projectItem) continue;
+                var sel = typeof it.isSelected === "function" && it.isSelected();
+                if (name === "") { if (sel) video.push({ item: it, track: t }); }
+                else if (gcutNameMatches(it.name, name) && (named === null || (sel && !named.sel))) named = { item: it, track: t, sel: sel };
+            }
+        }
+        if (named) video = [named];
+        if (!video.length) {
+            return gcutOk({ found: false,
+                message: name === "" ? "No clip is selected in the timeline." : "No clip named " + name + " on the active sequence." });
+        }
+        var first = video[0], startT = gcutT(first.item.start), endT = gcutT(first.item.end);
+        var problems = [], out = { video: [], audio: [] };
+        for (i = 0; i < video.length; i++) {
+            var v = video[i].item, lbl = gcutLabel("video", video[i].track);
+            if (!gcutNear(gcutT(v.start), startT, clock.half) || !gcutNear(gcutT(v.end), endT, clock.half)) {
+                var off = Math.abs(gcutT(v.start) - startT) / GCUT_TICKS;
+                problems.push(lbl + " doesn't start and end with " + gcutLabel("video", first.track) + " (off by " +
+                    off.toFixed(2) + " s). Genius Cut needs synced clips that start and end together.");
+            }
+            if (Math.abs(gcutSpeed(v) - 1) > 1e-6) problems.push(lbl + " isn't at 100% speed.");
+            out.video.push(gcutItemRecord("video", video[i].track, v));
+        }
+        for (t = 0; t < seq.audioTracks.numTracks; t++) {
+            var aItems = gcutItems(seq.audioTracks[t]);
+            for (i = 0; i < aItems.length; i++) {
+                it = aItems[i];
+                if (!it.projectItem) continue;
+                var s = gcutT(it.start), e = gcutT(it.end);
+                if (e <= startT + clock.half || s >= endT - clock.half) continue;
+                if (s < startT - clock.half || e > endT + clock.half) {
+                    problems.push(gcutLabel("audio", t) + " runs past the clips (a J/L cut or a music bed). " +
+                        "Genius Cut can't rebuild that safely yet: trim it to the clips, or move it to after the edit.");
+                }
+                out.audio.push(gcutItemRecord("audio", t, it));
+            }
+        }
+        if (!out.audio.length) problems.push("No audio on the timeline under these clips.");
+        return gcutOk({
+            found: true, sequenceId: gcutSeqId(seq), startTicks: String(startT), endTicks: String(endT),
+            startS: startT / GCUT_TICKS, durationS: (endT - startT) / GCUT_TICKS,
+            fps: Math.round(clock.fps * 1000) / 1000, video: out.video, audio: out.audio, problems: problems
+        });
+    } catch (e) {
+        return gcutFail(e);
+    }
+}
+
 // ── gcutApplyCuts ───────────────────────────────────────────────────────────────────
 
 function gcutKey(trackIndex, startTicks) { return "v" + trackIndex + "@" + startTicks; }

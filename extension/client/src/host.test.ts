@@ -135,6 +135,7 @@ class Track {
 class Seq {
   videoTracks: any; audioTracks: any;
   timebase = String(TPF);
+  sequenceID = "seq-1";
   audioTrackFor = (videoIndex: number) => videoIndex;
   dropSpanIndex = -1;
   ignoreInOut = false;
@@ -185,6 +186,26 @@ function scene(unit: Unit = "seconds") {
   v.selected = true;
   return { seq, pi, v, a, host: load(seq) };
 }
+
+/** Three synced angles (V1 wide, V2 close, V3 screen) at 100–110 s, the wide camera's own audio on
+ *  A1 (same project item as V1), a music bed on A3 (90–130 s) and a title on V4 (104–106 s). */
+function multiScene({ music = true } = {}) {
+  const seq = new Seq(4, 3);
+  const wide = new ProjectItem("wide.mov", "node-w", 600);
+  const close = new ProjectItem("close.mov", "node-c", 600);
+  const screen = new ProjectItem("screen.mov", "node-s", 600, "seconds", false);
+  const v1 = seq.videoTracks[0].add(wide, 100, 10, 20);
+  const v2 = seq.videoTracks[1].add(close, 100, 12, 22);
+  const v3 = seq.videoTracks[2].add(screen, 100, 5, 15);
+  const a1 = seq.audioTracks[0].add(wide, 100, 10, 20);
+  v1.linked = [a1]; a1.linked = [v1];
+  if (music) seq.audioTracks[2].add(new ProjectItem("music.wav", "node-m", 300, "seconds", false), 90, 0, 40);
+  seq.videoTracks[3].add(new ProjectItem("title", "node-t", 30, "seconds", false), 104, 0, 2);
+  for (const v of [v1, v2, v3]) v.selected = true;
+  wide.inS = 2; wide.outS = 58; close.inS = 0; close.outS = 600;
+  return { seq, wide, close, screen, v1, v2, v3, a1, host: load(seq) };
+}
+const snapshot = (s: { host: ReturnType<typeof load> }, name = "") => s.host.call("gcutSnapshotSelection", name);
 
 const START = String(100 * TICKS);
 const spans = [{ start: 10, end: 12 }, { start: 13, end: 17 }, { start: 18, end: 20 }]; // keeps 8 of 10 s
@@ -450,5 +471,66 @@ describe("gcutCloseTrailingGap", () => {
   it("after the gap is closed, restore refuses and points at Undo", () => {
     closeGap(s);
     expect(() => restore(s)).toThrow(/Undo/);
+  });
+});
+
+describe("gcutSnapshotSelection", () => {
+  it("records every selected video clip and the audio under them", () => {
+    const r = snapshot(multiScene({ music: false }));
+    expect(r).toMatchObject({ found: true, sequenceId: "seq-1", startTicks: START, durationS: 10, problems: [] });
+    expect(r.video.map((v: any) => [v.label, v.name, v.inS])).toEqual([["V1", "wide.mov", 10], ["V2", "close.mov", 12], ["V3", "screen.mov", 5]]);
+    expect(r.audio.map((a: any) => [a.label, a.name, a.inS])).toEqual([["A1", "wide.mov", 10]]);
+  });
+
+  it("lists a music bed under the clips as audio too (the panel then asks which to transcribe)", () => {
+    const r = snapshot(multiScene());
+    expect(r.audio.map((a: any) => a.label)).toEqual(["A1", "A3"]);
+    expect(r.problems[0]).toMatch(/A3.*past|J\/L/); // music runs 90–130 s: beyond the range, refused as a J/L-style overhang
+  });
+
+  it("selected audio items aren't counted as video or listed twice", () => {
+    const s = multiScene({ music: false });
+    s.a1.selected = true;
+    const r = snapshot(s);
+    expect(r.video).toHaveLength(3);
+    expect(r.audio).toHaveLength(1);
+  });
+
+  it("flags clips that don't start and end together, naming the track and the offset", () => {
+    const s = multiScene({ music: false });
+    s.v2.start = Time.k(103 * TICKS); s.v2.end = Time.k(113 * TICKS);
+    expect(snapshot(s).problems.join(" ")).toMatch(/V2.*3\.00 s.*start and end together/);
+  });
+
+  it("says when there's no audio under the clips", () => {
+    const s = multiScene({ music: false });
+    s.seq.audioTracks[0].items = [];
+    expect(snapshot(s).problems).toContain("No audio on the timeline under these clips.");
+  });
+
+  it("flags a retimed clip", () => {
+    const s = multiScene({ music: false });
+    s.v3.speed = 2;
+    expect(snapshot(s).problems.join(" ")).toMatch(/V3.*100% speed/);
+  });
+
+  it("reports nothing selected", () => {
+    const s = multiScene();
+    for (const v of [s.v1, s.v2, s.v3]) v.selected = false;
+    expect(snapshot(s)).toMatchObject({ found: false, message: "No clip is selected in the timeline." });
+  });
+
+  it("with a clip name, records just that clip and the audio under it", () => {
+    const r = snapshot(multiScene({ music: false }), "close");
+    expect(r.video.map((v: any) => v.label)).toEqual(["V2"]);
+    expect(r.audio.map((a: any) => a.label)).toEqual(["A1"]);
+  });
+
+  it("names effects per clip", () => {
+    const s = multiScene({ music: false });
+    s.v2.addEffect("Lumetri Color");
+    const r = snapshot(s);
+    expect(r.video[1].effects).toEqual(["Lumetri Color"]);
+    expect(r.video[0].effects).toEqual([]);
   });
 });

@@ -26,7 +26,7 @@ const SNAPSHOT: Snapshot = {
   found: true, sequenceId: "sample-sequence", startTicks: T(START_S), endTicks: T(START_S + DURATION_S),
   startS: START_S, durationS: DURATION_S, fps: 23.976,
   video: [angle("video", 0, "wide.mov", 12, ["Lumetri Color"]), angle("video", 1, "close.mov", 14), angle("video", 2, "screen.mov", 5)],
-  audio: [angle("audio", 0, "wide.mov", 12)],
+  audio: [angle("audio", 0, "wide.mov", 12), angle("audio", 1, "lav.wav", 3)],
   problems: [],
 };
 
@@ -104,7 +104,7 @@ export const mockHost: Host = {
   async applyCuts(snap, spans) {
     await delay(1200);
     const expected = spans.reduce((a, s) => a + (s.end - s.start), 0);
-    return { ok: true, appliedCount: spans.length, clipCount: 4, expectedDuration: expected, actualDuration: expected,
+    return { ok: true, appliedCount: spans.length, clipCount: snap.video.length + snap.audio.length, expectedDuration: expected, actualDuration: expected,
       trailingGapS: snap.durationS - expected };
   },
   async closeGap() { await delay(300); },

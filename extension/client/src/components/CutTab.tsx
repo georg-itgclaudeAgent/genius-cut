@@ -15,7 +15,7 @@ import { CutReview } from "./CutReview";
 type Phase =
   | { k: "idle" }
   | { k: "finding" }
-  | { k: "choosing"; snap: Snapshot }
+  | { k: "choosing"; snap: Snapshot; preselect: string | null }
   | { k: "analysing"; snap: Snapshot }
   | { k: "review"; snap: Snapshot; res: TrimResponse; checked: boolean[] }
   | { k: "applying"; snap: Snapshot; res: TrimResponse; checked: boolean[] }
@@ -25,6 +25,17 @@ type Phase =
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const errorPhase = (e: unknown, snap?: Snapshot, restorable = false): Phase =>
   ({ k: "error", message: errMsg(e), snap, notYet: e instanceof HostUnavailable, restorable });
+
+/**
+ * After a failed Apply, offer "Restore original" only when the host reports a mid-rebuild failure
+ * it couldn't roll back. A thrown refusal (changed since Analyse, locked, different sequence...)
+ * changed nothing, and Restore there could undo an earlier edit stashed at the same start.
+ */
+export function offersRestore(outcome: unknown): boolean {
+  if (outcome instanceof Error || !outcome || typeof outcome !== "object") return false;
+  const r = outcome as ApplyResult;
+  return r.ok === false && r.rolledBack === false;
+}
 
 function Telemetry({ device }: { device: string }) {
   const gpu = device === "cuda";
@@ -73,7 +84,7 @@ export function CutTab({ health, ready, onTrimmed }: {
       // Problems (no audio, speed-changed, out of sync...) stop here, before any audio is chosen.
       if (found.problems.length) return go({ k: "error", message: found.problems.join(" ") });
       const choice = audioChoice(found, recalledAudio(found.sequenceId));
-      if (choice.kind === "ask") return go({ k: "choosing", snap: found });
+      if (choice.kind === "ask") return go({ k: "choosing", snap: found, preselect: choice.preselect });
       await run(found, choice.sources);
     } catch (e) {
       if (epoch.current === mine) go(errorPhase(e));
@@ -119,15 +130,16 @@ export function CutTab({ health, ready, onTrimmed }: {
     try {
       const result = await runtime.host.applyCuts(c, keptSpans(res.cuts, checked, c.durationS));
       if (!result.ok) {
-        go({ k: "error", snap: c, restorable: !result.rolledBack, message: result.message ||
+        go({ k: "error", snap: c, restorable: offersRestore(result), message: result.message ||
           `The rebuilt clip is ${result.actualDuration.toFixed(2)} s, expected ${result.expectedDuration.toFixed(2)} s. ` +
           "Nothing was hidden: check the timeline, or restore the original." });
         return;
       }
       go({ k: "applied", snap: c, res, result, gapClosed: false, busy: false });
     } catch (e) {
-      // A throw mid-rebuild can leave the timeline half-changed, so offer the restore.
-      go(errorPhase(e, c, !(e instanceof HostUnavailable)));
+      // The host turns every failure after the first change into ok:false, so a throw is a
+      // refusal (or a missing host) that changed nothing: no restore.
+      go(errorPhase(e, c, offersRestore(e)));
     }
   }
 
@@ -213,7 +225,7 @@ export function CutTab({ health, ready, onTrimmed }: {
       )}
 
       {phase.k === "choosing" && (
-        <AudioPicker snap={phase.snap} onCancel={() => go({ k: "idle" })}
+        <AudioPicker snap={phase.snap} preselect={phase.preselect} onCancel={() => go({ k: "idle" })}
           onPick={(key, sources) => { rememberAudio(phase.snap.sequenceId, key); run(phase.snap, sources); }} />
       )}
 

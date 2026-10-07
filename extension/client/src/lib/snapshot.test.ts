@@ -18,6 +18,10 @@ describe("snapshotSummary", () => {
   it("several clips list the tracks", () => {
     expect(snapshotSummary(three)).toBe("3 video clips (V1, V2, V3) + 1 audio (A1) · 10:47.4");
   });
+  it("one video clip with several audio clips says so", () => {
+    const one = snap([item("video", 0, "wide.mov", 10)], [item("audio", 0, "wide.mov", 10), item("audio", 1, "lav.wav", 3)]);
+    expect(snapshotSummary(one)).toBe("wide.mov · V1 + 2 audio (A1, A2) · 10:47.4");
+  });
 });
 
 describe("effectsByClip", () => {
@@ -30,12 +34,12 @@ describe("audioChoice", () => {
   it("uses the only audio clip", () => {
     expect(audioChoice(three, null)).toEqual({ kind: "use", sources: [three.audio[0]] });
   });
-  it("asks when there are several, unless the remembered choice is still there", () => {
+  it("always asks when there are several, preselecting the remembered choice if it's still there", () => {
     const two = snap(three.video, [item("audio", 0, "mic1.wav", 3), item("audio", 1, "mic2.wav", 7.5)]);
-    expect(audioChoice(two, null)).toEqual({ kind: "ask" });
-    expect(audioChoice(two, audioKey(two.audio[1]))).toEqual({ kind: "use", sources: [two.audio[1]] });
-    expect(audioChoice(two, "mix")).toEqual({ kind: "use", sources: two.audio });
-    expect(audioChoice(two, "A3:gone.wav")).toEqual({ kind: "ask" }); // a remembered clip that's no longer there
+    expect(audioChoice(two, null)).toEqual({ kind: "ask", preselect: null });
+    expect(audioChoice(two, audioKey(two.audio[1]))).toEqual({ kind: "ask", preselect: audioKey(two.audio[1]) });
+    expect(audioChoice(two, "mix")).toEqual({ kind: "ask", preselect: "mix" });
+    expect(audioChoice(two, "A3:gone.wav")).toEqual({ kind: "ask", preselect: null }); // a remembered clip that's no longer there
   });
 });
 

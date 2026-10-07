@@ -3,8 +3,11 @@ import { formatDuration } from "./timecode";
 
 export function snapshotSummary(s: Snapshot): string {
   const len = formatDuration(s.durationS);
-  if (s.video.length === 1) return `${s.video[0].name} · ${s.video[0].label} · ${len}`;
   const v = s.video.map((x) => x.label).join(", "), a = s.audio.map((x) => x.label).join(", ");
+  if (s.video.length === 1) {
+    const audio = s.audio.length > 1 ? ` + ${s.audio.length} audio (${a})` : "";
+    return `${s.video[0].name} · ${s.video[0].label}${audio} · ${len}`;
+  }
   return `${s.video.length} video clips (${v}) + ${s.audio.length} audio (${a}) · ${len}`;
 }
 
@@ -14,13 +17,14 @@ export function effectsByClip(s: Snapshot): string[] {
 
 export const audioKey = (a: SnapshotItem) => `${a.label}:${a.name}`;
 
-export type AudioChoice = { kind: "use"; sources: SnapshotItem[] } | { kind: "ask" };
+/** preselect: the remembered key ("mix" or an audioKey) if it's still on offer, else null. */
+export type AudioChoice = { kind: "use"; sources: SnapshotItem[] } | { kind: "ask"; preselect: string | null };
 
+/** One audio clip is used as is; with several the picker always shows, so a remembered choice can change. */
 export function audioChoice(s: Snapshot, remembered: string | null): AudioChoice {
   if (s.audio.length === 1) return { kind: "use", sources: s.audio };
-  if (remembered === "mix") return { kind: "use", sources: s.audio };
-  const hit = s.audio.find((a) => audioKey(a) === remembered);
-  return hit ? { kind: "use", sources: [hit] } : { kind: "ask" };
+  const still = remembered === "mix" || s.audio.some((a) => audioKey(a) === remembered);
+  return { kind: "ask", preselect: still ? remembered : null };
 }
 
 export function trimRequestFor(s: Snapshot, sources: SnapshotItem[], prompt: string): TrimRequest {

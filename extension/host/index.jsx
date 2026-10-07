@@ -8,21 +8,28 @@
  *   - each gcut* function takes one JSON-encoded string argument and returns a JSON string;
  *   - failures return "Error: <message>" and never throw.
  *
- * Timeline edits follow plan decision D2: remove the clip and re-lay the kept source spans
- * with overwriteClip (no razor: Premiere 2026 silently no-ops the QE razor). Consequences:
+ * Timeline edits rebuild every recorded clip (a selection snapshot taken at Analyse: the synced
+ * video clips and the audio under them) following plan decision D2: remove each clip and re-lay
+ * the same kept spans from its own source with overwriteClip, on its own track (no razor:
+ * Premiere 2026 silently no-ops the QE razor). Consequences:
  *   - The rebuild lays fresh clips from the source, so effects, grades, keyframes and audio
- *     gain on the original are NOT carried over. gcutFindClip names any effects it finds so
- *     the panel can warn before Apply.
- *   - Apply is all-or-nothing: every span is checked as it lands, and any failure rolls back
- *     to the original clip. The bin item's own in/out marks are always restored.
- *   - Clips it can't rebuild safely are refused before anything changes: retimed clips,
- *     J/L cuts (audio split or extended past the video) and clips without linked audio.
+ *     gain on the originals are NOT carried over. gcutSnapshotSelection names the effects on
+ *     each clip so the panel can warn before Apply.
+ *   - Apply is all-or-nothing: every piece is checked as it lands, and any failure rolls every
+ *     clip back. The bin items' own in/out marks are always restored.
+ *   - Clips it can't rebuild safely are refused before anything changes: retimed clips, clips
+ *     that don't start and end together, and audio running past them (J/L cuts, music beds).
+ *   - Restore puts every recorded clip back; Close gap pulls everything after the edit left, on
+ *     every track. Both work from the record Apply keeps for this session only.
  *
  * Unverified against real Premiere until Checkpoint B (docs silent or contradictory):
  *   - setInPoint/setOutPoint units (docs say ticks for one, seconds for the other): set,
  *     read back, fall back to the other unit, and remember which worked;
- *   - where overwriteClip puts linked audio: checked afterwards, never assumed;
- *   - whether remove()/move() also act on linked partners: handled either way.
+ *   - whether videoTrack.overwriteClip brings the clip's linked audio, and onto which audio
+ *     track: checked afterwards and removed, never assumed;
+ *   - whether audioTrack.overwriteClip places audio only, for a project item that also has video;
+ *   - whether remove() also acts on linked partners, and whether move() moves the linked
+ *     partner: handled either way (Close gap moves each item and checks every track after).
  */
 
 var GCUT_TICKS = 254016000000; // Premiere ticks per second
@@ -132,26 +139,13 @@ function gcutSpeed(item) {
 
 function gcutNode(item) { return item.projectItem ? item.projectItem.nodeId : null; }
 
-function gcutFindVideoItem(seq, trackIndex, startTicks) {
-    if (trackIndex < 0 || trackIndex >= seq.videoTracks.numTracks) throw new Error("That video track no longer exists.");
-    var items = gcutItems(seq.videoTracks[trackIndex]);
-    for (var i = 0; i < items.length; i++) {
-        if (items[i].start.ticks === startTicks) return items[i];
-    }
-    throw new Error("The clip has moved or changed since it was analysed. Analyse it again.");
-}
-
-/** Audio items exactly linked to a video item: same source, same start and end. */
-function gcutExactAudio(seq, node, startT, endT) {
-    var found = [];
-    for (var t = 0; t < seq.audioTracks.numTracks; t++) {
-        var items = gcutItems(seq.audioTracks[t]);
-        for (var i = 0; i < items.length; i++) {
-            var a = items[i];
-            if (gcutNode(a) === node && gcutT(a.start) === startT && gcutT(a.end) === endT) found.push({ track: t, item: a });
-        }
-    }
-    return found;
+/** The source media's frame rate, falling back to the sequence's if Premiere won't say. */
+function gcutSourceFps(pi, clock) {
+    try {
+        var fps = Number(pi.getFootageInterpretation().frameRate);
+        if (fps > 0 && isFinite(fps)) return fps;
+    } catch (e) { /* not available on this item */ }
+    return clock.fps;
 }
 
 function gcutEffects(item, intrinsic, out) {
@@ -202,57 +196,6 @@ function gcutSetRange(pi, inS, outS, tolS) {
         : gcutSetOne(pi, "in", inS, tolS) && gcutSetOne(pi, "out", outS, tolS);
     if (ok && gcutPointIs(pi, "in", inS, tolS) && gcutPointIs(pi, "out", outS, tolS)) return;
     throw new Error("Premiere didn't accept the source range " + inS.toFixed(3) + "-" + outS.toFixed(3) + " s.");
-}
-
-// ── gcutFindClip ────────────────────────────────────────────────────────────────────
-
-/** name: "" = use the selected clip. */
-function gcutFindClip(nameJson) {
-    try {
-        var name = gcutParse(nameJson) || "";
-        var seq = gcutSequence(), clock = gcutClock(seq);
-        var candidates = [], selected = [];
-        for (var t = 0; t < seq.videoTracks.numTracks; t++) {
-            var items = gcutItems(seq.videoTracks[t]);
-            for (var i = 0; i < items.length; i++) {
-                var it = items[i];
-                if (!it.projectItem) continue;
-                var sel = typeof it.isSelected === "function" && it.isSelected();
-                var hit = name === "" ? sel : gcutNameMatches(it.name, name);
-                if (hit) {
-                    candidates.push({ item: it, track: t });
-                    if (sel) selected.push({ item: it, track: t });
-                }
-            }
-        }
-        if (!candidates.length) {
-            return gcutOk({ found: false, name: name,
-                message: name === "" ? "No clip is selected in the timeline." : "No clip named " + name + " on the active sequence." });
-        }
-        var chosen = selected.length ? selected[0] : candidates[0];
-        var c = chosen.item;
-        var effects = [];
-        gcutEffects(c, GCUT_VIDEO_INTRINSIC, effects);
-        var audio = gcutExactAudio(seq, gcutNode(c), gcutT(c.start), gcutT(c.end));
-        for (var a = 0; a < audio.length; a++) gcutEffects(audio[a].item, GCUT_AUDIO_INTRINSIC, effects);
-        return gcutOk({
-            found: true,
-            name: c.name,
-            mediaPath: c.projectItem.getMediaPath(),
-            trackIndex: chosen.track,
-            startTicks: c.start.ticks,
-            inS: c.inPoint.seconds,
-            outS: c.outPoint.seconds,
-            startS: c.start.seconds,
-            fps: Math.round(clock.fps * 1000) / 1000,
-            matchCount: candidates.length,
-            selectedUsed: selected.length > 0,
-            speed: gcutSpeed(c),
-            effects: effects
-        });
-    } catch (e) {
-        return gcutFail(e);
-    }
 }
 
 // ── multi-clip: synced angles of one recording, cut together ────────────────────────
@@ -371,18 +314,25 @@ function gcutRefind(seq, spec, clock) {
     return found;
 }
 
-/** Relative kept spans (seconds) → whole-frame pieces [{t0S, durT}] on the sequence grid. */
+/**
+ * Relative kept spans (seconds) → whole-frame pieces [{t0S, durT}] on the sequence grid. Nothing
+ * is laid past the range: a piece ending even a frame later would overwrite the first frame of
+ * whatever starts at the range end, outside the stretch the intact check looks at. So a piece
+ * is shortened to end at the range end, in its source and on the timeline.
+ */
 function gcutPieces(spans, durationS, clock) {
     if (!gcutIsArray(spans) || !spans.length) throw new Error("There's nothing to keep, so nothing was changed.");
-    var out = [], prevEnd = -clock.frameS;
+    var out = [], prevEnd = -clock.frameS, rangeFrames = Math.round(durationS / clock.frameS), laidFrames = 0;
     for (var i = 0; i < spans.length; i++) {
         var s = spans[i];
         if (!(s.end > s.start)) throw new Error("A kept span is empty or backwards. Nothing was changed.");
         if (s.start < -clock.frameS || s.end > durationS + clock.frameS) throw new Error("A kept span falls outside the clips. Nothing was changed.");
         if (s.start < prevEnd - clock.frameS / 2) throw new Error("Kept spans overlap or are out of order. Nothing was changed.");
         var t0 = Math.round(s.start / clock.frameS) * clock.frameS, frames = Math.round((s.end - t0) / clock.frameS);
+        frames = Math.min(frames, Math.round((durationS - t0) / clock.frameS), rangeFrames - laidFrames);
         if (frames < 1) throw new Error("A kept span is shorter than a frame. Nothing was changed.");
         out.push({ t0S: t0, durT: frames * clock.tpf });
+        laidFrames += frames;
         prevEnd = s.end;
     }
     return out;
@@ -408,6 +358,21 @@ function gcutOthers(seq, found, startT, endT) {
         }
     }
     return snap;
+}
+
+/** Label of the first snapshot item that's no longer exactly where it was, or null. */
+function gcutSnapshotIntact(seq, snap, clock) {
+    var tracks = gcutTracks(seq);
+    for (var k = 0; k < snap.length; k++) {
+        var want = snap[k], items = gcutItems(tracks[want.t].track), found = false;
+        for (var i = 0; i < items.length; i++) {
+            var it = items[i];
+            if (gcutNode(it) === want.node && gcutT(it.start) === want.start && gcutT(it.end) === want.end &&
+                gcutNear(it.inPoint.seconds, want.inS, clock.frameS / 2)) { found = true; break; }
+        }
+        if (!found) return want.label;
+    }
+    return null;
 }
 
 /** True if `keep` (an others list) holds this item: same track, start and source. */
@@ -437,7 +402,7 @@ function gcutRemoveRange(seq, nodes, fromT, toT, clock, keep) {
 /**
  * Lay one recorded item's pieces back to back on its own track, from its own source. `rec`
  * (optional) has rebuiltEndT pushed out before each piece, so a failure part-way rolls back
- * everything laid so far, even a piece reaching a frame past the range.
+ * everything laid so far, wherever it reached.
  */
 function gcutLayItem(seq, f, pieces, startT, clock, rec) {
     var track = gcutKindTracks(seq, f.kind)[f.trackIndex], cursorT = startT;
@@ -482,24 +447,28 @@ function gcutStrayLeft(seq, found, fromT, toT, clock, others) {
     for (var t = 0; t < tracks.length; t++) {
         var items = gcutItems(tracks[t].track);
         for (var i = 0; i < items.length; i++) {
-            var it = items[i], n = gcutNode(it), s = gcutT(it.start), home = false;
+            var it = items[i], n = gcutNode(it), s = gcutT(it.start);
             if (!gcutHasNode(nodes, n) || gcutKept(others, t, s, n)) continue;
             if (gcutT(it.end) <= fromT + clock.half || s >= toT - clock.half) continue;
-            for (f = 0; f < found.length; f++) {
-                if (found[f].node === n && (found[f].kind === "audio") === tracks[t].audio && found[f].trackIndex === tracks[t].index) home = true;
-            }
-            if (!home) return tracks[t].label;
+            if (!gcutHome(found, n, tracks[t])) return tracks[t].label;
         }
     }
     return null;
 }
 
+/** True if a recorded item of source `n` lives on this track (an entry of gcutTracks). */
+function gcutHome(found, n, track) {
+    for (var f = 0; f < found.length; f++) {
+        if (found[f].node === n && (found[f].kind === "audio") === track.audio && found[f].trackIndex === track.index) return true;
+    }
+    return false;
+}
+
 /** Lay every item: video first, then remove stray audio the video brought along, then audio. */
 function gcutLayAll(seq, found, pieces, startT, endT, clock, others, rec) {
-    var nodes = [], i, endAt = startT;
-    for (i = 0; i < found.length; i++) nodes.push(found[i].node);
+    var i, endAt = startT;
     for (i = 0; i < found.length; i++) if (found[i].kind === "video") endAt = gcutLayItem(seq, found[i], pieces, startT, clock, rec);
-    gcutRemoveStrayAudio(seq, nodes, startT, Math.max(endAt, endT), clock, others);
+    gcutRemoveStrayAudio(seq, found, startT, Math.max(endAt, endT), clock, others);
     for (i = 0; i < found.length; i++) if (found[i].kind === "audio") endAt = gcutLayItem(seq, found[i], pieces, startT, clock, rec);
     return endAt;
 }
@@ -517,15 +486,20 @@ function gcutTailLeft(seq, f, fromT, toT, clock) {
     return false;
 }
 
-/** Remove audio of our sources in [fromT, toT] that isn't in `others` (it gets re-laid next). */
-function gcutRemoveStrayAudio(seq, nodes, fromT, toT, clock, others) {
-    var tracks = gcutTracks(seq);
+/**
+ * Remove audio of our sources in [fromT, toT] that isn't in `others`. Audio on a track where a
+ * recorded audio item of that source lives stays: laying that item overwrites it exactly, and
+ * removing it could take its linked video piece along on builds where remove() acts on partners.
+ */
+function gcutRemoveStrayAudio(seq, found, fromT, toT, clock, others) {
+    var tracks = gcutTracks(seq), nodes = [], f;
+    for (f = 0; f < found.length; f++) nodes.push(found[f].node);
     for (var t = 0; t < tracks.length; t++) {
         if (!tracks[t].audio) continue;
         var items = gcutItems(tracks[t].track);
         for (var i = items.length - 1; i >= 0; i--) {
             var it = items[i], n = gcutNode(it), s = gcutT(it.start);
-            if (gcutHasNode(nodes, n) && !gcutKept(others, t, s, n) &&
+            if (gcutHasNode(nodes, n) && !gcutKept(others, t, s, n) && !gcutHome(found, n, tracks[t]) &&
                 s >= fromT - clock.half && gcutT(it.end) <= toT + clock.half) it.remove(false, false);
         }
     }
@@ -565,7 +539,8 @@ function gcutApplyCutsMulti(specJson) {
             if (!seen) marks.push({ pi: found[k].pi, node: found[k].node, inS: found[k].pi.getInPoint().seconds, outS: found[k].pi.getOutPoint().seconds });
         }
         var key = "m@" + spec.startTicks;
-        var rec = { startT: startT, endT: endT, rebuiltEndT: endT, gapClosed: false, items: found };
+        var rec = { sequenceId: gcutSeqId(seq), startT: startT, endT: endT, rebuiltEndT: endT, gapClosed: false,
+                    items: found, others: others };
         // A new Apply at the same start replaces the earlier record (that Restore is meaningless once
         // the timeline changed again); if this one rolls back cleanly, the earlier record comes back.
         var stash = gcutState().gcutStash, hadPrev = stash.hasOwnProperty(key), prev = stash[key];
@@ -611,307 +586,114 @@ function gcutApplyCutsMulti(specJson) {
     }
 }
 
-// ── gcutApplyCuts ───────────────────────────────────────────────────────────────────
+// ── gcutRestoreMulti: every recorded clip back as it was ────────────────────────────
 
-function gcutKey(trackIndex, startTicks) { return "v" + trackIndex + "@" + startTicks; }
+/** The Apply record for this start on the open sequence; refuses with `missing` if there is none. */
+function gcutRecord(seq, spec, missing) {
+    var rec = gcutState().gcutStash["m@" + spec.startTicks];
+    if (!rec) throw new Error(missing);
+    if (rec.sequenceId !== gcutSeqId(seq)) {
+        throw new Error("A different sequence is open than the one Genius Cut edited. Open that sequence first.");
+    }
+    return rec;
+}
 
-/** The source media's frame rate, falling back to the sequence's if Premiere won't say. */
-function gcutSourceFps(pi, clock) {
-    try {
-        var fps = Number(pi.getFootageInterpretation().frameRate);
-        if (fps > 0 && isFinite(fps)) return fps;
-    } catch (e) { /* not available on this item */ }
-    return clock.fps;
+/** Our rebuilt pieces on the timeline now: each recorded source on its own track inside [fromT, toT]. */
+function gcutOursNow(seq, rec, fromT, toT, clock) {
+    var ours = [];
+    for (var i = 0; i < rec.items.length; i++) {
+        var f = rec.items[i], tracks = gcutKindTracks(seq, f.kind);
+        if (f.trackIndex >= tracks.numTracks) throw new Error(f.label + " no longer exists. Use Premiere's Undo instead.");
+        var items = gcutItems(tracks[f.trackIndex]);
+        for (var j = 0; j < items.length; j++) {
+            var it = items[j], s = gcutT(it.start);
+            if (gcutNode(it) === f.node && s >= fromT - clock.half && gcutT(it.end) <= toT + clock.half) {
+                ours.push({ kind: f.kind, trackIndex: f.trackIndex, startT: s });
+            }
+        }
+    }
+    return ours;
 }
 
 /**
- * Kept spans → whole-frame placements: [{inS, outS, frames, setIn, setOut}] in source seconds.
- * Premiere rounds set in/out points DOWN to the source frame grid (Checkpoint B, 2026-10-05:
- * a span starting at 13.020 s on 30 fps media read back as 13.000 s and was refused). So each
- * span starts on a source frame. setIn/setOut sit a quarter of a source frame later: the
- * fallback when floating-point error makes Premiere round the exact value down a frame.
+ * Restore re-lays every recorded clip over the whole range on its own track (and the camera
+ * angles may bring their audio along). Refuse if anything that wasn't there at Apply now sits
+ * where that would overwrite it: anywhere in the range on a recorded track, or in the gap on any
+ * track. Returns the refusal, or null.
  */
-function gcutPlan(spans, inS, outS, clock, srcFrameS) {
-    srcFrameS = srcFrameS || clock.frameS;
-    if (!gcutIsArray(spans) || !spans.length) throw new Error("There's nothing to keep, so nothing was changed.");
-    var plan = [], prevEnd = inS - clock.frameS;
-    for (var i = 0; i < spans.length; i++) {
-        var s = spans[i];
-        if (!(s.end > s.start)) throw new Error("A kept span is empty or backwards. Nothing was changed.");
-        if (s.start < inS - clock.frameS || s.end > outS + clock.frameS) throw new Error("A kept span falls outside the clip. Nothing was changed.");
-        if (s.start < prevEnd - clock.frameS / 2) throw new Error("Kept spans overlap or are out of order. Nothing was changed.");
-        var start = Math.round(s.start / srcFrameS) * srcFrameS;
-        var frames = Math.round((s.end - start) / clock.frameS);
-        if (frames < 1) throw new Error("A kept span is shorter than a frame. Nothing was changed.");
-        var end = start + frames * clock.frameS, nudge = srcFrameS / 4;
-        plan.push({ inS: start, outS: end, frames: frames, setIn: start + nudge, setOut: end + nudge });
-        prevEnd = s.end;
-    }
-    return plan;
-}
-
-/** Everything that isn't ours overlapping [startT, endT), on every track. */
-function gcutSnapshot(seq, node, startT, endT) {
-    var snap = [], tracks = gcutTracks(seq);
-    for (var t = 0; t < tracks.length; t++) {
-        var items = gcutItems(tracks[t].track);
-        for (var i = 0; i < items.length; i++) {
-            var it = items[i];
-            if (gcutNode(it) === node) continue;
-            var s = gcutT(it.start), e = gcutT(it.end);
-            if (e > startT && s < endT) snap.push({ label: tracks[t].label, t: t, start: s, end: e, inS: it.inPoint.seconds, node: gcutNode(it) });
-        }
-    }
-    return snap;
-}
-
-/** Label of the first snapshot item that's no longer exactly where it was, or null. */
-function gcutSnapshotIntact(seq, snap, clock) {
+function gcutInTheWay(seq, rec, others, clock) {
     var tracks = gcutTracks(seq);
-    for (var k = 0; k < snap.length; k++) {
-        var want = snap[k], items = gcutItems(tracks[want.t].track), found = false;
-        for (var i = 0; i < items.length; i++) {
-            var it = items[i];
-            if (gcutNode(it) === want.node && gcutT(it.start) === want.start && gcutT(it.end) === want.end &&
-                gcutNear(it.inPoint.seconds, want.inS, clock.frameS / 2)) { found = true; break; }
+    for (var i = 0; i < others.length; i++) {
+        var o = others[i], recorded = false;
+        if (gcutKept(rec.others, o.t, o.start, o.node)) continue;
+        for (var j = 0; j < rec.items.length; j++) {
+            if ((rec.items[j].kind === "audio") === tracks[o.t].audio && rec.items[j].trackIndex === tracks[o.t].index) recorded = true;
         }
-        if (!found) return want.label;
+        if (o.end > rec.rebuiltEndT + clock.half && o.start < rec.endT - clock.half) {
+            return "Something was placed in the gap on " + o.label + " since, and restoring would overwrite it. Use Premiere's Undo instead.";
+        }
+        if (recorded && o.start < rec.endT - clock.half) {
+            return "Something was placed on " + o.label + " over the cut clips since, and restoring would overwrite it. Use Premiere's Undo instead.";
+        }
     }
     return null;
 }
 
-/** Remove every item of this source inside [fromT, toT] on every track, last first. */
-function gcutRemoveOurs(seq, node, fromT, toT, clock) {
-    var tracks = gcutTracks(seq);
-    for (var t = 0; t < tracks.length; t++) {
-        var items = gcutItems(tracks[t].track);
-        for (var i = items.length - 1; i >= 0; i--) {
-            var it = items[i];
-            if (gcutNode(it) === node && gcutT(it.start) >= fromT - clock.half && gcutT(it.end) <= toT + clock.half) {
-                it.remove(false, false);
-            }
-        }
-    }
-}
-
-/** Our source's items sitting inside [fromT, toT], per track label. */
-function gcutOursByTrack(seq, node, fromT, toT, clock) {
-    var out = {}, tracks = gcutTracks(seq);
-    for (var t = 0; t < tracks.length; t++) {
-        var items = gcutItems(tracks[t].track), sum = 0, n = 0;
-        for (var i = 0; i < items.length; i++) {
-            var it = items[i];
-            if (gcutNode(it) === node && gcutT(it.start) >= fromT - clock.half && gcutT(it.end) <= toT + clock.half) {
-                sum += gcutT(it.end) - gcutT(it.start); n++;
-            }
-        }
-        if (n) out[tracks[t].label] = { ticks: sum, count: n, audio: tracks[t].audio, index: tracks[t].index };
-    }
-    return out;
-}
-
-/** Remove whatever we laid and re-lay the original clip; true if it's verifiably back. */
-function gcutRelayOriginal(seq, rec, clock) {
-    var o = rec.original, pi = rec.pi;
-    gcutRemoveOurs(seq, o.node, o.startT, Math.max(rec.rebuiltEndT, o.endT), clock);
-    gcutSetRange(pi, o.inS, o.outS, clock.frameS / 2);
-    seq.videoTracks[o.trackIndex].overwriteClip(pi, String(o.startT));
-    var items = gcutItems(seq.videoTracks[o.trackIndex]);
-    for (var i = 0; i < items.length; i++) {
-        var it = items[i];
-        if (gcutNode(it) === o.node && gcutNear(gcutT(it.start), o.startT, clock.half) &&
-            gcutNear(gcutT(it.end), o.endT, clock.half) && gcutNear(it.inPoint.seconds, o.inS, clock.frameS / 2)) return true;
-    }
-    return false;
-}
-
-/** spec: { trackIndex, startTicks, spans: [{start, end}] } — spans in SOURCE seconds. */
-function gcutApplyCuts(specJson) {
-    var seq, clock, rec, pi, binIn, binOut, key;
+/** spec: { startTicks } — the range start recorded at Analyse. */
+function gcutRestoreMulti(specJson) {
+    var seq, clock, rec, marks = [], k;
     try {
         var spec = gcutParse(specJson);
-        seq = gcutSequence();
-        clock = gcutClock(seq);
-        var item = gcutFindVideoItem(seq, spec.trackIndex, spec.startTicks);
-        if (Math.abs(gcutSpeed(item) - 1) > 1e-6) throw new Error("This clip isn't at 100% speed. Nothing was changed.");
-        var srcFps = gcutSourceFps(item.projectItem, clock), ratio = srcFps / clock.fps;
-        if (Math.round(ratio) < 1 || Math.abs(ratio - Math.round(ratio)) > 1e-3) {
-            throw new Error("This clip is " + Math.round(srcFps * 1000) / 1000 + " fps but the sequence is " +
-                Math.round(clock.fps * 1000) / 1000 + " fps. Genius Cut can only rebuild clips whose frame rate matches " +
-                "the sequence (or is a whole multiple of it) for now. Nothing was changed.");
+        seq = gcutSequence(); clock = gcutClock(seq);
+        rec = gcutRecord(seq, spec, "There's no Genius Cut edit to restore on these clips in this session. Use Premiere's Undo instead.");
+        if (rec.gapClosed) throw new Error("The gap was already closed, so restoring would overlap what moved. Use Premiere's Undo instead.");
+        var ours = gcutOursNow(seq, rec, rec.startT, rec.rebuiltEndT, clock);
+        var others = gcutOthers(seq, ours, rec.startT, Math.max(rec.rebuiltEndT, rec.endT));
+        var blocked = gcutInTheWay(seq, rec, others, clock);
+        if (blocked) throw new Error(blocked);
+        for (k = 0; k < rec.items.length; k++) {
+            var seen = false;
+            for (var m = 0; m < marks.length; m++) if (marks[m].node === rec.items[k].node) seen = true;
+            if (!seen) marks.push({ pi: rec.items[k].pi, node: rec.items[k].node, inS: rec.items[k].pi.getInPoint().seconds, outS: rec.items[k].pi.getOutPoint().seconds });
         }
-        var plan = gcutPlan(spec.spans, item.inPoint.seconds, item.outPoint.seconds, clock, 1 / srcFps);
-
-        pi = item.projectItem;
-        var node = pi.nodeId, startT = gcutT(item.start), endT = gcutT(item.end);
-        var t, i, a;
-        for (t = 0; t < seq.audioTracks.numTracks; t++) {
-            var aItems = gcutItems(seq.audioTracks[t]);
-            for (i = 0; i < aItems.length; i++) {
-                var ai = aItems[i];
-                if (gcutNode(ai) !== node) continue;
-                var s = gcutT(ai.start), e = gcutT(ai.end);
-                if (!(s === startT && e === endT) && e > startT && s < endT) {
-                    throw new Error("This clip's audio on A" + (t + 1) + " is split or extended past the video (a J/L cut). " +
-                        "Genius Cut can't rebuild that safely yet. Nothing was changed.");
-                }
-            }
-        }
-        var linked = gcutExactAudio(seq, node, startT, endT);
-        if (!linked.length) {
-            throw new Error("This clip's audio isn't linked on the timeline (for example, it was replaced by a separate recording). " +
-                "Genius Cut can't rebuild it safely yet. Nothing was changed.");
-        }
-        var audioTracks = [];
-        for (a = 0; a < linked.length; a++) audioTracks.push(linked[a].track);
-        var snap = gcutSnapshot(seq, node, startT, endT);
-
-        binIn = pi.getInPoint().seconds;
-        binOut = pi.getOutPoint().seconds;
-        key = gcutKey(spec.trackIndex, spec.startTicks);
-        // Written BEFORE anything changes, so a failure can always be rolled back.
-        rec = {
-            pi: pi,
-            original: { trackIndex: spec.trackIndex, node: node, startT: startT, endT: endT,
-                        inS: item.inPoint.seconds, outS: item.outPoint.seconds, audioTracks: audioTracks },
-            rebuiltEndT: endT,
-            gapClosed: false
-        };
-        gcutState().gcutStash[key] = rec;
-        var track = seq.videoTracks[spec.trackIndex];
-
+        // Relaying grows rec.rebuiltEndT as pieces land; if Restore fails, the record must still
+        // describe the edit on the timeline, so Close gap still sees the gap.
+        var rebuiltEndT = rec.rebuiltEndT;
         try {
-            // 1. Take the original off the timeline, then any linked audio that's still there.
-            item.remove(false, false);
-            var still = gcutExactAudio(seq, node, startT, endT);
-            for (a = still.length - 1; a >= 0; a--) still[a].item.remove(false, false);
-
-            // 2. Re-lay each kept span on whole frames, checking each as it lands.
-            var cursorT = startT;
-            for (var p = 0; p < plan.length; p++) {
-                var span = plan[p], durT = span.frames * clock.tpf;
-                try {
-                    gcutSetRange(pi, span.inS, span.outS, clock.frameS / 2);
-                } catch (rangeErr) {
-                    // Rounded down a frame by floating-point error: aim a quarter-frame later.
-                    gcutSetRange(pi, span.setIn, span.setOut, clock.frameS / 2);
-                }
-                track.overwriteClip(pi, String(cursorT));
-                rec.rebuiltEndT = Math.max(rec.rebuiltEndT, cursorT + durT);
-                var landed = false, vItems = gcutItems(track);
-                for (i = 0; i < vItems.length; i++) {
-                    var v = vItems[i];
-                    if (gcutNode(v) === node && gcutNear(gcutT(v.start), cursorT, clock.half) &&
-                        gcutNear(gcutT(v.end) - gcutT(v.start), durT, clock.half) &&
-                        gcutNear(v.inPoint.seconds, span.inS, clock.frameS / 2)) { landed = true; break; }
-                }
-                if (!landed) throw new Error("Kept span " + (p + 1) + " of " + plan.length + " didn't land where or as expected.");
-                cursorT += durT;
-            }
-            rec.rebuiltEndT = cursorT;
-
-            // 3. Audio must be back on its original tracks, and nowhere else.
-            var ours = gcutOursByTrack(seq, node, startT, cursorT, clock);
-            for (var label in ours) {
-                if (ours.hasOwnProperty(label) && ours[label].audio) {
-                    var home = false;
-                    for (a = 0; a < audioTracks.length; a++) if (audioTracks[a] === ours[label].index) home = true;
-                    if (!home) throw new Error("The rebuilt audio landed on " + label + " instead of A" + (audioTracks[0] + 1) + ".");
-                }
-            }
-            for (a = 0; a < audioTracks.length; a++) {
-                var got = ours["A" + (audioTracks[a] + 1)];
-                if (!got || !gcutNear(got.ticks, cursorT - startT, clock.tpf)) {
-                    throw new Error("The linked audio didn't land back on A" + (audioTracks[a] + 1) + ".");
-                }
-            }
-
-            // 4. Nothing that isn't ours may have been touched.
-            var hit = gcutSnapshotIntact(seq, snap, clock);
-            if (hit) throw new Error("The rebuild overwrote something on " + hit + ".");
-
-            return gcutOk({
-                ok: true,
-                appliedCount: plan.length,
-                expectedDuration: (cursorT - startT) / GCUT_TICKS,
-                actualDuration: (cursorT - startT) / GCUT_TICKS,
-                trailingGapS: (endT - cursorT) / GCUT_TICKS
-            });
+            if (!gcutRelayAll(seq, rec, clock, others)) throw new Error("The original clips didn't go back as expected. Use Premiere's Undo.");
+            var hit = gcutSnapshotIntact(seq, others, clock);
+            if (hit) throw new Error("Restoring changed something on " + hit + ". Use Premiere's Undo.");
         } catch (inner) {
-            var back = false;
-            try { back = gcutRelayOriginal(seq, rec, clock); } catch (ignored) { back = false; }
-            if (back) delete gcutState().gcutStash[key];
-            var damage = gcutSnapshotIntact(seq, snap, clock);
-            return gcutOk({
-                ok: false,
-                rolledBack: back,
-                appliedCount: 0,
-                expectedDuration: 0,
-                actualDuration: 0,
-                trailingGapS: 0,
-                message: inner.message +
-                    (back ? " The original clip was put back." : " It couldn't be put back automatically: use Premiere's Undo.") +
-                    (damage ? " Something on " + damage + " was changed too: use Undo to recover it." : "")
-            });
+            rec.rebuiltEndT = rebuiltEndT;
+            throw inner;
         }
-    } catch (e) {
-        return gcutFail(e);
-    } finally {
-        // Always leave the bin item's own in/out marks as they were.
-        if (pi && binIn !== undefined) {
-            try { gcutSetRange(pi, binIn, binOut, clock.frameS / 2); } catch (ignored2) { /* nothing more we can do */ }
-        }
-    }
-}
-
-// ── gcutRestoreOriginal ─────────────────────────────────────────────────────────────
-
-/** spec: { trackIndex, startTicks } — the ORIGINAL clip's identity from gcutFindClip. */
-function gcutRestoreOriginal(specJson) {
-    var pi, binIn, binOut, clock;
-    try {
-        var spec = gcutParse(specJson);
-        var key = gcutKey(spec.trackIndex, spec.startTicks);
-        var rec = gcutState().gcutStash[key];
-        if (!rec) throw new Error("There's no Genius Cut edit to restore for this clip in this session. Use Premiere's Undo.");
-        if (rec.gapClosed) throw new Error("The gap was already closed, so later clips moved. Use Premiere's Undo to go back.");
-        var seq = gcutSequence(), o = rec.original;
-        clock = gcutClock(seq);
-        // Refuse rather than overwrite anything placed in the reclaimed gap since.
-        var inGap = gcutSnapshot(seq, o.node, rec.rebuiltEndT, o.endT);
-        if (inGap.length) {
-            throw new Error("Something was placed in the gap on " + inGap[0].label + " since, and restoring would overwrite it. Use Premiere's Undo.");
-        }
-        pi = rec.pi;
-        binIn = pi.getInPoint().seconds;
-        binOut = pi.getOutPoint().seconds;
-        if (!gcutRelayOriginal(seq, rec, clock)) throw new Error("The original clip didn't go back as expected. Use Premiere's Undo.");
-        delete gcutState().gcutStash[key];
+        delete gcutState().gcutStash["m@" + spec.startTicks];
         return gcutOk({ ok: true });
     } catch (e) {
         return gcutFail(e);
     } finally {
-        if (pi && binIn !== undefined) {
-            try { gcutSetRange(pi, binIn, binOut, clock.frameS / 2); } catch (ignored) { /* best effort */ }
+        // Always leave the bin items' own in/out marks as they were.
+        for (k = 0; k < marks.length; k++) {
+            try { gcutSetRange(marks[k].pi, marks[k].inS, marks[k].outS, clock.frameS / 2); } catch (ignored) { /* best effort */ }
         }
     }
 }
 
-// ── gcutCloseTrailingGap ────────────────────────────────────────────────────────────
+// ── gcutCloseGapMulti ───────────────────────────────────────────────────────────────
 
 /**
  * Ripple everything after the gap left by the gap's length, on every track, so sync holds
  * across tracks. Refuses if anything sits inside the gap or a track with later clips is
  * locked. Items already moved as a linked partner are not moved twice.
+ * spec: { startTicks } — the range start recorded at Analyse.
  */
-function gcutCloseTrailingGap(specJson) {
+function gcutCloseGapMulti(specJson) {
     try {
         var spec = gcutParse(specJson);
-        var rec = gcutState().gcutStash[gcutKey(spec.trackIndex, spec.startTicks)];
-        if (!rec) throw new Error("There's no Genius Cut edit on this clip in this session.");
-        if (rec.gapClosed) return gcutOk({ ok: true, movedCount: 0 });
         var seq = gcutSequence(), clock = gcutClock(seq);
-        var gapStartT = rec.rebuiltEndT, gapEndT = rec.original.endT, gapT = gapEndT - gapStartT;
+        var rec = gcutRecord(seq, spec, "There's no Genius Cut edit on these clips in this session.");
+        if (rec.gapClosed) return gcutOk({ ok: true, movedCount: 0 });
+        var gapStartT = rec.rebuiltEndT, gapEndT = rec.endT, gapT = gapEndT - gapStartT;
         if (gapT <= clock.half) return gcutOk({ ok: true, movedCount: 0 });
 
         var movers = [], tracks = gcutTracks(seq), t, i, it;

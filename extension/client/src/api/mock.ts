@@ -5,7 +5,7 @@
  */
 import type { Transport } from "./backend";
 import type { Host } from "./host";
-import type { AiStatus, ClipInfo, Health, Library, RunCost, SequenceCut, StyleExample, TrimResponse, Word } from "./types";
+import type { AiStatus, Health, Library, RunCost, SequenceCut, Snapshot, SnapshotItem, Span, StyleExample, TrimResponse, Word } from "./types";
 
 const W = (w: string, start: number, end: number): Word => ({ w, start, end });
 const WORDS: Word[] = [
@@ -16,17 +16,25 @@ const WORDS: Word[] = [
   W("the", 7.86, 7.96), W("wrong", 7.96, 8.3), W("plan.", 8.3, 8.8),
 ];
 
-const CLIP: ClipInfo = {
-  found: true, name: "interview_take3.mp4", mediaPath: "D:/Footage/EP114/interview_take3.mp4",
-  trackIndex: 0, startTicks: String(95.5 * 254016000000), inS: 12.0, outS: 21.2, startS: 95.5, fps: 23.976, matchCount: 1, selectedUsed: true, speed: 1,
-  effects: ["Lumetri Color"],
+const START_S = 95.5, DURATION_S = 9.2;
+const T = (s: number) => String(s * 254016000000);
+const angle = (kind: "video" | "audio", trackIndex: number, name: string, inS: number, effects: string[] = []): SnapshotItem => ({
+  kind, trackIndex, label: (kind === "video" ? "V" : "A") + (trackIndex + 1), startTicks: T(START_S), endTicks: T(START_S + DURATION_S),
+  name, mediaPath: `D:/Footage/EP114/${name}`, inS, outS: inS + DURATION_S, speed: 1, effects,
+});
+const SNAPSHOT: Snapshot = {
+  found: true, sequenceId: "sample-sequence", startTicks: T(START_S), endTicks: T(START_S + DURATION_S),
+  startS: START_S, durationS: DURATION_S, fps: 23.976,
+  video: [angle("video", 0, "wide.mov", 12, ["Lumetri Color"]), angle("video", 1, "close.mov", 14), angle("video", 2, "screen.mov", 5)],
+  audio: [angle("audio", 0, "wide.mov", 12)],
+  problems: [],
 };
 
-function cutsFor(clip: ClipInfo): SequenceCut[] {
+function cutsFor(startS: number): SequenceCut[] {
   const c = (a: number, b: number, reason: string): SequenceCut => {
     const ws = WORDS.slice(a, b + 1);
     const start = ws[0].start, end = ws[ws.length - 1].end;
-    return { start, end, text: ws.map((w) => w.w).join(" "), reason, start_seq_s: clip.startS + start, end_seq_s: clip.startS + end };
+    return { start, end, text: ws.map((w) => w.w).join(" "), reason, start_seq_s: startS + start, end_seq_s: startS + end };
   };
   return [c(0, 1, "filler"), c(8, 8, "filler"), c(15, 16, "filler"), c(17, 17, "repeat")];
 }
@@ -62,10 +70,13 @@ export const mockTransport: Transport = async (req) => {
   if (req.path === "/trim") {
     await delay(1800);
     const body = JSON.parse(req.body || "{}");
-    const clip = { ...CLIP, startS: body.clip_start_s ?? CLIP.startS };
-    const cuts = cutsFor(clip);
+    const cuts = cutsFor(body.range_start_seq_s ?? START_S);
+    const kept: Span[] = [];
+    let cursor = 0;
+    for (const c of cuts) { if (c.start > cursor) kept.push({ start: cursor, end: c.start }); cursor = c.end; }
+    if (cursor < DURATION_S) kept.push({ start: cursor, end: DURATION_S });
     const response: TrimResponse = {
-      words: WORDS, cuts, kept_spans_source: [], stt_device: "cuda",
+      words: WORDS, cuts, kept_spans_source: [], kept_spans: kept, stt_device: "cuda",
       cut_fraction: 0, warning: null, cost: sampleCost(12053, 2661),
     };
     return ok(response);
@@ -89,15 +100,15 @@ export const mockTransport: Transport = async (req) => {
 };
 
 export const mockHost: Host = {
-  async findClip() { await delay(300); return CLIP; },
-  async applyCuts(clip, spans) {
+  async snapshotSelection() { await delay(300); return SNAPSHOT; },
+  async applyCuts(snap, spans) {
     await delay(1200);
     const expected = spans.reduce((a, s) => a + (s.end - s.start), 0);
-    return { ok: true, appliedCount: spans.length, expectedDuration: expected, actualDuration: expected,
-      trailingGapS: (clip.outS - clip.inS) - expected };
+    return { ok: true, appliedCount: spans.length, clipCount: 4, expectedDuration: expected, actualDuration: expected,
+      trailingGapS: snap.durationS - expected };
   },
   async closeGap() { await delay(300); },
-  async restoreOriginal() { await delay(500); },
+  async restore() { await delay(500); },
 };
 
 export function resetMockBoot() { bootedAt = Date.now(); }

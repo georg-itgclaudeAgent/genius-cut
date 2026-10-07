@@ -1,9 +1,9 @@
 /**
- * The ExtendScript side (extension/host/index.jsx): find the clip, apply the cuts, close
- * the gap, restore. HostUnavailable means the gcut* functions aren't loaded in Premiere
+ * The ExtendScript side (extension/host/index.jsx): snapshot the selected range, apply the
+ * cuts to every clip in it, close the gap, restore. HostUnavailable means the gcut* functions aren't loaded in Premiere
  * (an old install, or a host script that failed to load), not a failed edit.
  */
-import type { ClipInfo, Span } from "./types";
+import type { NotFound, Snapshot, Span } from "./types";
 
 export class HostUnavailable extends Error {
   constructor() {
@@ -15,6 +15,7 @@ export class HostUnavailable extends Error {
 export interface ApplyResult {
   ok: boolean;
   appliedCount: number;
+  clipCount: number;
   expectedDuration: number;
   actualDuration: number;
   trailingGapS: number;
@@ -24,10 +25,13 @@ export interface ApplyResult {
 }
 
 export interface Host {
-  findClip(name: string | null): Promise<ClipInfo>;
-  applyCuts(clip: ClipInfo, keptSpansSource: Span[]): Promise<ApplyResult>;
-  closeGap(clip: ClipInfo): Promise<void>;
-  restoreOriginal(clip: ClipInfo): Promise<void>;
+  snapshotSelection(name: string | null): Promise<Snapshot | NotFound>;
+  /** keptSpans are range-relative seconds. */
+  applyCuts(snap: Snapshot, keptSpans: Span[]): Promise<ApplyResult>;
+  /** Put the original clips back. Throws the host's message if it can't. */
+  restore(snap: Snapshot): Promise<void>;
+  /** Close the gap the cuts left at the end. Throws the host's message if it can't. */
+  closeGap(snap: Snapshot): Promise<void>;
 }
 
 const MISSING = "__GCUT_MISSING__";
@@ -44,10 +48,17 @@ export function cepHost(evalScript: (s: string) => Promise<string>): Host {
     if (out.startsWith("Error:")) throw new Error(out.slice(6).trim());
     return JSON.parse(out);
   }
+  const refusal = (r: any) => {
+    if (r && r.ok === false) throw new Error(r.message || "Premiere couldn't do that. Use Undo.");
+  };
   return {
-    findClip: (name) => call("gcutFindClip", name ?? ""),
-    applyCuts: (clip, spans) => call("gcutApplyCuts", { trackIndex: clip.trackIndex, startTicks: clip.startTicks, spans }),
-    closeGap: (clip) => call("gcutCloseTrailingGap", { trackIndex: clip.trackIndex, startTicks: clip.startTicks }),
-    restoreOriginal: (clip) => call("gcutRestoreOriginal", { trackIndex: clip.trackIndex, startTicks: clip.startTicks }),
+    snapshotSelection: (name) => call("gcutSnapshotSelection", name ?? ""),
+    applyCuts: (snap, spans) => call("gcutApplyCutsMulti", {
+      sequenceId: snap.sequenceId, startTicks: snap.startTicks, endTicks: snap.endTicks,
+      items: [...snap.video, ...snap.audio].map((x) => ({ kind: x.kind, trackIndex: x.trackIndex, startTicks: x.startTicks, endTicks: x.endTicks })),
+      spans,
+    }),
+    restore: async (snap) => refusal(await call("gcutRestoreMulti", { startTicks: snap.startTicks })),
+    closeGap: async (snap) => refusal(await call("gcutCloseGapMulti", { startTicks: snap.startTicks })),
   };
 }

@@ -14,11 +14,44 @@ export interface SequenceCut {
   end_seq_s: number;
 }
 
+export interface SnapshotItem {
+  kind: "video" | "audio";
+  trackIndex: number;
+  label: string;          // "V1", "A2": what the editor sees
+  startTicks: string;     // exact timeline position in ticks: how the host finds the clip again
+  endTicks: string;
+  name: string;
+  mediaPath: string;
+  inS: number;
+  outS: number;
+  /** Playback speed: 1 = 100%, negative = reversed. Only 1 is trimmed. */
+  speed: number;
+  /** Effects on the clip (beyond Motion/Opacity/Volume...). The rebuild does NOT keep them. */
+  effects: string[];
+}
+
+/** What the host reports about the selected range: every clip in it, across tracks. */
+export interface Snapshot {
+  found: true;
+  sequenceId: string;
+  startTicks: string;
+  endTicks: string;
+  startS: number;
+  durationS: number;
+  fps: number;
+  video: SnapshotItem[];
+  audio: SnapshotItem[];
+  problems: string[];
+}
+
+export interface NotFound { found: false; message: string }
+
+export interface AudioSource { media_path: string; in_s: number }
+
 export interface TrimRequest {
-  media_path: string;
-  in_s: number;
-  out_s: number;
-  clip_start_s: number;
+  duration_s: number;
+  range_start_seq_s: number;
+  audio: AudioSource[];
   prompt: string;
 }
 
@@ -36,6 +69,7 @@ export interface TrimResponse {
   words: Word[];
   cuts: SequenceCut[];
   kept_spans_source: Span[];
+  kept_spans: Span[];     // range-relative; what the host re-lays
   stt_device: string;
   cut_fraction: number;
   warning: string | null;
@@ -73,23 +107,3 @@ export interface StyleExample {
 }
 
 export interface Library { examples: StyleExample[]; summary: string | null }
-
-/** What the host (ExtendScript, Phase C) reports about the target clip. */
-export interface ClipInfo {
-  found: boolean;
-  name: string;
-  mediaPath: string;
-  trackIndex: number;
-  /** Exact timeline start in ticks: how the host finds this clip again (names repeat). */
-  startTicks: string;
-  inS: number;
-  outS: number;
-  startS: number;
-  fps: number;
-  matchCount: number;
-  selectedUsed: boolean;
-  /** Playback speed: 1 = 100%, negative = reversed. Phase 1 only trims 1. */
-  speed: number;
-  /** Effects on the clip (beyond Motion/Opacity/Volume…). The rebuild does NOT keep them. */
-  effects: string[];
-}

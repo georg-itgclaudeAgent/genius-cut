@@ -1,5 +1,5 @@
 /**
- * Review maths, recomputed live as the editor unticks cuts. `keptSpansSource` must
+ * Review maths, recomputed live as the editor unticks cuts. `keptSpans` must
  * agree with backend/geniuscut/trim.py `kept_spans`: it is what the host re-lays.
  */
 import type { SequenceCut, Span } from "../api/types";
@@ -34,11 +34,8 @@ function keptRelative(cuts: SequenceCut[], checked: boolean[], duration: number)
   return kept.filter((s) => s.end - s.start > EPS);
 }
 
-export function keptSpansSource(
-  cuts: SequenceCut[], checked: boolean[], clip: { in_s: number; out_s: number },
-): Span[] {
-  return keptRelative(cuts, checked, clip.out_s - clip.in_s)
-    .map((s) => ({ start: ms(clip.in_s + s.start), end: ms(clip.in_s + s.end) }));
+export function keptSpans(cuts: SequenceCut[], checked: boolean[], durationS: number): Span[] {
+  return keptRelative(cuts, checked, durationS).map((s) => ({ start: ms(s.start), end: ms(s.end) }));
 }
 
 export interface ReviewSummary {

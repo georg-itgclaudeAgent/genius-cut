@@ -1,9 +1,9 @@
-"""The whole proposal: clip in, proposed cuts out. Nothing here touches the timeline.
+"""The whole proposal: range in, proposed cuts out. Nothing here touches the timeline.
 
 Clock mapping (the easiest thing in this project to get confidently wrong):
-ffmpeg extracts exactly the clip's used span, so word time t=0 *is* the clip's in point.
-- sequence time (display) = clip_start_s + t        — no in-point term
-- source time (what the host re-lays) = in_s + t
+ffmpeg extracts exactly the range from each source, so word time t=0 *is* the range start.
+- sequence time (display) = range_start_seq_s + t   — no in-point term
+- each clip's source time = its own in point + t (computed by the host)
 """
 
 import shutil
@@ -47,11 +47,18 @@ def run_trim(
     propose: Callable = cuts.propose_cuts,
     extract: Callable = audio.extract_span,
     refine: Callable = boundaries.refine,
+    mix: Callable = audio.mix_wavs,
 ) -> TrimResponse:
     work = Path(tempfile.mkdtemp(prefix="geniuscut-"))
     env = None
+    duration = req.duration_s
     try:
-        wav = extract(req.media_path, req.in_s, req.out_s, out_dir=work)
+        wavs = []
+        for i, src in enumerate(req.audio):
+            d = work / f"src{i}"
+            d.mkdir()
+            wavs.append(extract(src.media_path, src.in_s, src.in_s + duration, out_dir=d))
+        wav = wavs[0] if len(wavs) == 1 else mix(wavs, work / "mix.wav")
         words = transcriber.transcribe(wav)
         try:
             env = boundaries.envelope(read_wav_16k_mono(wav))
@@ -59,7 +66,6 @@ def run_trim(
             env = None
     finally:
         shutil.rmtree(work, ignore_errors=True)
-    duration = req.out_s - req.in_s
     with spend.meter(kind="trim") as m:
         cut_spans = propose(words, library.build_fewshot(library_dir), req.prompt)
     cut_spans = refine(cut_spans, words, duration, env=env)
@@ -77,9 +83,11 @@ def run_trim(
     return TrimResponse(
         words=words,
         cuts=[SequenceCut(**c.model_dump(),
-                          start_seq_s=_ms(req.clip_start_s + c.start),
-                          end_seq_s=_ms(req.clip_start_s + c.end)) for c in cut_spans],
-        kept_spans_source=[Span(start=_ms(req.in_s + s.start), end=_ms(req.in_s + s.end)) for s in kept],
+                          start_seq_s=_ms(req.range_start_seq_s + c.start),
+                          end_seq_s=_ms(req.range_start_seq_s + c.end)) for c in cut_spans],
+        kept_spans=[Span(start=_ms(s.start), end=_ms(s.end)) for s in kept],
+        kept_spans_source=[Span(start=_ms(req.audio[0].in_s + s.start), end=_ms(req.audio[0].in_s + s.end))
+                           for s in kept],
         stt_device=transcriber.device,
         cut_fraction=round(cut_fraction, 4),
         warning=warning,

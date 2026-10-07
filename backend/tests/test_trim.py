@@ -62,7 +62,7 @@ def test_kept_spans_are_the_complement_of_the_cuts_in_source_time(tmp_path):
 def test_kept_spans_sum_to_span_minus_cut_total(tmp_path):
     r = run(tmp_path)
     kept = sum(s.end - s.start for s in r.kept_spans_source)
-    assert kept == pytest.approx((REQ.out_s - REQ.in_s) - (0.3 + 0.2))
+    assert kept == pytest.approx(REQ.duration_s - (0.3 + 0.2))
 
 
 def test_sequence_time_is_clip_start_plus_word_time_with_no_in_point_term(tmp_path):

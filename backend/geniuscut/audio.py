@@ -66,3 +66,19 @@ def probe_duration(path: Path | str) -> float:
     if result.returncode != 0:
         raise FfmpegError(f"ffprobe failed on {path}: {result.stderr.strip()}")
     return float(result.stdout.strip())
+
+
+def mix_wavs(paths: list[Path], out: Path) -> Path:
+    """Mix 16 kHz mono WAVs into one, at full level (each presenter's mic as recorded), as long
+    as the longest. For transcription only: the timeline's audio is never changed."""
+    if len(paths) == 1:
+        return Path(paths[0])
+    cmd = [find_tool("ffmpeg"), "-nostdin", "-y", "-hide_banner", "-loglevel", "error"]
+    for p in paths:
+        cmd += ["-i", str(p)]
+    cmd += ["-filter_complex", f"amix=inputs={len(paths)}:normalize=0:duration=longest",
+            "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(out)]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0 or not Path(out).exists():
+        raise FfmpegError(f"ffmpeg could not mix the audio: {result.stderr.strip()}")
+    return Path(out)

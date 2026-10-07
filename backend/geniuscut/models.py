@@ -31,28 +31,43 @@ class Span(BaseModel):
     end: float
 
 
-class ClipRef(BaseModel):
-    media_path: str
-    in_s: float = Field(ge=0, allow_inf_nan=False, description="Clip in point, source time")
-    out_s: float = Field(ge=0, allow_inf_nan=False, description="Clip out point, source time")
-    clip_start_s: float = Field(ge=0, allow_inf_nan=False,
-                                description="Where the clip starts on the timeline, sequence time")
-
-    @model_validator(mode="after")
-    def _span_not_empty(self):
-        if self.out_s <= self.in_s:
-            raise ValueError(f"out_s ({self.out_s}) must be after in_s ({self.in_s})")
-        return self
-
-
 PAUSE_KEEP_S = 0.25  # breathing room left next to speech when a pause is cut
 
 
-class TrimRequest(ClipRef):
+class AudioSource(BaseModel):
+    """One audio clip on the timeline: its file and its source time at the range start."""
+
+    media_path: str
+    in_s: float = Field(ge=0, allow_inf_nan=False, description="Source time at the range start")
+
+
+class TrimRequest(BaseModel):
+    """A timeline range (synced clips that start and end together) and the audio to transcribe.
+    Several sources are mixed for transcription only."""
+
+    duration_s: float = Field(gt=0, allow_inf_nan=False)
+    range_start_seq_s: float = Field(default=0.0, ge=0, allow_inf_nan=False,
+                                     description="Where the range starts on the timeline, display only")
+    audio: list[AudioSource] = Field(min_length=1)
     prompt: str = ""
     cut_pauses: bool = True
     min_pause_s: float = Field(default=1.0, le=30, allow_inf_nan=False,
                                description="Silences at least this long become pause cuts")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_single_clip(cls, data):
+        """Panels before multi-clip sent one clip: {media_path, in_s, out_s, clip_start_s}."""
+        if isinstance(data, dict) and "media_path" in data and "audio" not in data:
+            d = dict(data)
+            in_s, out_s = d.pop("in_s"), d.pop("out_s")
+            if out_s <= in_s:
+                raise ValueError(f"out_s ({out_s}) must be after in_s ({in_s})")
+            d["audio"] = [{"media_path": d.pop("media_path"), "in_s": in_s}]
+            d["duration_s"] = out_s - in_s
+            d["range_start_seq_s"] = d.pop("clip_start_s", 0.0)
+            return d
+        return data
 
     @model_validator(mode="after")
     def _pause_leaves_breathing_room(self):
@@ -82,6 +97,8 @@ class RunCost(BaseModel):
 class TrimResponse(BaseModel):
     words: list[Word]
     cuts: list[SequenceCut]
+    kept_spans: list[Span] = Field(default_factory=list,
+                                   description="What every recorded clip keeps, seconds from the range start")
     kept_spans_source: list[Span] = Field(description="What the host re-lays, in source time")
     stt_device: str
     cut_fraction: float = 0.0

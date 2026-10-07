@@ -224,14 +224,14 @@ function georgScene() {
 const snapshot = (s: { host: ReturnType<typeof load> }, name = "") => s.host.call("gcutSnapshotSelection", name);
 
 const START = String(100 * TICKS);
-const spans = [{ start: 10, end: 12 }, { start: 13, end: 17 }, { start: 18, end: 20 }]; // keeps 8 of 10 s
-/** The one-clip scene through the multi API: snapshot V1 + A1, spans given in SOURCE seconds. */
-const apply = (s: ReturnType<typeof scene>, sp: unknown = spans) => {
-  const snap = s.host.call("gcutSnapshotSelection", "");
-  const toRel = (sp as any[]).map((x) => ({ start: x.start - snap.video[0].inS, end: x.end - snap.video[0].inS }));
+/** Cut timeline moments, in seconds from the range start: removes 102–103 and 107–108 s (keeps 8 of 10 s). */
+const cuts = [{ start: 2, end: 3 }, { start: 7, end: 8 }];
+/** Snapshot the selection, then apply `c` to every recorded item. */
+const applyCuts = (s: any, c: unknown = cuts, snap = snapshot(s)) => {
   const items = [...snap.video, ...snap.audio].map((i: any) => ({ kind: i.kind, trackIndex: i.trackIndex, startTicks: i.startTicks, endTicks: i.endTicks }));
-  return s.host.call("gcutApplyCutsMulti", { sequenceId: snap.sequenceId, startTicks: snap.startTicks, endTicks: snap.endTicks, items, spans: toRel });
+  return s.host.call("gcutApplyCutsMulti", { sequenceId: snap.sequenceId, startTicks: snap.startTicks, endTicks: snap.endTicks, items, cuts: c });
 };
+const span = (t: Track) => t.clips.map((i: TrackItem) => [+(i.start.seconds).toFixed(2), +(i.end.seconds).toFixed(2), +(i.inPoint.seconds).toFixed(2)]);
 const restore = (s: ReturnType<typeof scene>) => s.host.call("gcutRestoreMulti", { startTicks: START });
 const closeGap = (s: ReturnType<typeof scene>) => s.host.call("gcutCloseGapMulti", { startTicks: START });
 const layout = (t: Track) => t.clips.map((i: TrackItem) => [+(i.start.seconds).toFixed(3), +(i.end.seconds).toFixed(3)]);
@@ -288,8 +288,8 @@ describe("gcutSnapshotSelection: one clip", () => {
 describe("gcutApplyCutsMulti: one clip", () => {
   it("rebuilds the kept spans back to back, on the frame grid, video and audio", () => {
     const s = scene();
-    const r = apply(s);
-    expect(r).toMatchObject({ ok: true, appliedCount: 3 });
+    const r = applyCuts(s);
+    expect(r).toMatchObject({ ok: true, appliedCount: 2 });
     expect(r.trailingGapS).toBeCloseTo(2, 1);
     const v = s.seq.videoTracks[0].clips;
     expect(v.map((i: TrackItem) => +(i.inPoint.seconds).toFixed(2))).toEqual([10, 13, 18]);
@@ -297,9 +297,9 @@ describe("gcutApplyCutsMulti: one clip", () => {
     expect(s.seq.audioTracks[0].clips.numItems).toBe(3);
   });
 
-  it("I1: spans that aren't on frames still land back to back with no gaps or overlaps", () => {
+  it("I1: cuts that aren't on frames still leave pieces back to back with no gaps or overlaps", () => {
     const s = scene();
-    const r = apply(s, [{ start: 10.013, end: 11.271 }, { start: 12.5021, end: 14.0417 }, { start: 15.33, end: 19.98 }]);
+    const r = applyCuts(s, [{ start: 1.271, end: 2.5021 }, { start: 4.0417, end: 5.33 }, { start: 9.98, end: 10 }]);
     expect(r.ok).toBe(true);
     const v = s.seq.videoTracks[0].clips;
     for (let i = 0; i < v.numItems; i++) expect(v[i].start.t % TPF).toBe(0);
@@ -311,7 +311,7 @@ describe("gcutApplyCutsMulti: one clip", () => {
     // that start mid-frame must be snapped to the source grid before they're set.
     const s = scene();
     s.pi.floorToFrames = true;
-    const r = apply(s, [{ start: 10, end: 12.5 }, { start: 13.03, end: 16.27 }, { start: 17.41, end: 19.97 }]);
+    const r = applyCuts(s, [{ start: 2.5, end: 3.03 }, { start: 6.27, end: 7.41 }, { start: 9.97, end: 10 }]);
     expect(r).toMatchObject({ ok: true, appliedCount: 3 });
     const v = s.seq.videoTracks[0].clips;
     for (let i = 0; i < v.numItems; i++) expect(Math.abs(v[i].inPoint.seconds * FPS - Math.round(v[i].inPoint.seconds * FPS))).toBeLessThan(1e-6);
@@ -322,40 +322,40 @@ describe("gcutApplyCutsMulti: one clip", () => {
   it("works when the source is an integer multiple of the sequence frame rate (50 fps in 25)", () => {
     const s = scene();
     s.pi.floorToFrames = true; s.pi.mediaFps = 50;
-    expect(apply(s, [{ start: 10.011, end: 12.49 }, { start: 13.03, end: 19.97 }])).toMatchObject({ ok: true, appliedCount: 2 });
+    expect(applyCuts(s, [{ start: 2.49, end: 3.03 }, { start: 9.97, end: 10 }])).toMatchObject({ ok: true, appliedCount: 2 });
   });
 
   it("refuses, changing nothing, when the source frame rate doesn't fit the sequence's (24 fps in 25)", () => {
     const s = scene();
     s.pi.mediaFps = 24;
     const before = layout(s.seq.videoTracks[0]);
-    expect(() => apply(s)).toThrow(/24 fps.*25 fps|frame rate/);
+    expect(() => applyCuts(s)).toThrow(/24 fps.*25 fps|frame rate/);
     expect(layout(s.seq.videoTracks[0])).toEqual(before);
   });
 
   it("leaves the bin item's own in/out exactly as it found them", () => {
     const s = scene();
-    apply(s);
+    applyCuts(s);
     expect([s.pi.inS, s.pi.outS]).toEqual([2, 58]);
   });
 
   it("works when this Premiere build wants ticks instead of seconds", () => {
     const s = scene("ticks");
-    expect(apply(s).ok).toBe(true);
+    expect(applyCuts(s).ok).toBe(true);
     expect(s.seq.videoTracks[0].clips[1].inPoint.seconds).toBeCloseTo(13, 2);
   });
 
   it("I3: works when the bin's marks sit outside the spans and Premiere rejects in > out", () => {
     const s = scene();
     s.pi.inS = 0; s.pi.outS = 1; s.pi.rejectInAfterOut = true;
-    expect(apply(s).ok).toBe(true);
+    expect(applyCuts(s).ok).toBe(true);
     expect([s.pi.inS, s.pi.outS]).toEqual([0, 1]);
   });
 
   it("I2: stops at the first span that lands wrong, and says rollback wasn't possible", () => {
     const s = scene();
     s.seq.ignoreInOut = true; // overwriteClip lays the whole source instead of the span
-    const r = apply(s);
+    const r = applyCuts(s);
     expect(r.ok).toBe(false);
     expect(r.message).toMatch(/didn't land/);
     // A world where overwriteClip ignores in/out can't be rolled back honestly either.
@@ -366,7 +366,7 @@ describe("gcutApplyCutsMulti: one clip", () => {
   it("C1: a failure part-way rolls back to the original clip and restores the bin", () => {
     const s = scene();
     s.seq.dropSpanIndex = 1;
-    const r = apply(s);
+    const r = applyCuts(s);
     expect(r).toMatchObject({ ok: false, rolledBack: true });
     expect(r.message).toMatch(/Every clip was put back/);
     expect(layout(s.seq.videoTracks[0])).toEqual([[100, 110]]);
@@ -381,7 +381,7 @@ describe("gcutApplyCutsMulti: one clip", () => {
     // rejection is now retried (Checkpoint B fix), so the refusal has to persist.
     const sec = (v: any) => (Number(v) > 1e6 ? Number(v) / TICKS : Number(v));
     s.pi.setInPoint = (v: any, m: number) => { if (Math.abs(sec(v) - 13) < 0.2) throw new Error("boom"); return orig(v, m); };
-    const r = apply(s);
+    const r = applyCuts(s);
     expect(r).toMatchObject({ ok: false, rolledBack: true });
     expect(layout(s.seq.videoTracks[0])).toEqual([[100, 110]]);
     expect([s.pi.inS, s.pi.outS]).toEqual([2, 58]);
@@ -392,19 +392,19 @@ describe("gcutApplyCutsMulti: one clip", () => {
     const music = new ProjectItem("music.wav", "node-9", 300);
     s.seq.audioTracks[1].add(music, 90, 0, 40);
     s.seq.audioTrackFor = () => 1; // Premiere puts the rebuilt audio on A2, over the music
-    // The snapshot refuses the music bed as a J/L overhang; send only V1 + A1 to reach Apply.
     const items = [{ kind: "video", trackIndex: 0 }, { kind: "audio", trackIndex: 0 }].map((i) => ({ ...i, startTicks: START, endTicks: String(110 * TICKS) }));
-    expect(() => s.host.call("gcutApplyCutsMulti", { sequenceId: "seq-1", startTicks: START, endTicks: String(110 * TICKS), items, spans: rel }))
+    expect(() => s.host.call("gcutApplyCutsMulti", { sequenceId: "seq-1", startTicks: START, endTicks: String(110 * TICKS), items, cuts }))
       .toThrow(/on A2 since Analyse/);
     expect(layout(s.seq.audioTracks[1])).toEqual([[90, 130]]);
     expect(layout(s.seq.videoTracks[0])).toEqual([[100, 110]]);
   });
 
-  it("C3: refuses a J/L cut (linked audio extends past the video) before changing anything", () => {
+  it("a J/L cut (linked audio runs past the video) keeps its tail, slid left by the cuts", () => {
     const s = scene();
     s.a.end = Time.s(112); s.a.outPoint = Time.s(22);
-    expect(() => apply(s)).toThrow(/A1 doesn't start and end with the video clips/);
-    expect(s.seq.videoTracks[0].clips.numItems).toBe(1);
+    expect(applyCuts(s)).toMatchObject({ ok: true });
+    expect(span(s.seq.videoTracks[0])).toEqual([[100, 102, 10], [102, 106, 13], [106, 108, 18]]);
+    expect(span(s.seq.audioTracks[0])).toEqual([[100, 102, 10], [102, 106, 13], [106, 110, 18]]);
   });
 
   // "C3: refuses a video-only clip whose source has audio" is gone: multi-clip accepts video
@@ -413,25 +413,24 @@ describe("gcutApplyCutsMulti: one clip", () => {
   it("I5: works when Premiere's remove also removes the linked audio", () => {
     const s = scene();
     s.seq.removeLinked = true;
-    expect(apply(s)).toMatchObject({ ok: true });
+    expect(applyCuts(s)).toMatchObject({ ok: true });
   });
 
   // "the clip moved" is covered by "refuses when a recorded clip moved since Analyse" below.
   it.each([
-    ["spans outside the clip", [{ start: 5, end: 12 }], /outside the clip/],
-    ["overlapping spans", [{ start: 10, end: 14 }, { start: 13, end: 15 }], /overlap/],
-    ["nothing kept", [], /nothing to keep/i],
-    ["a span shorter than a frame", [{ start: 10, end: 10.01 }], /shorter than a frame/],
-  ])("refuses when %s, and changes nothing", (_label, sp, msg) => {
+    ["there are no cuts", []],
+    ["the only cut lies outside the clips", [{ start: 12, end: 14 }]],
+    ["the only cut is shorter than half a frame", [{ start: 2, end: 2.01 }]],
+  ])("refuses when %s, and changes nothing", (_label, c) => {
     const s = scene();
-    expect(() => apply(s, sp)).toThrow(msg);
+    expect(() => applyCuts(s, c)).toThrow("There's nothing to cut, so nothing was changed.");
     expect(s.seq.videoTracks[0].clips.numItems).toBe(1);
     expect(s.seq.audioTracks[0].clips.numItems).toBe(1);
   });
 
   it("refuses a retimed clip, and changes nothing", () => {
     const s = scene(); s.v.speed = 2;
-    expect(() => apply(s)).toThrow(/100% speed/);
+    expect(() => applyCuts(s)).toThrow(/100% speed/);
     expect(s.seq.videoTracks[0].clips.numItems).toBe(1);
   });
 });
@@ -439,7 +438,7 @@ describe("gcutApplyCutsMulti: one clip", () => {
 describe("gcutRestoreMulti: one clip", () => {
   it("puts the original clip back exactly, audio included, and the bin untouched", () => {
     const s = scene();
-    apply(s);
+    applyCuts(s);
     expect(restore(s)).toMatchObject({ ok: true });
     expect(s.seq.videoTracks[0].clips.map((i: TrackItem) => [i.start.seconds, i.end.seconds, i.inPoint.seconds, i.outPoint.seconds]))
       .toEqual([[100, 110, 10, 20]]);
@@ -451,7 +450,7 @@ describe("gcutRestoreMulti: one clip", () => {
   });
   it("refuses if something was dropped into the gap since, rather than overwrite it", () => {
     const s = scene();
-    apply(s);
+    applyCuts(s);
     s.seq.videoTracks[0].add(new ProjectItem("logo.png", "node-5", 5), 109, 0, 0.5);
     expect(() => restore(s)).toThrow(/gap/);
   });
@@ -466,7 +465,7 @@ describe("gcutCloseGapMulti: one clip", () => {
     const la = s.seq.audioTracks[0].add(later, 110, 0, 5);
     lv.linked = [la]; la.linked = [lv];
     s.seq.audioTracks[2].add(new ProjectItem("sfx.wav", "node-4", 10), 112, 0, 3);
-    apply(s);
+    applyCuts(s);
   });
 
   it("ripples everything after the gap left by the gap, on every track", () => {
@@ -522,6 +521,11 @@ describe("gcutSnapshotSelection (timeline model)", () => {
     s.a1.selected = false;
     s.seq.audioTracks[1].add(new ProjectItem("mic.wav", "node-m2", 900, "seconds", false), 100, 0, 10).selected = true;
     expect(snapshot(s).problems).toContain("A1 is linked to V1 but isn't selected. Select it too, or unlink it.");
+  });
+  it("doesn't count audio from a selected clip's source that lies elsewhere on the timeline as linked", () => {
+    const s = multiScene({ music: false });
+    s.seq.audioTracks[2].add(s.wide, 200, 40, 45); // wide.mov's audio, unselected, nowhere near V1 (100–110)
+    expect(snapshot(s).problems).toEqual([]);
   });
   it("says when the selected audio doesn't overlap the video", () => {
     const s = georgScene(); s.a1.start = Time.k(200 * TICKS); s.a1.end = Time.k(210 * TICKS);
@@ -580,18 +584,13 @@ describe("gcutSnapshotSelection", () => {
   });
 });
 
-const rel = [{ start: 0, end: 2 }, { start: 3, end: 7 }, { start: 8, end: 10 }]; // keeps 8 of 10 s
-function applyMulti(s: ReturnType<typeof multiScene>, spans: unknown = rel, snap = snapshot(s)) {
-  const items = [...snap.video, ...snap.audio].map((i: any) => ({ kind: i.kind, trackIndex: i.trackIndex, startTicks: i.startTicks, endTicks: i.endTicks }));
-  return s.host.call("gcutApplyCutsMulti", { sequenceId: snap.sequenceId, startTicks: snap.startTicks, endTicks: snap.endTicks, items, spans });
-}
 const pieces = (t: Track) => t.clips.map((i: TrackItem) => [+(i.start.seconds).toFixed(3), +(i.end.seconds).toFixed(3), +(i.inPoint.seconds).toFixed(3)]);
 
 describe("gcutApplyCutsMulti", () => {
   it("cuts every recorded clip identically, back to back, each from its own source", () => {
     const s = multiScene({ music: false });
-    const r = applyMulti(s);
-    expect(r).toMatchObject({ ok: true, appliedCount: 3, clipCount: 4 });
+    const r = applyCuts(s);
+    expect(r).toMatchObject({ ok: true, appliedCount: 2, clipCount: 4 });
     expect(r.trailingGapS).toBeCloseTo(2, 3);
     expect(pieces(s.seq.videoTracks[0])).toEqual([[100, 102, 10], [102, 106, 13], [106, 108, 18]]);
     expect(pieces(s.seq.videoTracks[1])).toEqual([[100, 102, 12], [102, 106, 15], [106, 108, 20]]);
@@ -600,7 +599,7 @@ describe("gcutApplyCutsMulti", () => {
 
   it("same-source camera audio ends up exactly once per piece on A1", () => {
     const s = multiScene({ music: false });
-    applyMulti(s);
+    applyCuts(s);
     expect(pieces(s.seq.audioTracks[0])).toEqual([[100, 102, 10], [102, 106, 13], [106, 108, 18]]);
     // The close-up's own audio that overwriteClip brought along (sim: lands on A2) is removed.
     expect(s.seq.audioTracks[1].clips.numItems).toBe(0);
@@ -608,7 +607,7 @@ describe("gcutApplyCutsMulti", () => {
 
   it("leaves everything it didn't record exactly as it was (the title on V4)", () => {
     const s = multiScene({ music: false });
-    applyMulti(s);
+    applyCuts(s);
     expect(layout(s.seq.videoTracks[3])).toEqual([[104, 106]]);
   });
 
@@ -617,7 +616,7 @@ describe("gcutApplyCutsMulti", () => {
     const snap = snapshot(s);
     for (const v of [s.v1, s.v2, s.v3]) v.selected = false;
     s.seq.videoTracks[3].clips[0].selected = true;
-    expect(applyMulti(s, rel, snap)).toMatchObject({ ok: true, clipCount: 4 });
+    expect(applyCuts(s, cuts, snap)).toMatchObject({ ok: true, clipCount: 4 });
     expect(layout(s.seq.videoTracks[3])).toEqual([[104, 106]]);
   });
 
@@ -626,7 +625,7 @@ describe("gcutApplyCutsMulti", () => {
     const snap = snapshot(s);
     s.seq.sequenceID = "seq-2";
     const before = layout(s.seq.videoTracks[0]);
-    expect(() => applyMulti(s, rel, snap)).toThrow(/different sequence/);
+    expect(() => applyCuts(s, cuts, snap)).toThrow(/different sequence/);
     expect(layout(s.seq.videoTracks[0])).toEqual(before);
   });
 
@@ -634,21 +633,21 @@ describe("gcutApplyCutsMulti", () => {
     const s = multiScene({ music: false });
     const snap = snapshot(s);
     s.v2.start = Time.k(101 * TICKS); s.v2.end = Time.k(111 * TICKS);
-    expect(() => applyMulti(s, rel, snap)).toThrow(/V2's clip changed since Analyse/);
+    expect(() => applyCuts(s, cuts, snap)).toThrow(/V2's clip changed since Analyse/);
   });
 
   it("refuses a locked track before changing anything", () => {
     const s = multiScene({ music: false });
     s.seq.videoTracks[2].locked = true;
     const before = layout(s.seq.videoTracks[0]);
-    expect(() => applyMulti(s)).toThrow(/V3 is locked/);
+    expect(() => applyCuts(s)).toThrow(/V3 is locked/);
     expect(layout(s.seq.videoTracks[0])).toEqual(before);
   });
 
   it("one piece landing wrong rolls back every clip to how it was", () => {
     const s = multiScene({ music: false });
     s.seq.dropSpanIndex = 4; // the 5th placement (V2's second piece) silently fails
-    const r = applyMulti(s);
+    const r = applyCuts(s);
     expect(r).toMatchObject({ ok: false, rolledBack: true });
     expect(r.message).toMatch(/V2/);
     for (const [t, inS] of [[0, 10], [1, 12], [2, 5]] as const) expect(pieces(s.seq.videoTracks[t])).toEqual([[100, 110, inS]]);
@@ -660,13 +659,13 @@ describe("gcutApplyCutsMulti", () => {
   it("works when Premiere rounds set points down to whole source frames", () => {
     const s = multiScene({ music: false });
     for (const pi of [s.wide, s.close, s.screen]) pi.floorToFrames = true;
-    expect(applyMulti(s, [{ start: 0, end: 2.5 }, { start: 3.03, end: 6.27 }, { start: 7.41, end: 9.97 }])).toMatchObject({ ok: true });
+    expect(applyCuts(s, [{ start: 2.5, end: 3.03 }, { start: 6.27, end: 7.41 }, { start: 9.97, end: 10 }])).toMatchObject({ ok: true });
   });
 
   it("refuses a source whose frame rate doesn't fit the sequence's", () => {
     const s = multiScene({ music: false });
     s.close.mediaFps = 24;
-    expect(() => applyMulti(s)).toThrow(/V2.*24 fps.*25 fps/);
+    expect(() => applyCuts(s)).toThrow(/V2.*24 fps.*25 fps/);
   });
 
   it("refuses audio added under the clips since Analyse, naming the track, before changing anything", () => {
@@ -676,7 +675,7 @@ describe("gcutApplyCutsMulti", () => {
     s.seq.audioTracks[1].add(new ProjectItem("sfx.wav", "node-x", 5, "seconds", false), 103, 0, 1);
     const all = () => [...[0, 1, 2, 3].map((t) => pieces(s.seq.videoTracks[t])), ...[0, 1, 2].map((t) => pieces(s.seq.audioTracks[t]))];
     const before = all();
-    expect(() => applyMulti(s, rel, snap)).toThrow("Something was added under the clips on A2 since Analyse. Analyse again.");
+    expect(() => applyCuts(s, cuts, snap)).toThrow("Something was added under the clips on A2 since Analyse. Analyse again.");
     expect(all()).toEqual(before);
     expect(pieces(s.seq.audioTracks[1])).toEqual([[103, 104, 0]]);
   });
@@ -687,7 +686,7 @@ describe("gcutApplyCutsMulti: stash and rollback safety", () => {
 
   it("a re-apply at the same start that rolls back keeps the first edit's Restore record", () => {
     const s = multiScene({ music: false });
-    expect(applyMulti(s)).toMatchObject({ ok: true });
+    expect(applyCuts(s)).toMatchObject({ ok: true });
     const first = stash(s)["m@" + START];
     expect(first).toBeTruthy();
     // Analyse the first pieces of the cut timeline (100–102 s) and apply again; it fails.
@@ -696,7 +695,7 @@ describe("gcutApplyCutsMulti: stash and rollback safety", () => {
     const snap2 = snapshot(s);
     expect(snap2).toMatchObject({ found: true, startTicks: START, problems: [] });
     s.seq.dropSpanIndex = 12; // 12 placements so far: the re-apply's first one silently fails
-    expect(applyMulti(s, [{ start: 0, end: 1 }], snap2)).toMatchObject({ ok: false, rolledBack: true });
+    expect(applyCuts(s, [{ start: 1, end: 2 }], snap2)).toMatchObject({ ok: false, rolledBack: true });
     const rec = stash(s)["m@" + START];
     expect(rec).toBe(first);
     expect([rec.startT, rec.endT, rec.rebuiltEndT]).toEqual([100 * TICKS, 110 * TICKS, 108 * TICKS]);
@@ -710,7 +709,7 @@ describe("gcutApplyCutsMulti: stash and rollback safety", () => {
       return this.track === s.seq.audioTracks[1] ? 0 : orig.call(this, r, a);
     };
     try {
-      const r = applyMulti(s);
+      const r = applyCuts(s);
       expect(r).toMatchObject({ ok: false, rolledBack: false });
       expect(r.message).toMatch(/A2/);
       expect(r.message).toMatch(/couldn't be put back automatically: use Premiere's Undo/);
@@ -722,7 +721,7 @@ describe("gcutApplyCutsMulti: stash and rollback safety", () => {
   it("an original whose remove does nothing (its tail left in the gap) fails and rolls back", () => {
     const s = multiScene({ music: false });
     s.v1.remove = () => 0;
-    const r = applyMulti(s);
+    const r = applyCuts(s);
     expect(r).toMatchObject({ ok: false, rolledBack: true });
     expect(r.message).toMatch(/V1/);
     for (const [t, inS] of [[0, 10], [1, 12], [2, 5]] as const) expect(pieces(s.seq.videoTracks[t])).toEqual([[100, 110, inS]]);
@@ -734,21 +733,105 @@ describe("gcutApplyCutsMulti: stash and rollback safety", () => {
     const v2 = s.seq.videoTracks[1], real = v2.overwriteClip.bind(v2);
     let calls = 0;
     v2.overwriteClip = (pi: ProjectItem, ticks: string) => { if (calls++ === 0) throw new Error("Premiere refused"); return real(pi, ticks); };
-    const r = applyMulti(s, [{ start: 0, end: 10.04 }]); // V1 is laid whole (clamped to 110) before V2 throws
+    const r = applyCuts(s, [{ start: 2, end: 3 }]); // V1 is laid in full before V2 throws
     expect(r).toMatchObject({ ok: false, rolledBack: true });
     for (const [t, inS] of [[0, 10], [1, 12], [2, 5]] as const) expect(pieces(s.seq.videoTracks[t])).toEqual([[100, 110, inS]]);
     expect(pieces(s.seq.audioTracks[0])).toEqual([[100, 110, 10]]);
   });
 });
 
-describe("gcutApplyCutsMulti: nothing is laid past the range", () => {
-  it("a span ending a frame past the range is clamped, so a clip starting right after keeps its first frame", () => {
+describe("gcutApplyCutsMulti: nothing is cut past the range", () => {
+  it("a cut ending a frame past the range is clamped, so a clip starting right after keeps its first frame", () => {
     const s = multiScene({ music: false });
     const broll = new ProjectItem("broll.mov", "node-b", 60, "seconds", false);
     s.seq.videoTracks[0].add(broll, 110, 0, 5);
-    expect(applyMulti(s, [{ start: 0, end: 10.04 }])).toMatchObject({ ok: true, trailingGapS: 0 });
-    expect(pieces(s.seq.videoTracks[0])).toEqual([[100, 110, 10], [110, 115, 0]]);
-    expect(pieces(s.seq.videoTracks[1])).toEqual([[100, 110, 12]]);
+    const r = applyCuts(s, [{ start: 9, end: 10.04 }]);
+    expect(r).toMatchObject({ ok: true, appliedCount: 1 });
+    expect(r.trailingGapS).toBeCloseTo(1, 6);
+    expect(pieces(s.seq.videoTracks[0])).toEqual([[100, 109, 10], [110, 115, 0]]);
+    expect(pieces(s.seq.videoTracks[1])).toEqual([[100, 109, 12]]);
+  });
+});
+
+describe("timeline mapping helpers", () => {
+  const ctx = () => multiScene().host.ctx as any;
+  const clock = { tpf: TPF };
+  const at = (s: number) => Math.round(s * TICKS);
+
+  it("gcutCutTicks: frame-snapped, sorted, merged; zero-length cuts dropped", () => {
+    const c = ctx().gcutCutTicks([{ start: 7, end: 8 }, { start: 2.01, end: 3 }, { start: 2.5, end: 3.48 }, { start: 5, end: 5.01 }], at(100), clock);
+    expect(c.map((x: any) => [x.startT / TICKS, x.endT / TICKS])).toEqual([[102, 103.48], [107, 108]]);
+  });
+  it("gcutRemovedBefore: whole cuts before t, and the part of a cut containing t", () => {
+    const cutsT = [{ startT: at(102), endT: at(103) }, { startT: at(107), endT: at(108) }];
+    expect([101, 102.5, 103, 107.5, 110].map((t) => ctx().gcutRemovedBefore(cutsT, at(t)) / TICKS)).toEqual([0, 0.5, 1, 1.5, 2]);
+  });
+  it("gcutItemPieces: an item's kept stretches, each slid by what was removed before it", () => {
+    const cutsT = [{ startT: at(102), endT: at(103) }, { startT: at(107), endT: at(108) }];
+    const p = ctx().gcutItemPieces({ startT: at(100.24), endT: at(109.84), inS: 30 }, cutsT, 1 / FPS);
+    expect(p.map((x: any) => [x.fromT / TICKS, x.atT / TICKS, +(x.durT / TICKS).toFixed(2), +x.srcIn.toFixed(2)]))
+      .toEqual([[100.24, 100.24, 1.76, 30], [103, 102, 4, 32.76], [108, 106, 1.84, 37.76]]);
+  });
+});
+
+describe("gcutApplyCutsMulti (timeline mapping)", () => {
+  it("removes the same timeline moments from every selected clip and keeps the hand-made offsets", () => {
+    const s = georgScene();
+    expect(applyCuts(s, cuts)).toMatchObject({ ok: true, clipCount: 4 });
+    expect(span(s.seq.videoTracks[0])).toEqual([[100, 102, 10], [102, 106, 13], [106, 108, 18]]);
+    expect(span(s.seq.videoTracks[1])).toEqual([[100.24, 102, 30], [102, 106, 32.76], [106, 107.84, 37.76]]);
+    expect(span(s.seq.videoTracks[2])).toEqual([[100.28, 102, 5], [102, 106, 7.72], [106, 108, 12.72]]);
+    // Audio runs past both ends: untouched before R, its tail slides left by the 2 s total.
+    expect(span(s.seq.audioTracks[0])).toEqual([[99, 102, 50], [102, 106, 54], [106, 109, 59]]);
+  });
+
+  it("an item that starts after a cut slides without being cut", () => {
+    const s = georgScene();
+    applyCuts(s, [{ start: 0.04, end: 0.2 }]); // 100.04–100.2, entirely before V2 and V3 start
+    expect(span(s.seq.videoTracks[1])).toEqual([[100.08, 109.68, 30]]);
+    expect(span(s.seq.videoTracks[2])).toEqual([[100.12, 109.84, 5]]);
+  });
+
+  it("refuses when sliding would cover an unrecorded clip, and changes nothing", () => {
+    const s = georgScene();
+    s.seq.videoTracks[2].add(new ProjectItem("bumper.mov", "node-u", 30, "seconds", false), 99, 0, 1.28); // ends at 100.28
+    const before = [0, 1, 2].map((t) => span(s.seq.videoTracks[t]));
+    expect(() => applyCuts(s, [{ start: 0.04, end: 0.2 }])).toThrow(/Moving V3's clip left would cover bumper.mov on V3/);
+    expect([0, 1, 2].map((t) => span(s.seq.videoTracks[t]))).toEqual(before);
+  });
+
+  it("leaves unselected clips alone (the title on V4, unselected music)", () => {
+    const s = georgScene();
+    applyCuts(s, cuts);
+    expect(span(s.seq.videoTracks[3])).toEqual([[112, 115, 0]]);
+  });
+
+  it("one piece landing wrong rolls every clip back to its own original place", () => {
+    const s = georgScene();
+    s.seq.dropSpanIndex = 4;
+    expect(applyCuts(s, cuts)).toMatchObject({ ok: false, rolledBack: true });
+    expect(span(s.seq.videoTracks[1])).toEqual([[100.24, 109.84, 30]]);
+    expect(span(s.seq.audioTracks[0])).toEqual([[99, 111, 50]]);
+  });
+
+  it("refuses an empty cut list", () => {
+    expect(() => applyCuts(georgScene(), [])).toThrow(/nothing to cut/);
+  });
+
+  it("records each item's own original place, and Restore puts every one back there", () => {
+    const s = georgScene();
+    applyCuts(s, cuts);
+    const rec = (s.host.ctx as any).$.global.gcutStash["m@" + START];
+    expect(rec.items.map((i: any) => [i.label, i.startT / TICKS, i.endT / TICKS, i.inS])).toEqual(
+      [["V1", 100, 110, 10], ["V2", 100.24, 109.84, 30], ["V3", 100.28, 110, 5], ["A1", 99, 111, 50]]);
+    expect(rec.cutsT.map((c: any) => [c.startT / TICKS, c.endT / TICKS])).toEqual([[102, 103], [107, 108]]);
+    expect(rec.rebuiltEndT).toBe(109 * TICKS);
+    expect(s.host.call("gcutRestoreMulti", { startTicks: START })).toEqual({ ok: true });
+    expect(span(s.seq.videoTracks[0])).toEqual([[100, 110, 10]]);
+    expect(span(s.seq.videoTracks[1])).toEqual([[100.24, 109.84, 30]]);
+    expect(span(s.seq.videoTracks[2])).toEqual([[100.28, 110, 5]]);
+    expect(span(s.seq.audioTracks[0])).toEqual([[99, 111, 50]]);
+    expect(s.seq.audioTracks[1].clips.numItems + s.seq.audioTracks[2].clips.numItems).toBe(0);
   });
 });
 
@@ -758,7 +841,7 @@ const closeGapMulti = (s: ReturnType<typeof multiScene>) => s.host.call("gcutClo
 describe("gcutRestoreMulti", () => {
   it("puts every recorded clip back exactly", () => {
     const s = multiScene({ music: false });
-    applyMulti(s);
+    applyCuts(s);
     expect(restoreMulti(s)).toEqual({ ok: true });
     for (const [t, inS] of [[0, 10], [1, 12], [2, 5]] as const) expect(pieces(s.seq.videoTracks[t])).toEqual([[100, 110, inS]]);
     expect(pieces(s.seq.audioTracks[0])).toEqual([[100, 110, 10]]);
@@ -771,21 +854,21 @@ describe("gcutRestoreMulti", () => {
   });
   it("refuses, naming the track, if something was placed in the gap since", () => {
     const s = multiScene({ music: false });
-    applyMulti(s);
+    applyCuts(s);
     s.seq.audioTracks[2].add(new ProjectItem("hit.wav", "node-h", 5, "seconds", false), 108.5, 0, 1);
     expect(() => restoreMulti(s)).toThrow(/gap on A3/);
     expect(pieces(s.seq.videoTracks[0])).toEqual([[100, 102, 10], [102, 106, 13], [106, 108, 18]]);
   });
   it("refuses if something was placed over the cut clips on a recorded track since", () => {
     const s = multiScene({ music: false });
-    applyMulti(s);
+    applyCuts(s);
     s.seq.videoTracks[1].add(new ProjectItem("logo.png", "node-l", 5, "seconds", false), 101, 0, 0.5);
     expect(() => restoreMulti(s)).toThrow(/V2/);
     expect(layout(s.seq.videoTracks[1])).toContainEqual([101, 101.5]);
   });
   it("refuses, naming the track, if audio was added under the cut clips on a track it didn't record", () => {
     const s = multiScene({ music: false });
-    applyMulti(s);
+    applyCuts(s);
     // A2 holds nothing recorded, but the angles' linked audio lands there when Restore re-lays them.
     s.seq.audioTracks[1].add(new ProjectItem("sfx.wav", "node-x", 5, "seconds", false), 101, 0, 0.5);
     expect(() => restoreMulti(s)).toThrow(/A2/);
@@ -798,13 +881,13 @@ describe("gcutRestoreMulti", () => {
   it("leaves alone a clip that already sat in the gap at Apply", () => {
     const s = multiScene({ music: false });
     s.seq.videoTracks[3].add(new ProjectItem("lower third", "node-3", 30, "seconds", false), 108.5, 0, 1);
-    applyMulti(s);
+    applyCuts(s);
     expect(restoreMulti(s)).toEqual({ ok: true });
     expect(layout(s.seq.videoTracks[3])).toEqual([[104, 106], [108.5, 109.5]]);
   });
   it("a Restore that fails part-way keeps the record, so Close gap still sees the gap", () => {
     const s = multiScene({ music: false });
-    applyMulti(s);
+    applyCuts(s);
     s.seq.dropSpanIndex = 12; // 12 placements so far: Restore's first (V1) silently fails
     expect(() => restoreMulti(s)).toThrow(/Undo/);
     const rec = (s.host.ctx as any).$.global.gcutStash["m@" + START];
@@ -822,28 +905,28 @@ describe("gcutCloseGapMulti", () => {
   it("pulls everything after the edit left by the gap, on every track", () => {
     const s = multiScene({ music: false });
     later(s);
-    applyMulti(s);
+    applyCuts(s);
     expect(closeGapMulti(s)).toMatchObject({ ok: true });
     expect(layout(s.seq.videoTracks[0]).at(-1)).toEqual([108, 113]);
     expect(layout(s.seq.audioTracks[2])).toEqual([[110, 112]]);
   });
   it("refuses, naming the track, if something sits inside the gap", () => {
     const s = multiScene({ music: false });
-    applyMulti(s);
+    applyCuts(s);
     s.seq.audioTracks[2].add(new ProjectItem("hit.wav", "node-h", 5, "seconds", false), 108.5, 0, 1);
     expect(() => closeGapMulti(s)).toThrow(/A3/);
   });
   it("refuses a locked track before moving anything", () => {
     const s = multiScene({ music: false });
     later(s);
-    applyMulti(s);
+    applyCuts(s);
     s.seq.audioTracks[2].locked = true;
     expect(() => closeGapMulti(s)).toThrow(/A3 is locked/);
     expect(layout(s.seq.videoTracks[0]).at(-1)).toEqual([110, 115]);
   });
   it("after closing the gap, Restore refuses and points at Undo", () => {
     const s = multiScene({ music: false });
-    applyMulti(s);
+    applyCuts(s);
     closeGapMulti(s);
     expect(() => restoreMulti(s)).toThrow(/Undo/);
   });

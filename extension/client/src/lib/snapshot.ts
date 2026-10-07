@@ -31,13 +31,17 @@ export function audioChoice(s: Snapshot, remembered: string | null): AudioChoice
   return { kind: "ask", preselect: still ? remembered : null };
 }
 
+/** Each source covers its overlap with the range; a source that doesn't reach into it is left out. */
 export function trimRequestFor(s: Snapshot, sources: SnapshotItem[], prompt: string): TrimRequest {
   const r0 = s.startS, r1 = r0 + s.durationS;
-  const audio: AudioSource[] = sources.map((a) => {
+  const audio: AudioSource[] = [];
+  for (const a of sources) {
     const aStart = Number(a.startTicks) / TICKS, aEnd = Number(a.endTicks) / TICKS;
     const from = Math.max(aStart, r0), to = Math.min(aEnd, r1);
-    return { media_path: a.mediaPath, in_s: round3(a.inS + (from - aStart)), offset_s: round3(from - r0), duration_s: round3(to - from) };
-  });
+    if (to - from < 0.001) continue;
+    audio.push({ media_path: a.mediaPath, in_s: round3(a.inS + (from - aStart)), offset_s: round3(from - r0), duration_s: round3(to - from) });
+  }
+  if (!audio.length) throw new Error("The selected audio doesn't overlap the selected video clips, so there's nothing to transcribe.");
   return { duration_s: s.durationS, range_start_seq_s: s.startS, audio, prompt };
 }
 

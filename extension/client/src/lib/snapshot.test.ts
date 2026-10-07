@@ -60,4 +60,18 @@ describe("trimRequestFor", () => {
       { media_path: "D:/lav.wav", in_s: 7, offset_s: 3, duration_s: 5 },
     ]);
   });
+
+  it("drops a source that doesn't overlap the range (wholly outside, or only touching its edge)", () => {
+    const a = { ...item("audio", 0, "mic.wav", 50), startTicks: String(99 * T), endTicks: String(111 * T) };
+    const out = { ...item("audio", 1, "lav.wav", 7), startTicks: String(200 * T), endTicks: String(210 * T) };
+    const edge = { ...item("audio", 2, "sfx.wav", 0), startTicks: String(110 * T), endTicks: String(115 * T) };
+    const s = { ...snap([item("video", 0, "A.mov", 10)], [a, out, edge]), startS: 100, durationS: 10 };
+    expect(trimRequestFor(s, [a, out, edge], "x").audio).toEqual([{ media_path: "D:/mic.wav", in_s: 51, offset_s: 0, duration_s: 10 }]);
+  });
+
+  it("throws when no chosen source overlaps the range", () => {
+    const out = { ...item("audio", 1, "lav.wav", 7), startTicks: String(200 * T), endTicks: String(210 * T) };
+    const s = { ...snap([item("video", 0, "A.mov", 10)], [out]), startS: 100, durationS: 10 };
+    expect(() => trimRequestFor(s, [out], "x")).toThrow("The selected audio doesn't overlap the selected video clips, so there's nothing to transcribe.");
+  });
 });

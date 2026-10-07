@@ -555,6 +555,19 @@ describe("gcutSnapshotSelection (timeline model)", () => {
     const s = georgScene(); s.a1.start = Time.k(200 * TICKS); s.a1.end = Time.k(210 * TICKS);
     expect(snapshot(s).problems).toContain("The selected audio doesn't overlap the selected video clips, so there's nothing to transcribe.");
   });
+  // A selected item outside the range would only slide at Apply, with no cut and no explanation.
+  it("names a selected audio clip that lies wholly outside the video clips' time", () => {
+    const s = georgScene();
+    s.seq.audioTracks[1].add(new ProjectItem("lav.wav", "node-v", 900, "seconds", false), 200, 0, 10).selected = true;
+    const r = snapshot(s);
+    expect([r.startS, r.durationS]).toEqual([100, 10]);
+    expect(r.problems).toEqual(["A2 (lav.wav) is selected but lies outside the video clips' time. Deselect it, then Analyse again."]);
+  });
+  it("names a selected video clip that lies outside the selected audio's time", () => {
+    const s = georgScene();
+    s.seq.videoTracks[3].add(new ProjectItem("Outro.mov", "node-o", 900, "seconds", false), 120, 0, 5).selected = true;
+    expect(snapshot(s).problems).toEqual(["V4 (Outro.mov) is selected but lies outside the selected audio's time. Deselect it, then Analyse again."]);
+  });
 });
 
 describe("gcutSnapshotSelection", () => {

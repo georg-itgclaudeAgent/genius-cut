@@ -302,6 +302,19 @@ function gcutSnapshotSelection(nameJson) {
             problems.push("The selected audio doesn't overlap the selected video clips, so there's nothing to transcribe.");
         } else {
             startT = Math.max(vStart, aStart); endT = Math.min(vEnd, aEnd);
+            // A selected item outside R would only slide at Apply, with nothing cut from it.
+            for (i = 0; i < out.audio.length; i++) {
+                it = out.audio[i];
+                if (!gcutOverlaps(Number(it.startTicks), Number(it.endTicks), startT, endT, clock)) {
+                    problems.push(it.label + " (" + it.name + ") is selected but lies outside the video clips' time. Deselect it, then Analyse again.");
+                }
+            }
+            for (i = 0; i < out.video.length; i++) {
+                it = out.video[i];
+                if (!gcutOverlaps(Number(it.startTicks), Number(it.endTicks), startT, endT, clock)) {
+                    problems.push(it.label + " (" + it.name + ") is selected but lies outside the selected audio's time. Deselect it, then Analyse again.");
+                }
+            }
         }
         return gcutOk({
             found: true, sequenceId: gcutSeqId(seq), startTicks: String(startT), endTicks: String(endT),

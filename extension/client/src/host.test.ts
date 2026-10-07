@@ -37,6 +37,8 @@ class ProjectItem {
   rejectInAfterOut = false;
   /** Real Premiere (Checkpoint B, 2026-10-05) rounds set in/out points DOWN to the media's frame grid. */
   floorToFrames = false;
+  /** Out points, and a clip's end, can't run past the end of the media (off by default). */
+  clampToMedia = false;
   mediaFps = FPS;
   constructor(public name: string, public nodeId: string, public durationS: number, public unit: Unit = "seconds", public hasAudio = true) {
     this.outS = durationS;
@@ -53,7 +55,7 @@ class ProjectItem {
     this.inS = s; return 0;
   }
   setOutPoint(v: any, _m: number) {
-    const s = this.toSeconds(v);
+    const s = this.clampToMedia ? Math.min(this.toSeconds(v), this.durationS) : this.toSeconds(v);
     if (this.rejectInAfterOut && s <= this.inS) throw new Error("Out point before in point");
     this.outS = s; return 0;
   }
@@ -77,7 +79,13 @@ class TrackItem {
   /** A trim, as setting `end` is in Premiere: the in point stays, the out point follows. Throws when `seq.endSettable` is off. */
   set end(v: Time) {
     if (!this.track.seq.endSettable) throw new Error("end is read-only");
-    this.setEnd(Number(v.ticks));
+    let t = Number(v.ticks);
+    const pi = this.projectItem;
+    if (pi.clampToMedia) { // the last whole sequence frame the media still covers
+      const tpf = Number(this.track.seq.timebase), last = this.start.t + (pi.durationS - this.inPoint.seconds) * TICKS;
+      t = Math.min(t, Math.floor(last / tpf + 1e-9) * tpf);
+    }
+    this.setEnd(t);
   }
   /** The simulator's own trims (overwrites), never refused. */
   setEnd(t: number) { this._end = Time.k(t); this.outPoint = Time.s(this.inPoint.seconds + (t - this.start.t) / TICKS); }
@@ -1154,7 +1162,8 @@ describe("a clip whose own frame rate doesn't fit the sequence (cut on timeline 
     expect(applyCuts(s, cuts)).toMatchObject({ ok: true, clipCount: 4 });
     const v2 = s.seq.videoTracks[1].clips;
     expect(ticks(s.seq.videoTracks[1])).toEqual([[at(100.24), at(102)], [at(102), at(106)], [at(106), at(107.84)]]);
-    [30, 32.76, 37.76].forEach((want, i) => expect(Math.abs(v2[i].inPoint.seconds - want)).toBeLessThanOrEqual(SRC_FRAME));
+    // What verify allows: within one source frame plus half a sequence frame of the planned source time.
+    [30, 32.76, 37.76].forEach((want, i) => expect(Math.abs(v2[i].inPoint.seconds - want)).toBeLessThanOrEqual(SRC_FRAME + 0.5 / FPS));
     fitting(s);
     expect(span(s.seq.videoTracks[3])).toEqual([[112, 115, 0]]);
   });
@@ -1282,6 +1291,41 @@ describe("a clip whose own frame rate doesn't fit the sequence (cut on timeline 
       expect(v.at(-1).end.t).toBe((3120 - removed) * TPF30);
       plan.forEach(([, , from], i) => expect(Math.abs(v[i].inPoint.seconds - (inS + (from - 3000) / 30))).toBeLessThanOrEqual(SRC_FRAME + 1e-9));
     });
+  });
+
+  describe("a loose clip running to the very end of its source (Premiere won't go past the media's end)", () => {
+    /** V1: a loose clip at 100–104 whose source ends exactly where the clip does; mic on A1 99–105. */
+    function endScene(fps: number, inS: number) {
+      const seq = new Seq(1, 1);
+      seq.timebase = String(TICKS / fps);
+      const pi = new ProjectItem("Camera B.mov", "node-b", inS + 4, "seconds", false);
+      pi.mediaFps = SRC_FPS; pi.floorToFrames = true; pi.clampToMedia = true;
+      const v1 = seq.videoTracks[0].add(pi, 100, inS, inS + 4);
+      const a1 = seq.audioTracks[0].add(new ProjectItem("mic.wav", "node-m", 900, "seconds", false), 99, 50, 56);
+      v1.selected = true; a1.selected = true;
+      return { seq, pi, host: load(seq) };
+    }
+    const frames = (s: { seq: Seq }, fps: number) =>
+      s.seq.videoTracks[0].clips.map((i: TrackItem) => [Math.round(i.start.t / (TICKS / fps)), Math.round(i.end.t / (TICKS / fps))]);
+
+    it("cut in the middle and at the end: applies with exact pieces, and Restore is exact", () => {
+      const s = endScene(25, 30.07);
+      expect(applyCuts(s, [{ start: 1, end: 2 }, { start: 3.6, end: 4 }])).toMatchObject({ ok: true });
+      expect(frames(s, 25)).toEqual([[2500, 2525], [2525, 2565]]);
+      expect(s.host.call("gcutRestoreMulti", { startTicks: START })).toEqual({ ok: true });
+      expect(frames(s, 25)).toEqual([[2500, 2600]]);
+      expect(s.seq.videoTracks[0].clips[0].inPoint.seconds).toBeCloseTo(floorSrc(30.07), 9);
+    });
+
+    const ins = Array.from({ length: 25 }, (_, k) => +(30 + k * 0.007).toFixed(3));
+    it.each([25, 30].flatMap((fps) => ins.map((inS) => [fps, inS] as const)))(
+      "%s fps, inS %s, cut in the middle: the last piece reaches the media's end exactly, and Restore is exact", (fps, inS) => {
+        const s = endScene(fps, inS);
+        expect(applyCuts(s, [{ start: 1, end: 2 }])).toMatchObject({ ok: true });
+        expect(frames(s, fps)).toEqual([[100 * fps, 101 * fps], [101 * fps, 103 * fps]]);
+        expect(s.host.call("gcutRestoreMulti", { startTicks: START })).toEqual({ ok: true });
+        expect(frames(s, fps)).toEqual([[100 * fps, 104 * fps]]);
+      });
   });
 
   it.each(["throws", "silently does nothing"])("when setting a piece's end %s, Apply rolls back and says so, every track unchanged", (how) => {

@@ -472,13 +472,16 @@ function gcutNewEnd(f, cutsT) { return f.endT - gcutRemovedBefore(cutsT, f.endT)
  * An item {startT, endT, inS}'s kept stretches [{fromT, durT, atT, srcIn}]: each lands at
  * atT = fromT - removedBefore(fromT), the same mapping for every item, from source in point
  * inS + (fromT - startT) snapped to the grid srcFrameS: the source's frames (Premiere rounds set
- * points down to them), or the sequence's for audio and loose video (see gcutRefind).
+ * points down to them), or the sequence's for audio. A loose item's (see gcutRefind) is used as it
+ * is: snapped, it could sit up to half a frame late, and a piece running to the very end of its
+ * source would then need media past the end to reach its planned length.
  */
 function gcutItemPieces(item, cutsT, srcFrameS) {
     var out = [], cursor = item.startT;
     function push(fromT, toT) {
         if (toT <= fromT) return;
-        var srcIn = Math.round((item.inS + (fromT - item.startT) / GCUT_TICKS) / srcFrameS) * srcFrameS;
+        var srcIn = item.inS + (fromT - item.startT) / GCUT_TICKS;
+        if (!item.loose) srcIn = Math.round(srcIn / srcFrameS) * srcFrameS;
         out.push({ fromT: fromT, durT: toT - fromT, atT: fromT - gcutRemovedBefore(cutsT, fromT), srcIn: srcIn });
     }
     for (var i = 0; i < cutsT.length; i++) {

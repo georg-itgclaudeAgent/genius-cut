@@ -8,8 +8,8 @@
  *   - each gcut* function takes one JSON-encoded string argument and returns a JSON string;
  *   - failures return "Error: <message>" and never throw.
  *
- * Timeline edits rebuild every recorded clip (a selection snapshot taken at Analyse: the synced
- * video clips and the audio under them) following plan decision D2: remove each clip and re-lay
+ * Timeline edits rebuild every recorded clip (a selection snapshot taken at Analyse: the selected
+ * video clips and the selected audio) following plan decision D2: remove each clip and re-lay
  * the same kept spans from its own source with overwriteClip, on its own track (no razor:
  * Premiere 2026 silently no-ops the QE razor). Consequences:
  *   - The rebuild lays fresh clips from the source, so effects, grades, keyframes and audio
@@ -221,7 +221,12 @@ function gcutItemRecord(kind, trackIndex, it) {
     };
 }
 
-/** name: "" = the selected clips. Records the selection so later edits never read it again. */
+/**
+ * name: "" = the selected clips. Records the selected video clips and the SELECTED audio, so
+ * later edits never read the selection again. The clips may start and end at different places
+ * (hand-synced angles): the returned start/end is the range R where the selected video span
+ * (earliest start → latest end) and the selected audio span overlap. Only R gets transcribed.
+ */
 function gcutSnapshotSelection(nameJson) {
     try {
         var name = gcutParse(nameJson) || "";
@@ -242,35 +247,47 @@ function gcutSnapshotSelection(nameJson) {
             return gcutOk({ found: false,
                 message: name === "" ? "No clip is selected in the timeline." : "No clip named " + name + " on the active sequence." });
         }
-        var first = video[0], startT = gcutT(first.item.start), endT = gcutT(first.item.end);
-        var problems = [], out = { video: [], audio: [] };
+        var problems = [], out = { video: [], audio: [] }, vStart = null, vEnd = null;
         for (i = 0; i < video.length; i++) {
             var v = video[i].item, lbl = gcutLabel("video", video[i].track);
-            if (!gcutNear(gcutT(v.start), startT, clock.half) || !gcutNear(gcutT(v.end), endT, clock.half)) {
-                var off = Math.max(Math.abs(gcutT(v.start) - startT), Math.abs(gcutT(v.end) - endT)) / GCUT_TICKS;
-                problems.push(lbl + " doesn't start and end with " + gcutLabel("video", first.track) + " (off by " +
-                    off.toFixed(2) + " s). Genius Cut needs synced clips that start and end together.");
-            }
+            if (vStart === null || gcutT(v.start) < vStart) vStart = gcutT(v.start);
+            if (vEnd === null || gcutT(v.end) > vEnd) vEnd = gcutT(v.end);
             if (Math.abs(gcutSpeed(v) - 1) > 1e-6) problems.push(lbl + " isn't at 100% speed.");
             out.video.push(gcutItemRecord("video", video[i].track, v));
         }
+        var aStart = null, aEnd = null;
         for (t = 0; t < seq.audioTracks.numTracks; t++) {
             var aItems = gcutItems(seq.audioTracks[t]);
             for (i = 0; i < aItems.length; i++) {
                 it = aItems[i];
                 if (!it.projectItem) continue;
                 var s = gcutT(it.start), e = gcutT(it.end);
-                if (e <= startT + clock.half || s >= endT - clock.half) continue;
-                if (s < startT - clock.half || e > endT + clock.half) {
-                    problems.push(gcutLabel("audio", t) + " runs past the clips (a J/L cut or a music bed). " +
-                        "Genius Cut can't rebuild that safely yet: trim it to the clips, or move it to after the edit.");
-                } else if (!gcutNear(s, startT, clock.half) || !gcutNear(e, endT, clock.half)) {
-                    problems.push(gcutPartialMessage(gcutLabel("audio", t)));
+                if (typeof it.isSelected === "function" && it.isSelected()) {
+                    if (aStart === null || s < aStart) aStart = s;
+                    if (aEnd === null || e > aEnd) aEnd = e;
+                    out.audio.push(gcutItemRecord("audio", t, it));
+                    continue;
                 }
-                out.audio.push(gcutItemRecord("audio", t, it));
+                // An unselected item from a selected clip's own source, under it: the rebuild of
+                // that clip would bring it along, so it has to be cut too, or unlinked.
+                for (var k = 0; k < video.length; k++) {
+                    var vi = video[k].item;
+                    if (gcutNode(it) === gcutNode(vi) && e > gcutT(vi.start) + clock.half && s < gcutT(vi.end) - clock.half) {
+                        problems.push(gcutLabel("audio", t) + " is linked to " + gcutLabel("video", video[k].track) +
+                            " but isn't selected. Select it too, or unlink it.");
+                        break;
+                    }
+                }
             }
         }
-        if (!out.audio.length) problems.push("No audio on the timeline under these clips.");
+        var startT = vStart, endT = vEnd; // R; falls back to the video span when there is none
+        if (!out.audio.length) {
+            problems.push("No audio clip is selected. Select the audio Genius Cut should transcribe along with the video clips.");
+        } else if (Math.min(vEnd, aEnd) <= Math.max(vStart, aStart)) {
+            problems.push("The selected audio doesn't overlap the selected video clips, so there's nothing to transcribe.");
+        } else {
+            startT = Math.max(vStart, aStart); endT = Math.min(vEnd, aEnd);
+        }
         return gcutOk({
             found: true, sequenceId: gcutSeqId(seq), startTicks: String(startT), endTicks: String(endT),
             startS: startT / GCUT_TICKS, durationS: (endT - startT) / GCUT_TICKS,

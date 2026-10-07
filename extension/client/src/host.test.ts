@@ -183,12 +183,13 @@ function scene(unit: Unit = "seconds") {
   const a = seq.audioTracks[0].add(pi, 100, 10, 20);
   v.linked = [a]; a.linked = [v];
   pi.inS = 2; pi.outS = 58;
-  v.selected = true;
+  v.selected = true; a.selected = true;
   return { seq, pi, v, a, host: load(seq) };
 }
 
 /** Three synced angles (V1 wide, V2 close, V3 screen) at 100–110 s, the wide camera's own audio on
- *  A1 (same project item as V1), a music bed on A3 (90–130 s) and a title on V4 (104–106 s). */
+ *  A1 (same project item as V1), a music bed on A3 (90–130 s) and a title on V4 (104–106 s).
+ *  The angles and A1 are selected; the music bed isn't. */
 function multiScene({ music = true } = {}) {
   const seq = new Seq(4, 3);
   const wide = new ProjectItem("wide.mov", "node-w", 600);
@@ -201,9 +202,24 @@ function multiScene({ music = true } = {}) {
   v1.linked = [a1]; a1.linked = [v1];
   if (music) seq.audioTracks[2].add(new ProjectItem("music.wav", "node-m", 300, "seconds", false), 90, 0, 40);
   seq.videoTracks[3].add(new ProjectItem("title", "node-t", 30, "seconds", false), 104, 0, 2);
-  for (const v of [v1, v2, v3]) v.selected = true;
+  for (const v of [v1, v2, v3, a1]) v.selected = true;
   wide.inS = 2; wide.outS = 58; close.inS = 0; close.outS = 600;
   return { seq, wide, close, screen, v1, v2, v3, a1, host: load(seq) };
+}
+
+/** Georg's real sequence: angles hand-synced with different edges, audio running past them,
+ *  a title on V4 after the clips, an unrelated clip on V3 ending just before the screen recording. */
+function georgScene() {
+  const seq = new Seq(4, 3);
+  const a = new ProjectItem("Camera A.mov", "node-a", 900), b = new ProjectItem("Camera B.mov", "node-b", 900, "seconds", false);
+  const scr = new ProjectItem("Restream.mov", "node-r", 900, "seconds", false), mic = new ProjectItem("mic.wav", "node-m", 900, "seconds", false);
+  const v1 = seq.videoTracks[0].add(a, 100, 10, 20);          // 100–110
+  const v2 = seq.videoTracks[1].add(b, 100.24, 30, 39.6);     // 100.24–109.84: starts 0.24 s later, ends 0.16 s earlier
+  const v3 = seq.videoTracks[2].add(scr, 100.28, 5, 14.72);   // 100.28–110: starts 0.28 s later
+  const a1 = seq.audioTracks[0].add(mic, 99, 50, 62);         // 99–111: runs past both ends
+  seq.videoTracks[3].add(new ProjectItem("Title", "node-t", 30, "seconds", false), 112, 0, 3);
+  for (const x of [v1, v2, v3, a1]) x.selected = true;
+  return { seq, a, b, scr, mic, v1, v2, v3, a1, host: load(seq) };
 }
 const snapshot = (s: { host: ReturnType<typeof load> }, name = "") => s.host.call("gcutSnapshotSelection", name);
 
@@ -387,7 +403,6 @@ describe("gcutApplyCutsMulti: one clip", () => {
   it("C3: refuses a J/L cut (linked audio extends past the video) before changing anything", () => {
     const s = scene();
     s.a.end = Time.s(112); s.a.outPoint = Time.s(22);
-    expect(snapshot(s).problems.join(" ")).toMatch(/A1 runs past the clips/);
     expect(() => apply(s)).toThrow(/A1 doesn't start and end with the video clips/);
     expect(s.seq.videoTracks[0].clips.numItems).toBe(1);
   });
@@ -485,18 +500,49 @@ describe("gcutCloseGapMulti: one clip", () => {
   });
 });
 
+describe("gcutSnapshotSelection (timeline model)", () => {
+  it("accepts hand-synced clips with different edges; the range is where video and audio overlap", () => {
+    const r = snapshot(georgScene());
+    expect(r.problems).toEqual([]);
+    expect(r.video.map((v: any) => v.label)).toEqual(["V1", "V2", "V3"]);
+    expect(r.audio.map((x: any) => x.label)).toEqual(["A1"]);
+    expect([r.startS, r.durationS]).toEqual([100, 10]);   // R = [100,110] ∩ [99,111]
+  });
+  it("uses only the selected audio", () => {
+    const s = georgScene();
+    s.seq.audioTracks[2].add(new ProjectItem("music.wav", "node-x", 300, "seconds", false), 90, 0, 40); // unselected
+    expect(snapshot(s).audio.map((x: any) => x.label)).toEqual(["A1"]);
+  });
+  it("prompts when no audio is selected", () => {
+    const s = georgScene(); s.a1.selected = false;
+    expect(snapshot(s).problems).toContain("No audio clip is selected. Select the audio Genius Cut should transcribe along with the video clips.");
+  });
+  it("refuses linked audio that isn't selected", () => {
+    const s = multiScene({ music: false }); // A1 is V1's own audio (same node)
+    s.a1.selected = false;
+    s.seq.audioTracks[1].add(new ProjectItem("mic.wav", "node-m2", 900, "seconds", false), 100, 0, 10).selected = true;
+    expect(snapshot(s).problems).toContain("A1 is linked to V1 but isn't selected. Select it too, or unlink it.");
+  });
+  it("says when the selected audio doesn't overlap the video", () => {
+    const s = georgScene(); s.a1.start = Time.k(200 * TICKS); s.a1.end = Time.k(210 * TICKS);
+    expect(snapshot(s).problems).toContain("The selected audio doesn't overlap the selected video clips, so there's nothing to transcribe.");
+  });
+});
+
 describe("gcutSnapshotSelection", () => {
-  it("records every selected video clip and the audio under them", () => {
+  it("records every selected video clip and the selected audio", () => {
     const r = snapshot(multiScene({ music: false }));
     expect(r).toMatchObject({ found: true, sequenceId: "seq-1", startTicks: START, durationS: 10, problems: [] });
     expect(r.video.map((v: any) => [v.label, v.name, v.inS])).toEqual([["V1", "wide.mov", 10], ["V2", "close.mov", 12], ["V3", "screen.mov", 5]]);
     expect(r.audio.map((a: any) => [a.label, a.name, a.inS])).toEqual([["A1", "wide.mov", 10]]);
   });
 
-  it("lists a music bed under the clips as audio too (the panel then asks which to transcribe)", () => {
-    const r = snapshot(multiScene());
+  it("lists a selected music bed as audio too, even though it runs past the clips (the panel then asks which to transcribe)", () => {
+    const s = multiScene();
+    s.seq.audioTracks[2].clips[0].selected = true;
+    const r = snapshot(s);
     expect(r.audio.map((a: any) => a.label)).toEqual(["A1", "A3"]);
-    expect(r.problems[0]).toMatch(/A3.*past|J\/L/); // music runs 90–130 s: beyond the range, refused as a J/L-style overhang
+    expect(r).toMatchObject({ startTicks: START, durationS: 10, problems: [] }); // music runs 90–130 s; the range stays 100–110
   });
 
   it("selected audio items aren't counted as video or listed twice", () => {
@@ -505,24 +551,6 @@ describe("gcutSnapshotSelection", () => {
     const r = snapshot(s);
     expect(r.video).toHaveLength(3);
     expect(r.audio).toHaveLength(1);
-  });
-
-  it("flags clips that don't start and end together, naming the track and the offset", () => {
-    const s = multiScene({ music: false });
-    s.v2.start = Time.k(103 * TICKS); s.v2.end = Time.k(113 * TICKS);
-    expect(snapshot(s).problems.join(" ")).toMatch(/V2.*3\.00 s.*start and end together/);
-  });
-
-  it("measures an end-only mismatch too, rather than saying off by 0.00 s", () => {
-    const s = multiScene({ music: false });
-    s.v2.end = Time.k(112 * TICKS);
-    expect(snapshot(s).problems.join(" ")).toMatch(/V2 doesn't start and end with V1 \(off by 2\.00 s\)/);
-  });
-
-  it("says when there's no audio under the clips", () => {
-    const s = multiScene({ music: false });
-    s.seq.audioTracks[0].items = [];
-    expect(snapshot(s).problems).toContain("No audio on the timeline under these clips.");
   });
 
   it("flags a retimed clip", () => {
@@ -537,7 +565,7 @@ describe("gcutSnapshotSelection", () => {
     expect(snapshot(s)).toMatchObject({ found: false, message: "No clip is selected in the timeline." });
   });
 
-  it("with a clip name, records just that clip and the audio under it", () => {
+  it("with a clip name, records just that clip and the selected audio", () => {
     const r = snapshot(multiScene({ music: false }), "close");
     expect(r.video.map((v: any) => v.label)).toEqual(["V2"]);
     expect(r.audio.map((a: any) => a.label)).toEqual(["A1"]);
@@ -654,30 +682,6 @@ describe("gcutApplyCutsMulti", () => {
   });
 });
 
-describe("gcutApplyCutsMulti: items that don't cover the whole range", () => {
-  it("refuses a short audio item inside the range, in the snapshot and in apply, changing nothing", () => {
-    const s = multiScene({ music: false });
-    s.seq.audioTracks[1].add(s.close, 104, 50, 52); // B-roll audio on A2, 104–106 s
-    const snap = snapshot(s);
-    expect(snap.problems.join(" ")).toMatch(/A2 doesn't start and end with the video clips/);
-    expect(snap.problems.join(" ")).not.toMatch(/A2 runs past/);
-    const before = [0, 1, 2].map((t) => pieces(s.seq.videoTracks[t]));
-    expect(() => applyMulti(s, rel, snap)).toThrow(/A2 doesn't start and end with the video clips/);
-    expect([0, 1, 2].map((t) => pieces(s.seq.videoTracks[t]))).toEqual(before);
-    expect(pieces(s.seq.audioTracks[1])).toEqual([[104, 106, 50]]);
-  });
-
-  it("refuses two back-to-back audio clips on one track", () => {
-    const s = multiScene({ music: false });
-    s.a1.end = Time.k(105 * TICKS); s.a1.outPoint = Time.s(15);
-    s.seq.audioTracks[0].add(s.wide, 105, 15, 20);
-    const snap = snapshot(s);
-    expect(snap.problems.join(" ")).toMatch(/A1 doesn't start and end with the video clips/);
-    expect(() => applyMulti(s, rel, snap)).toThrow(/A1 doesn't start and end/);
-    expect(pieces(s.seq.audioTracks[0])).toEqual([[100, 105, 10], [105, 110, 15]]);
-  });
-});
-
 describe("gcutApplyCutsMulti: stash and rollback safety", () => {
   const stash = (s: ReturnType<typeof multiScene>) => (s.host.ctx as any).$.global.gcutStash;
 
@@ -688,6 +692,7 @@ describe("gcutApplyCutsMulti: stash and rollback safety", () => {
     expect(first).toBeTruthy();
     // Analyse the first pieces of the cut timeline (100–102 s) and apply again; it fails.
     for (const t of [0, 1, 2]) s.seq.videoTracks[t].clips[0].selected = true;
+    s.seq.audioTracks[0].clips[0].selected = true;
     const snap2 = snapshot(s);
     expect(snap2).toMatchObject({ found: true, startTicks: START, problems: [] });
     s.seq.dropSpanIndex = 12; // 12 placements so far: the re-apply's first one silently fails

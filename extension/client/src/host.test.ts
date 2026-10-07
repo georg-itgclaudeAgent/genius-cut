@@ -62,16 +62,25 @@ class ProjectItem {
 }
 
 class TrackItem {
-  start: Time; end: Time; inPoint: Time; outPoint: Time;
+  start: Time; inPoint: Time; outPoint: Time;
+  private _end: Time;
   selected = false; speed = 1; reversed = 0;
   linked: TrackItem[] = [];
   components: any;
   constructor(public track: Track, public projectItem: ProjectItem, startT: number, inS: number, durT: number, public mediaType: string) {
-    this.start = Time.k(startT); this.end = Time.k(startT + durT);
+    this.start = Time.k(startT); this._end = Time.k(startT + durT);
     this.inPoint = Time.s(inS); this.outPoint = Time.s(inS + durT / TICKS);
     const names = mediaType === "Video" ? ["Opacity", "Motion"] : ["Volume", "Channel Volume", "Panner"];
     this.components = Object.assign(names.map((displayName) => ({ displayName })), { numItems: names.length });
   }
+  get end() { return this._end; }
+  /** A trim, as setting `end` is in Premiere: the in point stays, the out point follows. Throws when `seq.endSettable` is off. */
+  set end(v: Time) {
+    if (!this.track.seq.endSettable) throw new Error("end is read-only");
+    this.setEnd(Number(v.ticks));
+  }
+  /** The simulator's own trims (overwrites), never refused. */
+  setEnd(t: number) { this._end = Time.k(t); this.outPoint = Time.s(this.inPoint.seconds + (t - this.start.t) / TICKS); }
   get name() { return this.projectItem.name; }
   isSelected() { return this.selected; }
   getSpeed() { return this.speed; }
@@ -86,7 +95,7 @@ class TrackItem {
   move(offset: Time) {
     if (this.track.locked) throw new Error("Track is locked");
     const all = this.track.seq.moveLinked ? [this, ...this.linked] : [this];
-    for (const it of all) { it.start = Time.k(it.start.t + offset.t); it.end = Time.k(it.end.t + offset.t); }
+    for (const it of all) { it.start = Time.k(it.start.t + offset.t); it.setEnd(it.end.t + offset.t); }
     return 0;
   }
 }
@@ -114,10 +123,10 @@ class Track {
       if (os < startT && oe > endT) { // split: keep left, add right remainder
         const right = new TrackItem(this, o.projectItem, endT, o.inPoint.seconds + (endT - os) / TICKS, oe - endT, o.mediaType);
         this.items.push(right);
-        o.end = Time.k(startT); o.outPoint = Time.s(o.inPoint.seconds + (startT - os) / TICKS);
+        o.setEnd(startT);
         continue;
       }
-      if (os < startT) { o.end = Time.k(startT); o.outPoint = Time.s(o.inPoint.seconds + (startT - os) / TICKS); }
+      if (os < startT) { o.setEnd(startT); }
       else { o.inPoint = Time.s(o.inPoint.seconds + (endT - os) / TICKS); o.start = Time.k(endT); }
     }
     const it = new TrackItem(this, pi, startT, inS, durT, this.kind === "video" ? "Video" : "Audio");
@@ -138,6 +147,7 @@ class Seq {
   audioTrackFor = (videoIndex: number) => videoIndex;
   dropSpanIndex = -1;
   ignoreInOut = false;
+  endSettable = true;
   removeLinked = false;
   moveLinked = false;
   private placements = 0;
@@ -1096,18 +1106,26 @@ describe("audio items and the frame-rate check", () => {
       expect(Math.abs(frames - Math.round(frames))).toBeLessThan(1e-6);
     }
   });
-  it("applies a video item whose frame rate doesn't fit the sequence's (was a refusal)", () => {
+  it("applies a video item whose frame rate doesn't fit the sequence's (was a refusal), on the sequence's frames", () => {
     const s = ntscScene(48000);
     s.cam.mediaFps = 25;
     expect(applyCuts(s, [{ start: 2, end: 3 }])).toMatchObject({ ok: true });
-    const v = s.seq.videoTracks[0].clips;
-    expect(v.numItems).toBe(2);
-    expect(v[1].start.t).toBe(v[0].end.t);
+    const tpf = Math.round(F * TICKS), v = s.seq.videoTracks[0].clips;
+    // The cut is frames 3057–3087: 2997–3057 from frame 300, then 3057–3267 from frame 390.
+    expect(v.map((i: TrackItem) => [i.start.t / tpf, i.end.t / tpf])).toEqual([[2997, 3057], [3057, 3267]]);
+    expect(v[0].inPoint.seconds).toBeCloseTo(300 * F, 6);
+    expect(v[1].inPoint.seconds).toBeCloseTo(390 * F, 6);
   });
 });
 
 describe("a clip whose own frame rate doesn't fit the sequence (cut on timeline time)", () => {
   const SRC_FPS = 17.364, SRC_FRAME = 1 / SRC_FPS; // Checkpoint B: Camera B, variable frame rate
+  const floorSrc = (x: number) => Math.floor(x * SRC_FPS) / SRC_FPS; // where Premiere puts a set point
+  const loosePi = (name: string, node: string) => {
+    const pi = new ProjectItem(name, node, 900, "seconds", false);
+    pi.mediaFps = SRC_FPS; pi.floorToFrames = true;
+    return pi;
+  };
   /** georgScene, with Camera B (V2) at 17.364 fps and Premiere flooring set points to its frames. */
   function looseScene() {
     const s = georgScene();
@@ -1115,6 +1133,7 @@ describe("a clip whose own frame rate doesn't fit the sequence (cut on timeline 
     return s;
   }
   const at = (sec: number) => Math.round(sec * FPS) * TPF; // a whole sequence frame, in ticks
+  const ticks = (t: Track) => t.clips.map((i: TrackItem) => [i.start.t, i.end.t]);
   const stash = (s: ReturnType<typeof georgScene>) => (s.host.ctx as any).$.global.gcutStash;
   const fitting = (s: ReturnType<typeof georgScene>) => {
     expect(span(s.seq.videoTracks[0])).toEqual([[100, 102, 10], [102, 106, 13], [106, 108, 18]]);
@@ -1126,28 +1145,25 @@ describe("a clip whose own frame rate doesn't fit the sequence (cut on timeline 
     expect(span(s.seq.videoTracks[2])).toEqual([[100.28, 110, 5]]);
     expect(span(s.seq.audioTracks[0])).toEqual([[99, 111, 50]]);
     const v2 = s.seq.videoTracks[1].clips;
-    expect(v2.map((i: TrackItem) => [i.start.t, i.end.t])).toEqual([[at(100.24), at(109.84)]]);
-    expect(Math.abs(v2[0].inPoint.seconds - 30)).toBeLessThanOrEqual(SRC_FRAME);
+    expect(ticks(s.seq.videoTracks[1])).toEqual([[at(100.24), at(109.84)]]);
+    expect(v2[0].inPoint.seconds).toBeCloseTo(floorSrc(30), 9); // the original in point, as Premiere floors it
   };
 
-  it("applies, every V2 piece on the sequence's frames, back to back, from within one source frame of its planned in point", () => {
+  it("applies: every V2 piece exactly where planned, back to back, the last ending exactly at its planned end", () => {
     const s = looseScene();
     expect(applyCuts(s, cuts)).toMatchObject({ ok: true, clipCount: 4 });
     const v2 = s.seq.videoTracks[1].clips;
-    expect(v2.map((i: TrackItem) => i.start.t)).toEqual([at(100.24), at(102), at(106)]);
-    for (let i = 1; i < v2.numItems; i++) expect(v2[i].start.t).toBe(v2[i - 1].end.t); // no gaps, no overlaps
+    expect(ticks(s.seq.videoTracks[1])).toEqual([[at(100.24), at(102)], [at(102), at(106)], [at(106), at(107.84)]]);
     [30, 32.76, 37.76].forEach((want, i) => expect(Math.abs(v2[i].inPoint.seconds - want)).toBeLessThanOrEqual(SRC_FRAME));
     fitting(s);
     expect(span(s.seq.videoTracks[3])).toEqual([[112, 115, 0]]);
   });
 
-  it("leaves no gap where Premiere's flooring would make a piece a frame short (laid a frame long, trimmed by the next)", () => {
+  it("leaves no gap where Premiere's flooring would make a piece a frame short", () => {
     // V2's piece 101.00–101.44 (from 30.76 s) floors to 0.40 s when laid exact: a one-frame gap before the next.
     const s = looseScene();
-    expect(applyCuts(s, [{ start: 0.5, end: 1 }, { start: 1.44, end: 2 }])).toMatchObject({ ok: true });
-    const v2 = s.seq.videoTracks[1].clips;
-    expect(v2.map((i: TrackItem) => i.start.t)).toEqual([at(100.24), at(100.5), at(100.94)]);
-    for (let i = 1; i < v2.numItems; i++) expect(v2[i].start.t).toBe(v2[i - 1].end.t);
+    expect(applyCuts(s, [{ start: 0.52, end: 1 }, { start: 1.44, end: 2 }])).toMatchObject({ ok: true });
+    expect(ticks(s.seq.videoTracks[1])).toEqual([[at(100.24), at(100.52)], [at(100.52), at(100.96)], [at(100.96), at(108.8)]]);
   });
 
   it("records which items are loose, with their own frame length, for Restore and Close gap", () => {
@@ -1157,7 +1173,7 @@ describe("a clip whose own frame rate doesn't fit the sequence (cut on timeline 
       .toEqual([["V1", false, 0], ["V2", true, SRC_FRAME], ["V3", false, 0], ["A1", false, 0]]);
   });
 
-  it("Restore puts V2 back at 100.24–109.84, its in point within one source frame of 30", () => {
+  it("Restore puts V2 back at exactly 100.24–109.84, from its original in point", () => {
     const s = looseScene();
     applyCuts(s, cuts);
     expect(s.host.call("gcutRestoreMulti", { startTicks: START })).toEqual({ ok: true });
@@ -1177,7 +1193,114 @@ describe("a clip whose own frame rate doesn't fit the sequence (cut on timeline 
     applyCuts(s, cuts);
     expect(s.host.call("gcutCloseGapMulti", { startTicks: START })).toEqual({ ok: true, movedCount: 1 });
     expect(span(s.seq.videoTracks[3])).toEqual([[110, 113, 0]]);
-    expect(s.seq.videoTracks[1].clips.map((i: TrackItem) => i.start.t)).toEqual([at(100.24), at(102), at(106)]);
+    expect(ticks(s.seq.videoTracks[1])).toEqual([[at(100.24), at(102)], [at(102), at(106)], [at(106), at(107.84)]]);
+  });
+
+  /** Review probes: a loose Camera B on V1 (100–104, from 30.04 s) with an unrecorded clip X right after it (104–107). */
+  function probeScene({ v2 = false, inS = 30.04 } = {}) {
+    const seq = new Seq(2, 1);
+    const v1 = seq.videoTracks[0].add(loosePi("Camera B.mov", "node-b"), 100, inS, inS + 4);
+    seq.videoTracks[0].add(new ProjectItem("X.mov", "node-x", 900, "seconds", false), 104, 0, 3);
+    const a1 = seq.audioTracks[0].add(new ProjectItem("mic.wav", "node-m", 900, "seconds", false), 99, 50, 58);
+    const sel = [v1, a1];
+    if (v2) sel.push(seq.videoTracks[1].add(loosePi("Camera C.mov", "node-c"), 100, 30.16, 36.16));
+    for (const x of sel) x.selected = true;
+    return { seq, host: load(seq) };
+  }
+  const xUntouched = (s: { seq: Seq }) => expect(span(s.seq.videoTracks[0]).at(-1)).toEqual([104, 107, 0]);
+
+  it("probe A: Apply and Restore never touch the clip right after a loose clip, and Restore is exact", () => {
+    const s = probeScene();
+    expect(applyCuts(s, [{ start: 1, end: 2 }])).toMatchObject({ ok: true });
+    expect(ticks(s.seq.videoTracks[0])).toEqual([[at(100), at(101)], [at(101), at(103)], [at(104), at(107)]]);
+    xUntouched(s);
+    expect(s.host.call("gcutRestoreMulti", { startTicks: START })).toEqual({ ok: true });
+    expect(ticks(s.seq.videoTracks[0])).toEqual([[at(100), at(104)], [at(104), at(107)]]);
+    expect(s.seq.videoTracks[0].clips[0].inPoint.seconds).toBeCloseTo(floorSrc(30.04), 9);
+    xUntouched(s);
+  });
+
+  it("Restore re-lays a loose clip from its own original in point, not one snapped to the sequence's frames", () => {
+    // 30.06 s snapped to the 25 fps grid is 30.08 s, which Premiere would floor a whole source frame later.
+    const s = probeScene({ inS: 30.06 });
+    expect(applyCuts(s, [{ start: 1, end: 2 }])).toMatchObject({ ok: true });
+    expect(s.host.call("gcutRestoreMulti", { startTicks: START })).toEqual({ ok: true });
+    expect(ticks(s.seq.videoTracks[0])).toEqual([[at(100), at(104)], [at(104), at(107)]]);
+    expect(s.seq.videoTracks[0].clips[0].inPoint.seconds).toBeCloseTo(floorSrc(30.06), 9);
+    expect(floorSrc(30.06)).not.toBeCloseTo(floorSrc(30.08), 6);
+  });
+
+  it("probe B: an uncut loose clip is re-laid exactly, and a rollback leaves X and every clip exact", () => {
+    const ok = probeScene({ v2: true });
+    expect(applyCuts(ok, [{ start: 5, end: 5.48 }])).toMatchObject({ ok: true });
+    expect(ticks(ok.seq.videoTracks[0])).toEqual([[at(100), at(104)], [at(104), at(107)]]);
+    expect(ticks(ok.seq.videoTracks[1])).toEqual([[at(100), at(105)], [at(105), at(105.52)]]);
+    xUntouched(ok);
+
+    const bad = probeScene({ v2: true });
+    bad.seq.dropSpanIndex = 2; // V1 is one placement, V2's last piece is the third
+    expect(applyCuts(bad, [{ start: 5, end: 5.48 }])).toMatchObject({ ok: false, rolledBack: true });
+    expect(ticks(bad.seq.videoTracks[0])).toEqual([[at(100), at(104)], [at(104), at(107)]]);
+    expect(ticks(bad.seq.videoTracks[1])).toEqual([[at(100), at(106)]]);
+    expect(bad.seq.videoTracks[0].clips[0].inPoint.seconds).toBeCloseTo(floorSrc(30.04), 9);
+    expect(bad.seq.videoTracks[1].clips[0].inPoint.seconds).toBeCloseTo(floorSrc(30.16), 9);
+    expect(span(bad.seq.audioTracks[0])).toEqual([[99, 107, 50]]);
+    xUntouched(bad);
+  });
+
+  describe("in a 30 fps sequence (a source frame is longer than a sequence frame)", () => {
+    const TPF30 = TICKS / 30;
+    function scene30(inS: number) {
+      const seq = new Seq(1, 1);
+      seq.timebase = String(TPF30);
+      const v1 = seq.videoTracks[0].add(loosePi("Camera B.mov", "node-b"), 100, inS, inS + 4);
+      const a1 = seq.audioTracks[0].add(new ProjectItem("mic.wav", "node-m", 900, "seconds", false), 99, 50, 56);
+      v1.selected = true; a1.selected = true;
+      return { seq, host: load(seq) };
+    }
+    const f30 = (sec: number) => Math.round(sec * 30); // a time in whole 30 fps frames
+    const pairs = [
+      [[0.767, 0.867], [1.2, 1.433]], // the review's gap case
+      [[0.5, 0.533], [0.6, 1]], [[1, 1.1], [2.9, 3.033]], [[0.1, 0.2], [3.5, 3.967]],
+    ];
+    const cases = pairs.flatMap((p) => Array.from({ length: 10 }, (_, k) => [30 + k / 30, p] as const));
+
+    it.each(cases)("inS %s, cuts %j: pieces back to back on the planned frames, the last ending at its planned end", (inS, pair) => {
+      const s = scene30(inS);
+      expect(applyCuts(s, pair.map(([a, b]) => ({ start: a, end: b })))).toMatchObject({ ok: true });
+      const cutF = pair.map(([a, b]) => [f30(100 + a), f30(100 + b)]);
+      const removed = cutF.reduce((n, [a, b]) => n + b - a, 0);
+      // Planned: each kept stretch lands at its start less what was cut before it.
+      const kept: number[][] = [];
+      let cursor = 3000;
+      for (const [a, b] of cutF) { if (a > cursor) kept.push([cursor, a]); cursor = b; }
+      kept.push([cursor, 3120]);
+      let gone = 0;
+      const plan = kept.map(([a, b], i) => { if (i) gone += cutF[i - 1][1] - cutF[i - 1][0]; return [a - gone, b - gone, a]; });
+      const v = s.seq.videoTracks[0].clips;
+      expect(v.map((i: TrackItem) => [i.start.t / TPF30, i.end.t / TPF30])).toEqual(plan.map(([a, b]) => [a, b]));
+      expect(v.at(-1).end.t).toBe((3120 - removed) * TPF30);
+      plan.forEach(([, , from], i) => expect(Math.abs(v[i].inPoint.seconds - (inS + (from - 3000) / 30))).toBeLessThanOrEqual(SRC_FRAME + 1e-9));
+    });
+  });
+
+  it.each(["throws", "silently does nothing"])("when setting a piece's end %s, Apply rolls back and says so, every track unchanged", (how) => {
+    const s = scene(); // 24 fps in 25, source points on whole seconds: the originals go back without a trim
+    s.pi.mediaFps = 24; s.pi.floorToFrames = true;
+    const real = Object.getOwnPropertyDescriptor(TrackItem.prototype, "end")!;
+    if (how === "throws") s.seq.endSettable = false;
+    else Object.defineProperty(TrackItem.prototype, "end", { ...real, set() { /* ignored */ } });
+    try {
+      const r = applyCuts(s);
+      expect(r).toMatchObject({ ok: false, rolledBack: true });
+      expect(r.message).toMatch(/Premiere wouldn't trim V1's piece to length\./);
+    } finally {
+      Object.defineProperty(TrackItem.prototype, "end", real);
+    }
+    expect(span(s.seq.videoTracks[0])).toEqual([[100, 110, 10]]);
+    expect(span(s.seq.audioTracks[0])).toEqual([[100, 110, 10]]);
+    expect(s.seq.audioTracks[1].clips.numItems + s.seq.audioTracks[2].clips.numItems).toBe(0);
+    expect([s.pi.inS, s.pi.outS]).toEqual([2, 58]);
   });
 });
 

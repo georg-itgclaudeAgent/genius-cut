@@ -366,8 +366,8 @@ function gcutRefind(seq, spec, clock) {
 }
 
 /**
- * Extra tolerance, in seconds, for a recorded item's source points and piece lengths: one of its
- * own frames for a loose item (Premiere floors set points to them), none for any other.
+ * Extra tolerance, in seconds, for a recorded item's source points: one of its own frames for a
+ * loose item (Premiere floors set points to them), none for any other. Lengths stay exact.
  */
 function gcutSlackS(f) { return f.loose ? f.mediaFrameS : 0; }
 
@@ -422,9 +422,8 @@ function gcutAtPlanned(items, plan, kind, trackIndex, it, clock) {
     var s = gcutT(it.start), d = gcutT(it.end) - s, n = gcutNode(it);
     for (var k = 0; k < items.length; k++) {
         if (items[k].kind !== kind || items[k].trackIndex !== trackIndex || items[k].node !== n) continue;
-        var durTol = clock.half + gcutSlackS(items[k]) * GCUT_TICKS;
         for (var p = 0; p < plan[k].length; p++) {
-            if (gcutNear(s, plan[k][p].atT, clock.half) && gcutNear(d, plan[k][p].durT, durTol)) return true;
+            if (gcutNear(s, plan[k][p].atT, clock.half) && gcutNear(d, plan[k][p].durT, clock.half)) return true;
         }
     }
     return false;
@@ -492,9 +491,13 @@ function gcutItemPieces(item, cutsT, srcFrameS) {
     return out;
 }
 
-/** An item laid whole at its own original place, from its own in point (Restore and rollback). */
+/**
+ * An item laid whole at its own original place, from its own in point (Restore and rollback). A
+ * loose item's in point is used as it is: it isn't on the sequence grid its pieces snap to.
+ */
 function gcutWhole(f) {
-    return [{ fromT: f.startT, durT: f.endT - f.startT, atT: f.startT, srcIn: Math.round(f.inS / f.srcFrameS) * f.srcFrameS }];
+    var srcIn = f.loose ? f.inS : Math.round(f.inS / f.srcFrameS) * f.srcFrameS;
+    return [{ fromT: f.startT, durT: f.endT - f.startT, atT: f.startT, srcIn: srcIn }];
 }
 
 /**
@@ -579,33 +582,72 @@ function gcutRemoveRange(seq, nodes, fromT, toT, clock, keep) {
 /**
  * Lay one recorded item's pieces ({durT, atT, srcIn}) on its own track, from its own source.
  * Pieces never reach outside the item's own [new start, original end], which the caller clears.
- * A loose item's set points land up to one of its own frames early, so a piece could come out a
- * frame short and leave a gap: every piece but its last is laid a sequence frame long, and the
- * next piece's overwrite trims it back exactly. The last is laid exact.
+ *
+ * A loose item's set points land up to one of its own frames early, so its pieces come out up to
+ * a source frame long or short. Each is laid off-length on purpose, then its end is set to the
+ * planned end (gcutTrimTo), so it ends up exact:
+ *   - long (out + at least one source frame, in whole sequence frames) when what spills past the
+ *     planned end stays before the item's LAST planned end, so the later pieces (and their linked
+ *     audio, which a trim of the video leaves long) overwrite it; then trimmed back;
+ *   - otherwise short (out set to the in point Premiere took + the length, which it floors), and
+ *     extended: overwriting past the last planned end could take the head of the next clip, which
+ *     no trim gives back. The last piece, and an item laid whole (Restore, rollback), always are.
  */
 function gcutLayItem(seq, f, pieces, clock) {
     var track = gcutKindTracks(seq, f.kind)[f.trackIndex], tolS = clock.frameS / 2 + gcutSlackS(f);
+    var overT = f.loose ? Math.max(1, Math.ceil(f.mediaFrameS / clock.frameS - 1e-9)) * clock.tpf : 0;
+    var lastEndT = pieces.length ? pieces[pieces.length - 1].atT + pieces[pieces.length - 1].durT : 0;
     for (var p = 0; p < pieces.length; p++) {
         // srcIn is already on the source frame grid (Premiere rounds set points down to it); a
         // quarter frame later is the fallback when floating-point error rounds it a frame low.
-        var srcIn = pieces[p].srcIn, srcOut = srcIn + pieces[p].durT / GCUT_TICKS, nudge = f.srcFrameS / 4;
-        if (f.loose && p < pieces.length - 1) srcOut += clock.frameS;
+        var srcIn = pieces[p].srcIn, endT = pieces[p].atT + pieces[p].durT, nudge = f.srcFrameS / 4;
+        var spill = f.loose && endT + overT + f.mediaFrameS * GCUT_TICKS <= lastEndT;
+        var srcOut = srcIn + (pieces[p].durT + (spill ? overT : 0)) / GCUT_TICKS;
         try { gcutSetRange(f.pi, srcIn, srcOut, tolS); }
         catch (rangeErr) { gcutSetRange(f.pi, srcIn + nudge, srcOut + nudge, tolS); }
+        if (f.loose && !spill) {
+            var shortOut = f.pi.getInPoint().seconds + pieces[p].durT / GCUT_TICKS;
+            if (f.pi.getOutPoint().seconds > shortOut && !gcutSetOne(f.pi, "out", shortOut, tolS)) {
+                throw new Error("Premiere didn't accept the source out point " + shortOut.toFixed(3) + " s.");
+            }
+        }
         track.overwriteClip(f.pi, String(pieces[p].atT));
+        if (f.loose) gcutTrimTo(track, f, pieces[p].atT, endT, clock);
     }
 }
 
-/** null if every piece of `f` sits where planned; otherwise what's wrong. */
+/** The clip of `f`'s source starting at atT on this track, or null. */
+function gcutLaidAt(track, f, atT, clock) {
+    var items = gcutItems(track);
+    for (var i = 0; i < items.length; i++) if (gcutNode(items[i]) === f.node && gcutNear(gcutT(items[i].start), atT, clock.half)) return items[i];
+    return null;
+}
+
+/**
+ * Set the end of the piece just laid at atT to endT (a loose item's trim or extension). A piece
+ * that isn't there is left to gcutVerifyItems; one whose end won't take fails the edit.
+ */
+function gcutTrimTo(track, f, atT, endT, clock) {
+    var it = gcutLaidAt(track, f, atT, clock);
+    if (!it || gcutNear(gcutT(it.end), endT, clock.half)) return;
+    try { it.end = gcutTimeFromTicks(endT); } catch (e) { it = null; }
+    if (it) it = gcutLaidAt(track, f, atT, clock); // read back afresh
+    if (!it || !gcutNear(gcutT(it.end), endT, clock.half)) throw new Error("Premiere wouldn't trim " + f.label + "'s piece to length.");
+}
+
+/**
+ * null if every piece of `f` sits where planned; otherwise what's wrong. Start and length are
+ * exact for every item (to half a sequence frame); a loose item's in point may sit up to one of
+ * its own frames early, where Premiere floored it.
+ */
 function gcutVerifyItems(seq, f, pieces, clock) {
-    var items = gcutItems(gcutKindTracks(seq, f.kind)[f.trackIndex]);
-    var slackS = gcutSlackS(f), durTol = clock.half + slackS * GCUT_TICKS, inTolS = clock.frameS / 2 + slackS;
+    var items = gcutItems(gcutKindTracks(seq, f.kind)[f.trackIndex]), inTolS = clock.frameS / 2 + gcutSlackS(f);
     for (var p = 0; p < pieces.length; p++) {
         var ok = 0;
         for (var i = 0; i < items.length; i++) {
             var v = items[i];
             if (gcutNode(v) === f.node && gcutNear(gcutT(v.start), pieces[p].atT, clock.half) &&
-                gcutNear(gcutT(v.end) - gcutT(v.start), pieces[p].durT, durTol) &&
+                gcutNear(gcutT(v.end) - gcutT(v.start), pieces[p].durT, clock.half) &&
                 gcutNear(v.inPoint.seconds, pieces[p].srcIn, inTolS)) ok++;
         }
         if (ok !== 1) return "Kept span " + (p + 1) + " of " + pieces.length + " on " + f.label + " didn't land where or as expected.";

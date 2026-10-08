@@ -107,7 +107,7 @@ export const mockHost: Host = {
     const gone = removed.reduce((a, s) => a + (s.end - s.start), 0);
     const expected = snap.durationS - gone;
     return { ok: true, appliedCount: removed.length, clipCount: snap.video.length + snap.audio.length, expectedDuration: expected, actualDuration: expected,
-      trailingGapS: gone };
+      trailingGapS: gone, crossfades: removed.length * snap.audio.length };
   },
   async closeGap() { await delay(300); },
   async restore() { await delay(500); },

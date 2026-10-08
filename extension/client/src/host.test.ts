@@ -1748,14 +1748,14 @@ describe("measured in Premiere 26.5.2: classify by EXACT frame rate, audio follo
     it("the field's 20 s copies and cuts: Apply lays every track exactly with no camera sound left; Restore puts every clip back exactly", () => {
       const s = field(20), snap = snapshot(s);
       expect(applyCuts(s, cutsOf(FIELD), snap)).toMatchObject({ ok: true, clipCount: 4, crossfades: 3 }); // A1's 3 cuts
-      expect(s.seq.audioTracks[0].items.filter((c) => c.transitions.length).map((c) => c.start.t / TPF30).sort((a, b) => a - b)).toEqual([60, 180, 294]);
+      expect(s.seq.audioTracks[0].items.filter((c: TrackItem) => c.transitions.length).map((c: TrackItem) => c.start.t / TPF30).sort((a: number, b: number) => a - b)).toEqual([60, 180, 294]);
       expectLayout(s, toF(FIELD));
       backToBack(s);
       noStrays(s);
       expect(s.host.call("gcutRestoreMulti", { startTicks: snap.startTicks })).toEqual({ ok: true });
       expectOriginal(s);
       noStrays(s);
-      expect(s.seq.audioTracks[0].items.flatMap((c) => c.transitions)).toEqual([]);
+      expect(s.seq.audioTracks[0].items.flatMap((c: TrackItem) => c.transitions)).toEqual([]);
     });
 
     it.each(cases)("120 s clips, cuts %j: Apply lays every track exactly with no camera sound left; Restore puts every clip back exactly", (...c) => {

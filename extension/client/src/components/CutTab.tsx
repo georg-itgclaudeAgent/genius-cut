@@ -37,6 +37,12 @@ export function offersRestore(outcome: unknown): boolean {
   return r.ok === false && r.rolledBack === false;
 }
 
+/** The lines under "Applied and verified": how many cuts were crossfaded, and the host's warning, if any. */
+export function appliedNotes(r: ApplyResult): { crossfaded: string | null; warning: string | null } {
+  const n = r.crossfades ?? 0;
+  return { crossfaded: n > 0 ? `Crossfaded ${n} ${n === 1 ? "cut" : "cuts"}` : null, warning: r.warning ?? null };
+}
+
 function Telemetry({ device }: { device: string }) {
   const gpu = device === "cuda";
   return (
@@ -254,6 +260,8 @@ export function CutTab({ health, ready, onTrimmed }: {
                 <span className="to">{formatDuration(phase.result.actualDuration)}</span>
                 <span style={{ marginLeft: "auto", color: "var(--blue)" }}>{phase.result.appliedCount} spans rebuilt in {phase.result.clipCount} {phase.result.clipCount === 1 ? "clip" : "clips"}</span>
               </div>
+              {appliedNotes(phase.result).crossfaded && <div className="muted" style={{ marginTop: 6 }}>{appliedNotes(phase.result).crossfaded}</div>}
+              {appliedNotes(phase.result).warning && <div className="note" style={{ marginTop: 6 }}>{appliedNotes(phase.result).warning}</div>}
             </div>
             {phase.result.trailingGapS > 0.01 && (
               <div className="sec">

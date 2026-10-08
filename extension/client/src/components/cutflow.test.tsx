@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import { AudioPicker } from "./AudioPicker";
-import { offersRestore } from "./CutTab";
+import { appliedNotes, offersRestore } from "./CutTab";
 import { mockHost } from "../api/mock";
 import { audioChoice, audioKey } from "../lib/snapshot";
 import type { Snapshot, SnapshotItem } from "../api/types";
@@ -50,5 +50,21 @@ describe("sample data", () => {
     expect(snap.audio.map((a) => [a.label, a.name])).toEqual([["A1", "wide.mov"], ["A2", "lav.wav"]]);
     expect(snap.video).toHaveLength(3);
     expect(audioChoice(snap, null)).toEqual({ kind: "ask", preselect: null });
+  });
+});
+
+describe("the applied summary (clean cuts)", () => {
+  const done = { ok: true, appliedCount: 3, clipCount: 4, expectedDuration: 8, actualDuration: 8, trailingGapS: 2 };
+  it("says how many cuts were crossfaded", () => {
+    expect(appliedNotes({ ...done, crossfades: 6 })).toEqual({ crossfaded: "Crossfaded 6 cuts", warning: null });
+    expect(appliedNotes({ ...done, crossfades: 1 }).crossfaded).toBe("Crossfaded 1 cut");
+  });
+  it("says nothing about crossfades when there were none (or an older host didn't say)", () => {
+    expect(appliedNotes({ ...done, crossfades: 0 })).toEqual({ crossfaded: null, warning: null });
+    expect(appliedNotes(done)).toEqual({ crossfaded: null, warning: null });
+  });
+  it("shows the host's warning when some couldn't be added", () => {
+    expect(appliedNotes({ ...done, crossfades: 4, warning: "Couldn't add 2 crossfades; the cuts are in place." }))
+      .toEqual({ crossfaded: "Crossfaded 4 cuts", warning: "Couldn't add 2 crossfades; the cuts are in place." });
   });
 });

@@ -19,6 +19,10 @@ export interface ApplyResult {
   expectedDuration: number;
   actualDuration: number;
   trailingGapS: number;
+  /** On success: how many cuts in the recorded audio got a short crossfade (hosts before clean cuts don't say). */
+  crossfades?: number;
+  /** On success: what didn't fully work but left the edit in place (crossfades that couldn't be added). */
+  warning?: string;
   /** On failure: true if the host already put the original clip back. */
   rolledBack?: boolean;
   message?: string;

@@ -80,6 +80,8 @@ class TrackItem {
   trueIn: Time;
   private _end: Time;
   selected = false; speed = 1; reversed = 0;
+  /** Transitions added through QE at this clip's start; they go when the clip goes (measured). */
+  transitions: { applyToStart: boolean; duration: string; offset: string; alignment: number }[] = [];
   linked: TrackItem[] = [];
   components: any;
   constructor(public track: Track, public projectItem: ProjectItem, startT: number, inS: number, durT: number, public mediaType: string) {
@@ -156,7 +158,7 @@ class Track {
         continue;
       }
       if (os < startT) { o.setEnd(startT); }
-      else { o.trueIn = Time.s(o.trueIn.seconds + (endT - os) / TICKS); o.start = Time.k(endT); }
+      else { o.trueIn = Time.s(o.trueIn.seconds + (endT - os) / TICKS); o.start = Time.k(endT); o.transitions = []; }
     }
     const it = new TrackItem(this, pi, startT, inS, durT, this.kind === "video" ? "Video" : "Audio");
     this.items.push(it);
@@ -218,8 +220,43 @@ function wav(name: string, nodeId: string, durationS: number) {
   return pi;
 }
 
-function load(seq: Seq) {
+/**
+ * The QE DOM as measured in Premiere 26.5.2 (2026-10-08): app.enableQE() defines `qe`; an audio track lists its
+ * items in order with gaps as "Empty" items (item.start.secs, item.type, item.name); a clip's addTransition with
+ * applyToStart=true puts a transition at its start, counted in track.numTransitions; removing the clip removes it.
+ * `transition: false` models Premiere not finding "Constant Power"; `throws` an addTransition that throws.
+ */
+class FakeQE {
+  transition = true;
+  throws = false;
+  constructor(public seq: Seq) {}
+  project = {
+    getActiveSequence: () => ({ getAudioTrackAt: (i: number) => this.track(this.seq.audioTracks[i]) }),
+    getAudioTransitionByName: (name: string) => (this.transition && name === "Constant Power" ? { name } : null),
+  };
+  private track(t: Track) {
+    const items: any[] = [];
+    let cursor = 0;
+    for (const c of t.clips as TrackItem[]) {
+      if (c.start.t > cursor) items.push({ type: "Empty", name: "", start: { secs: cursor / TICKS } });
+      items.push({
+        type: "Clip", name: c.name, start: { secs: c.start.seconds },
+        addTransition: (x: any, applyToStart: boolean, duration: string, offset: string, alignment: number) => {
+          if (this.throws || !x) throw new Error("addTransition failed");
+          c.transitions.push({ applyToStart, duration, offset, alignment });
+          return true;
+        },
+      });
+      cursor = c.end.t;
+    }
+    return { numItems: items.length, getItemAt: (i: number) => items[i], get numTransitions() { return t.items.reduce((n, c) => n + c.transitions.length, 0); } };
+  }
+}
+
+function load(seq: Seq, { qe = true } = {}) {
+  const fakeQe = new FakeQE(seq);
   const sandbox: any = { app: { project: { activeSequence: seq } }, Time, $: { global: {} } };
+  if (qe) sandbox.app.enableQE = () => { sandbox.qe = fakeQe; };
   const ctx = vm.createContext(sandbox);
   vm.runInContext("delete this.JSON;", ctx); // ExtendScript has no JSON
   vm.runInContext(HOST_SRC, ctx);
@@ -228,7 +265,7 @@ function load(seq: Seq) {
     if (out.startsWith("Error:")) throw new Error(out.slice(6).trim());
     return JSON.parse(out); // the panel parses with native JSON, so the tests do too
   };
-  return { ctx, call };
+  return { ctx, call, qe: fakeQe };
 }
 
 /** One interview clip on V1 + A1: source 10–20 s, placed at 100 s. Bin marks 2–58 s. */
@@ -1710,13 +1747,15 @@ describe("measured in Premiere 26.5.2: classify by EXACT frame rate, audio follo
 
     it("the field's 20 s copies and cuts: Apply lays every track exactly with no camera sound left; Restore puts every clip back exactly", () => {
       const s = field(20), snap = snapshot(s);
-      expect(applyCuts(s, cutsOf(FIELD), snap)).toMatchObject({ ok: true, clipCount: 4 });
+      expect(applyCuts(s, cutsOf(FIELD), snap)).toMatchObject({ ok: true, clipCount: 4, crossfades: 3 }); // A1's 3 cuts
+      expect(s.seq.audioTracks[0].items.filter((c) => c.transitions.length).map((c) => c.start.t / TPF30).sort((a, b) => a - b)).toEqual([60, 180, 294]);
       expectLayout(s, toF(FIELD));
       backToBack(s);
       noStrays(s);
       expect(s.host.call("gcutRestoreMulti", { startTicks: snap.startTicks })).toEqual({ ok: true });
       expectOriginal(s);
       noStrays(s);
+      expect(s.seq.audioTracks[0].items.flatMap((c) => c.transitions)).toEqual([]);
     });
 
     it.each(cases)("120 s clips, cuts %j: Apply lays every track exactly with no camera sound left; Restore puts every clip back exactly", (...c) => {
@@ -1943,5 +1982,82 @@ describe("measured in Premiere 26.5.2: a file's picture and sound land together,
     expect(span(s.seq.audioTracks[0])).toEqual([[99, 111, 50]]);
     expect(span(s.seq.videoTracks[1])).toEqual([[100.24, 109.84, 30]]);
     expect(s.seq.audioTracks[1].clips.numItems + s.seq.audioTracks[2].clips.numItems).toBe(0);
+  });
+});
+
+describe("clean cuts: a 2-frame Constant Power crossfade at every internal cut of the recorded audio (QE, measured)", () => {
+  /** [clip start, applyToStart, duration, offset, alignment] for every transition on the track. */
+  const fades = (t: Track) => (t.clips as TrackItem[]).flatMap((c) => c.transitions.map((x) => [+c.start.seconds.toFixed(3), x.applyToStart, x.duration, x.offset, x.alignment]));
+  const CENTRED = [true, "00:00:00:02", "00:00:00:00", 0.5];
+  const noVideoFades = (seq: Seq) => {
+    for (let t = 0; t < seq.videoTracks.numTracks; t++) expect(fades(seq.videoTracks[t])).toEqual([]);
+  };
+
+  it("crossfades each audio piece's start except the item's first, centred, 2 frames; video gets none", () => {
+    const s = multiScene({ music: false });
+    const r = applyCuts(s);
+    expect(r).toMatchObject({ ok: true, crossfades: 2 });
+    expect(r.warning).toBeUndefined();
+    expect(fades(s.seq.audioTracks[0])).toEqual([[102, ...CENTRED], [106, ...CENTRED]]);
+    noVideoFades(s.seq);
+  });
+
+  it("Georg's mic.wav running past the clips: crossfades at the two cuts, not at its first piece", () => {
+    const s = georgScene();
+    expect(applyCuts(s, cuts)).toMatchObject({ ok: true, crossfades: 2 });
+    expect(fades(s.seq.audioTracks[0])).toEqual([[102, ...CENTRED], [106, ...CENTRED]]);
+    noVideoFades(s.seq);
+  });
+
+  it("a single cut: one crossfade, on the audio only", () => {
+    const s = georgScene();
+    expect(applyCuts(s, [{ start: 0.04, end: 0.2 }])).toMatchObject({ ok: true, crossfades: 1 }); // 100.04-100.2
+    expect(fades(s.seq.audioTracks[0]).map((x) => x[0])).toEqual([100.04]);
+  });
+
+  it("Restore leaves no transition behind (they go with the clips), and every clip is back exactly", () => {
+    const s = multiScene({ music: false });
+    expect(applyCuts(s)).toMatchObject({ ok: true, crossfades: 2 });
+    expect(restoreMulti(s)).toEqual({ ok: true });
+    expect(fades(s.seq.audioTracks[0])).toEqual([]);
+    for (const [t, inS] of [[0, 10], [1, 12], [2, 5]] as const) expect(pieces(s.seq.videoTracks[t])).toEqual([[100, 110, inS]]);
+    expect(pieces(s.seq.audioTracks[0])).toEqual([[100, 110, 10]]);
+  });
+
+  it("a failed Apply adds none, and rolls back exactly", () => {
+    const s = multiScene({ music: false });
+    s.seq.dropSpanIndex = 4;
+    expect(applyCuts(s)).toMatchObject({ ok: false, rolledBack: true });
+    expect(fades(s.seq.audioTracks[0])).toEqual([]);
+    expect(pieces(s.seq.audioTracks[0])).toEqual([[100, 110, 10]]);
+  });
+
+  it.each([
+    ["QE isn't available", (s: ReturnType<typeof multiScene>) => { delete (s.host.ctx as any).app.enableQE; }],
+    ["Premiere has no Constant Power transition", (s: ReturnType<typeof multiScene>) => { s.host.qe.transition = false; }],
+    ["addTransition throws", (s: ReturnType<typeof multiScene>) => { s.host.qe.throws = true; }],
+  ])("when %s, Apply still succeeds with the cuts in place and says how many crossfades it couldn't add", (_, breakIt) => {
+    const s = multiScene({ music: false });
+    breakIt(s);
+    const r = applyCuts(s);
+    expect(r).toMatchObject({ ok: true, clipCount: 4, crossfades: 0, warning: "Couldn't add 2 crossfades; the cuts are in place." });
+    expect(pieces(s.seq.audioTracks[0])).toEqual([[100, 102, 10], [102, 106, 13], [106, 108, 18]]);
+    expect(pieces(s.seq.videoTracks[0])).toEqual([[100, 102, 10], [102, 106, 13], [106, 108, 18]]);
+    expect(restoreMulti(s)).toEqual({ ok: true });
+  });
+
+  it("counts only the crossfades Premiere really added (one that adds nothing is reported as not added)", () => {
+    const s = multiScene({ music: false });
+    const real = s.host.qe.project.getActiveSequence;
+    s.host.qe.project.getActiveSequence = () => {
+      const q = real();
+      return { getAudioTrackAt: (i: number) => {
+        const t = q.getAudioTrackAt(i);
+        // The clip after the first cut (102 s) says yes but nothing appears.
+        const item = (k: number) => { const it = t.getItemAt(k); return it.type === "Clip" && Math.abs(it.start.secs - 102) < 1e-6 ? { ...it, addTransition: () => true } : it; };
+        return { numItems: t.numItems, getItemAt: item, get numTransitions() { return t.numTransitions; } };
+      } };
+    };
+    expect(applyCuts(s)).toMatchObject({ ok: true, crossfades: 1, warning: "Couldn't add 1 crossfade; the cuts are in place." });
   });
 });

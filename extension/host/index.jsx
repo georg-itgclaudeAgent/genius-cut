@@ -956,6 +956,58 @@ function gcutRelay(seq, items, plan, clock, others) {
     }
 }
 
+// ── clean cuts: a short crossfade at every cut in the recorded audio ───────────────
+
+var GCUT_CROSSFADE = "Constant Power";
+var GCUT_CROSSFADE_FRAMES = "00:00:00:02"; // 2 frames, centred on the cut
+
+/**
+ * Add a 2-frame Constant Power crossfade, centred, at every internal cut of every recorded audio
+ * item (each piece's start but the item's first), through QE as measured in Premiere 26.5.2: the
+ * transition goes on the clip AFTER the cut (applyToStart), and removing the clip removes it, so
+ * Restore and a rollback need nothing. Runs only after Apply verified; it never throws and never
+ * changes a clip: anything unavailable is skipped. A crossfade counts as added only if the track's
+ * transition count went up. Returns { added, wanted }.
+ */
+function gcutCrossfades(seq, found, plan, clock) {
+    var wanted = 0, added = 0, i, p;
+    for (i = 0; i < found.length; i++) if (found[i].kind === "audio" && plan[i].length > 1) wanted += plan[i].length - 1;
+    if (!wanted) return { added: 0, wanted: 0 };
+    var qseq = null, fade = null;
+    try {
+        app.enableQE();
+        qseq = qe.project.getActiveSequence();
+        fade = qe.project.getAudioTransitionByName(GCUT_CROSSFADE);
+    } catch (e) { return { added: 0, wanted: wanted }; }
+    if (!qseq || !fade) return { added: 0, wanted: wanted };
+    for (i = 0; i < found.length; i++) {
+        if (found[i].kind !== "audio") continue;
+        var qt = null;
+        try { qt = qseq.getAudioTrackAt(found[i].trackIndex); } catch (e2) { qt = null; }
+        if (!qt) continue;
+        for (p = 1; p < plan[i].length; p++) {
+            try {
+                var at = gcutQeClipAt(qt, plan[i][p].atT, clock);
+                if (!at) continue;
+                var before = Number(qt.numTransitions);
+                at.addTransition(fade, true, GCUT_CROSSFADE_FRAMES, "00:00:00:00", 0.5, false, true);
+                var after = Number(qt.numTransitions);
+                if (isFinite(before) && isFinite(after) ? after > before : true) added++;
+            } catch (e3) { /* skipped: reported in the count */ }
+        }
+    }
+    return { added: added, wanted: wanted };
+}
+
+/** The QE clip on this QE track starting at atT (to half a frame), or null. */
+function gcutQeClipAt(qt, atT, clock) {
+    for (var k = 0; k < qt.numItems; k++) {
+        var it = qt.getItemAt(k);
+        if (it && it.type === "Clip" && gcutNear(Number(it.start.secs) * GCUT_TICKS, atT, clock.half)) return it;
+    }
+    return null;
+}
+
 /**
  * spec: { sequenceId, startTicks, endTicks, items: [{kind, trackIndex, startTicks, endTicks}],
  *         cuts: [{start, end}] } — the gcutSnapshotSelection record (startTicks/endTicks are the
@@ -1020,8 +1072,13 @@ function gcutApplyCutsMulti(specJson) {
             var hit = gcutSnapshotIntact(seq, others, clock);
             if (hit) throw new Error("The rebuild overwrote something on " + hit + ".");
             var keptS = (endT - startT - removedT) / GCUT_TICKS; // the range, once the cuts are out
+            // Verified: the edit stands whatever happens next. Crossfades are a finish on top.
+            var fades = { added: 0, wanted: 0 };
+            try { fades = gcutCrossfades(seq, found, plan, clock); } catch (fadeErr) { fades = { added: 0, wanted: 0 }; }
+            var missed = fades.wanted - fades.added;
             return gcutOk({ ok: true, appliedCount: cutsT.length, clipCount: found.length,
-                expectedDuration: keptS, actualDuration: keptS, trailingGapS: removedT / GCUT_TICKS });
+                expectedDuration: keptS, actualDuration: keptS, trailingGapS: removedT / GCUT_TICKS, crossfades: fades.added,
+                warning: missed > 0 ? "Couldn't add " + missed + " crossfade" + (missed === 1 ? "" : "s") + "; the cuts are in place." : undefined });
         } catch (inner) {
             var back = false;
             try { back = gcutRelayAll(seq, rec, clock, others); } catch (ignored) { back = false; }

@@ -32,11 +32,26 @@ def fake_extract(media_path, in_s, out_s, out_dir=None):
     return out
 
 
-REQ = TrimRequest(media_path="C:/footage/take3.mp4", in_s=10.0, out_s=14.0, clip_start_s=100.0, prompt="trim it")
+# These tests are about Claude's cuts and the clock mapping; pause cuts are tested separately.
+REQ = TrimRequest(media_path="C:/footage/take3.mp4", in_s=10.0, out_s=14.0, clip_start_s=100.0, prompt="trim it",
+                  cut_pauses=False)
+
+
+def as_proposed(cuts, words, duration, env=None):
+    return cuts
 
 
 def run(tmp_path, cuts=CUTS):
-    return trim.run_trim(REQ, FakeTranscriber(), tmp_path, propose=lambda w, f, i: cuts, extract=fake_extract)
+    # Edge refinement (boundaries.refine) is tested on its own; these tests pin the clock mapping.
+    return trim.run_trim(REQ, FakeTranscriber(), tmp_path, propose=lambda w, f, i: cuts, extract=fake_extract,
+                         refine=as_proposed)
+
+
+def test_by_default_proposed_cuts_are_widened_to_the_gap_around_them(tmp_path):
+    # Whisper's filler timings are loose (Checkpoint B): the "um," at 0.5-0.8 owns the gap 0.3-1.0.
+    r = trim.run_trim(REQ, FakeTranscriber(), tmp_path, propose=lambda w, f, i: CUTS[:1], extract=fake_extract)
+    assert [(c.start, c.end) for c in r.cuts] == [(0.35, 0.95)]
+    assert [(s.start, s.end) for s in r.kept_spans_source] == [(10.0, 10.35), (10.95, 14.0)]
 
 
 def test_kept_spans_are_the_complement_of_the_cuts_in_source_time(tmp_path):
@@ -47,7 +62,7 @@ def test_kept_spans_are_the_complement_of_the_cuts_in_source_time(tmp_path):
 def test_kept_spans_sum_to_span_minus_cut_total(tmp_path):
     r = run(tmp_path)
     kept = sum(s.end - s.start for s in r.kept_spans_source)
-    assert kept == pytest.approx((REQ.out_s - REQ.in_s) - (0.3 + 0.2))
+    assert kept == pytest.approx(REQ.duration_s - (0.3 + 0.2))
 
 
 def test_sequence_time_is_clip_start_plus_word_time_with_no_in_point_term(tmp_path):
@@ -89,7 +104,8 @@ def test_trim_endpoint_returns_words_cuts_and_kept_spans(tmp_path):
     assert r.status_code == 200, r.text
     body = r.json()
     assert len(body["words"]) == 5 and len(body["cuts"]) == 2
-    assert body["kept_spans_source"][0] == {"start": 10.0, "end": 10.5}
+    # "um," (0.5-0.8) is widened to its gap, keeping 0.05 s after "So," (ends 0.3).
+    assert body["kept_spans_source"][0] == {"start": 10.0, "end": 10.35}
 
 
 def test_trim_while_the_model_is_still_loading_is_503(tmp_path):
@@ -124,3 +140,96 @@ def test_missing_api_key_is_a_clear_error_not_a_500(tmp_path):
     r = TestClient(app, base_url="http://127.0.0.1:8791").post("/trim", json=REQ.model_dump(), headers={"Authorization": f"Bearer {token}"})
     assert r.status_code == 503
     assert "ANTHROPIC_API_KEY" in r.json()["detail"]
+
+
+# ── pause cuts ─────────────────────────────────────────────────────
+
+PAUSEY = [Word(w="So", start=0.1, end=0.4), Word(w="right.", start=0.5, end=0.9),
+          Word(w="Anyway", start=3.3, end=3.8)]
+
+
+class PauseyTranscriber(FakeTranscriber):
+    def transcribe(self, wav):
+        return PAUSEY
+
+
+def test_trim_adds_pause_cuts_alongside_claudes(tmp_path):
+    r = trim.run_trim(TrimRequest(**{**REQ.model_dump(), "cut_pauses": True}), PauseyTranscriber(), tmp_path,
+                      propose=lambda w, f, i: [], extract=fake_extract)
+    assert [(c.start, c.end, c.reason) for c in r.cuts] == [(1.15, 3.05, "pause")]
+    assert [(s.start, s.end) for s in r.kept_spans_source][-1] == (13.05, 14.0)
+
+
+def test_trim_can_switch_pause_cuts_off(tmp_path):
+    req = TrimRequest(**{**REQ.model_dump(), "cut_pauses": False})
+    r = trim.run_trim(req, PauseyTranscriber(), tmp_path, propose=lambda w, f, i: [], extract=fake_extract)
+    assert r.cuts == []
+
+
+def test_a_minimum_pause_too_short_for_breathing_room_is_a_422(tmp_path):
+    c, auth = api(tmp_path, FakeTranscriber())
+    r = c.post("/trim", json={**REQ.model_dump(), "cut_pauses": True, "min_pause_s": 0.3}, headers=auth)
+    assert r.status_code == 422
+
+
+def _health(tmp_path, device, phase):
+    app = create_app(token=get_or_create_token(tmp_path), stt_device=lambda: device, stt_phase=lambda: phase,
+                     library_dir=tmp_path / "library")
+    return TestClient(app, base_url="http://127.0.0.1:8791").get("/health").json()
+
+
+def test_health_says_whether_the_speech_model_is_loading_or_downloading(tmp_path):
+    # The panel said "the first start downloads about 3 GB" every time; a cached model only loads.
+    assert _health(tmp_path, "loading", "loading")["stt_phase"] == "loading"
+    assert _health(tmp_path, "loading", "downloading")["stt_phase"] == "downloading"
+    assert "stt_phase" not in _health(tmp_path, "cuda", None)
+
+
+def test_the_loader_reports_downloading_only_for_a_model_that_isnt_cached(monkeypatch):
+    import server
+    from geniuscut import stt
+    monkeypatch.setattr(stt, "cuda_runtime_available", lambda: True)
+    monkeypatch.setattr(stt, "model_is_cached", lambda name: name == "large-v3")
+    monkeypatch.delenv("GENIUSCUT_WHISPER_MODEL", raising=False)
+    assert server.load_phase() == "loading"
+    monkeypatch.setattr(stt, "model_is_cached", lambda name: False)
+    assert server.load_phase() == "downloading"
+
+
+def test_health_reports_the_api_version_and_process_id(tmp_path):
+    # The panel restarts a backend left running from an older version (Checkpoint B, 2026-10-08:
+    # a day-old backend answered the new panel's requests with "Field required" x4).
+    import os
+    from geniuscut import config
+    body = _health(tmp_path, "cuda", None)
+    assert body["api"] == config.API_VERSION and isinstance(body["api"], int)
+    assert body["pid"] == os.getpid()
+
+
+# ── frame_s: edges on the sequence's frames (clean cuts) ────────────
+
+def test_with_frame_s_every_cut_edge_lands_on_the_sequences_frames(tmp_path):
+    req = TrimRequest(**{**REQ.model_dump(), "frame_s": 0.12})
+    r = trim.run_trim(req, FakeTranscriber(), tmp_path, propose=lambda w, f, i: CUTS, extract=fake_extract, refine=as_proposed)
+    # Nearest boundary that still removes the whole word and stays out of its neighbours.
+    assert [(c.start, c.end) for c in r.cuts] == [(0.48, 0.84), (1.92, 2.28)]
+    assert [(s.start, s.end) for s in r.kept_spans_source] == [(10.0, 10.48), (10.84, 11.92), (12.28, 14.0)]
+
+
+def test_pause_cuts_are_snapped_too(tmp_path):
+    req = TrimRequest(**{**REQ.model_dump(), "cut_pauses": True, "frame_s": 0.12})
+    r = trim.run_trim(req, PauseyTranscriber(), tmp_path, propose=lambda w, f, i: [], extract=fake_extract)
+    assert [(c.start, c.end, c.reason) for c in r.cuts] == [(1.2, 3.0, "pause")]
+
+
+def test_without_frame_s_nothing_is_snapped(tmp_path):
+    assert TrimRequest(**REQ.model_dump()).frame_s is None
+    r = run(tmp_path)
+    assert [(c.start, c.end) for c in r.cuts] == [(0.5, 0.8), (2.0, 2.2)]
+
+
+@pytest.mark.parametrize("bad", [0, -0.1, 2])
+def test_an_impossible_frame_length_is_a_422(tmp_path, bad):
+    c, auth = api(tmp_path, FakeTranscriber())
+    r = c.post("/trim", json={**REQ.model_dump(), "frame_s": bad}, headers=auth)
+    assert r.status_code == 422

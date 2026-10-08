@@ -3,7 +3,7 @@
  * Node's http module (CEP --enable-nodejs), so CORS never applies; in a browser it's the
  * sample-data mock.
  */
-import type { Health, Library, StyleExample, TrimRequest, TrimResponse, Word } from "./types";
+import type { Health, Library, RunCost, StyleExample, TrimRequest, TrimResponse, Word } from "./types";
 
 export interface TransportRequest {
   method: "GET" | "POST";
@@ -47,11 +47,12 @@ export function createBackend({ transport, token }: { transport: Transport; toke
 
   return {
     health: () => call<Health>("GET", "/health", { auth: false, timeoutMs: 2000 }),
-    trim: (req: TrimRequest) => call<TrimResponse>("POST", "/trim", { body: req, timeoutMs: 10 * 60_000 }),
+    // 2 hours: a 90-minute clip takes ~12 min on the GPU and far longer if it falls back to the CPU.
+    trim: (req: TrimRequest) => call<TrimResponse>("POST", "/trim", { body: req, timeoutMs: 2 * 60 * 60_000 }),
     library: () => call<Library>("GET", "/library"),
     addExample: (raw_words: Word[], final_text: string, source_clip: string) =>
       call<StyleExample>("POST", "/library/examples", { body: { raw_words, final_text, source_clip } }),
-    summarize: () => call<{ summary: string }>("POST", "/library/summarize", { timeoutMs: 5 * 60_000 }),
+    summarize: () => call<{ summary: string; cost?: RunCost | null }>("POST", "/library/summarize", { timeoutMs: 5 * 60_000 }),
     reload: () => call<{ status: string }>("POST", "/reload", { timeoutMs: 2000 }),
   };
 }

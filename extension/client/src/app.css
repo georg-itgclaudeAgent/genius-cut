@@ -95,10 +95,17 @@ button:disabled { cursor: not-allowed; }
 .clip-meta { color: var(--text-faint); font-size: 10.5px; }
 .muted { color: var(--text-faint); }
 
-.prompt { display: flex; gap: 6px; }
-.prompt input, .field { flex: 1; min-width: 0; background: var(--well); border: 1px solid var(--line); border-radius: var(--r);
+.prompt { display: flex; gap: 6px; align-items: flex-end; }
+.prompt textarea, .field { flex: 1; min-width: 0; background: var(--well); border: 1px solid var(--line); border-radius: var(--r);
   color: var(--text); font: inherit; font-size: 12.5px; font-weight: 400; padding: 7px 9px; }
-.prompt input:focus, .field:focus { border-color: var(--blue); outline: none; }
+/* A chat-style prompt: three times the old single-line height, width follows the panel. */
+.prompt textarea { height: 90px; resize: none; line-height: 1.45; }
+.prompt textarea:focus, .field:focus { border-color: var(--blue); outline: none; }
+
+/* Progress, errors and results live in one fixed-height area that scrolls. */
+.result { position: relative; height: 320px; overflow-y: auto; border-bottom: 1px solid var(--line-soft); }
+.result-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  font-size: 22px; font-weight: 600; letter-spacing: 0.04em; color: var(--text); opacity: 0.4; pointer-events: none; }
 textarea.field { width: 100%; min-height: 64px; resize: vertical; }
 
 .btn { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; border-radius: var(--r);
@@ -172,3 +179,13 @@ textarea.field { width: 100%; min-height: 64px; resize: vertical; }
 
 .ack { display: flex; align-items: flex-start; gap: 8px; margin-top: 8px; color: var(--text); cursor: pointer; }
 .ack input { margin-top: 2px; accent-color: var(--coral); }
+
+/* AI spend: the estimate under Analyse, and the run's cost with a month meter */
+.cost-est { margin-top: 6px; font-size: 10.5px; color: var(--text-faint); font-variant-numeric: tabular-nums; }
+.cost-est.warn { color: var(--coral); font-weight: 500; }
+.cost-run { padding-top: 0; }
+.cost-line { font-size: 10.5px; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+.meter { height: 3px; margin-top: 5px; background: var(--raise); border-radius: 2px; overflow: hidden; }
+.meter span { display: block; height: 100%; background: var(--blue); }
+.meter.hot span { background: var(--coral); }
+.picker { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }

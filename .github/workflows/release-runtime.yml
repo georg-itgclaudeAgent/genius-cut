@@ -1,0 +1,76 @@
+name: Release Genius Cut runtime
+
+# Tag runtime-vX.Y.Z → build both runtime flavours on Windows, smoke-test the cpu one,
+# publish them. Not marked Latest: Genius Cut's own releases (v*) own that.
+
+on:
+  push:
+    tags:
+      - 'runtime-v*.*.*'
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Resolve version
+        id: ver
+        run: |
+          v="${GITHUB_REF_NAME#runtime-v}"
+          [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Tag $GITHUB_REF_NAME is not runtime-vX.Y.Z"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - name: Build cpu runtime
+        env: { VERSION: "${{ steps.ver.outputs.version }}" }
+        run: python scripts/build_runtime.py cpu "$VERSION"
+      - name: Build cuda runtime
+        env: { VERSION: "${{ steps.ver.outputs.version }}" }
+        run: python scripts/build_runtime.py cuda "$VERSION"
+      - name: Smoke-test the cpu runtime (no GPU on runners)
+        env: { VERSION: "${{ steps.ver.outputs.version }}", GENIUSCUT_WHISPER_MODEL: tiny }
+        run: |
+          mkdir rt && cd rt
+          python -c "import zipfile,sys;zipfile.ZipFile(sys.argv[1]).extractall('.')" "../dist/genius-cut-runtime-cpu-$VERSION.zip"
+          ./python.exe ../backend/server.py --selftest
+          ./python.exe -c "import sys; sys.path.insert(0, '../backend'); from geniuscut.audio import find_tool; import os; t = find_tool('ffmpeg'); print(t); assert os.path.samefile(t, os.path.join(sys.prefix, 'ffmpeg', 'bin', 'ffmpeg.exe'))"
+          ./ffmpeg/bin/ffmpeg.exe -hide_banner -version | head -1
+      - name: Smoke-check the cuda runtime loads its own NVIDIA DLLs (no GPU needed)
+        env: { VERSION: "${{ steps.ver.outputs.version }}" }
+        run: |
+          mkdir rt-cuda && cd rt-cuda
+          python -c "import zipfile,sys;zipfile.ZipFile(sys.argv[1]).extractall('.')" "../dist/genius-cut-runtime-cuda-$VERSION.zip"
+          ./python.exe - <<'PY'
+          import ctypes, glob, os, sys
+          root = sys.prefix  # the runtime folder, as backend/geniuscut/stt.py sees it
+          nvidia = os.path.normcase(os.path.join(root, "Lib", "site-packages", "nvidia"))
+          for d in sorted(glob.glob(os.path.join(nvidia, "*", "bin"))):
+              os.add_dll_directory(d)
+          k32 = ctypes.WinDLL("kernel32")
+          k32.GetModuleFileNameW.argtypes = (ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32)
+          for n in ("cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll", "cudnn64_9.dll", "cudnn_ops64_9.dll"):
+              buf = ctypes.create_unicode_buffer(32768)
+              k32.GetModuleFileNameW(ctypes.WinDLL(n)._handle, buf, len(buf))
+              print(n, "->", buf.value)
+              assert os.path.normcase(buf.value).startswith(nvidia), f"{n} not loaded from the runtime's nvidia/*/bin"
+          import ctranslate2  # also proves the MSVC C++ runtime shipped next to python.exe
+          print("cuda runtime ok, ctranslate2", ctranslate2.__version__)
+          PY
+      - name: Check sizes stay under GitHub's 2 GB asset limit
+        run: |
+          for f in dist/*.zip; do s=$(stat -c %s "$f"); echo "$f $((s/1048576)) MB"; test "$s" -lt 2000000000; done
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.zip dist/*.zip.sha256 \
+            --title "Genius Cut runtime ${GITHUB_REF_NAME#runtime-v}" --latest=false \
+            --notes "One-time runtime for Genius Cut's backend. Installed by Genius Installer Manager; editors don't download it by hand."

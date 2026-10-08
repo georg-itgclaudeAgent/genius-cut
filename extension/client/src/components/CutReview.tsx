@@ -1,10 +1,12 @@
 import { useState } from "react";
-import type { ClipInfo, TrimResponse } from "../api/types";
+import type { Snapshot, TrimResponse } from "../api/types";
 import { reviewSummary } from "../lib/review";
+import { effectsByClip } from "../lib/snapshot";
+import { RunCostLine } from "./Cost";
 import { formatDuration, formatTimecode } from "../lib/timecode";
 
 interface Props {
-  clip: ClipInfo;
+  snap: Snapshot;
   res: TrimResponse;
   checked: boolean[];
   onToggle: (i: number) => void;
@@ -14,18 +16,21 @@ interface Props {
   busy: boolean;
 }
 
-export function CutReview({ clip, res, checked, onToggle, onToggleAll, onApply, onDiscard, busy }: Props) {
-  const duration = clip.outS - clip.inS;
+export function CutReview({ snap, res, checked, onToggle, onToggleAll, onApply, onDiscard, busy }: Props) {
+  const duration = snap.durationS;
   const s = reviewSummary(res.cuts, checked, duration);
   const unticked = checked.length - s.count;
-  const effects = clip.effects ?? [];
+  const effects = effectsByClip(snap);
   const [ack, setAck] = useState(false);
 
   if (res.cuts.length === 0) {
     return (
-      <div className="sec">
-        <div className="note"><b>Nothing to cut.</b> This clip already reads cleanly in your style.</div>
-      </div>
+      <>
+        <div className="sec">
+          <div className="note"><b>Nothing to cut.</b> This clip already reads cleanly in your style.</div>
+        </div>
+        {res.cost && <RunCostLine cost={res.cost} />}
+      </>
     );
   }
 
@@ -44,6 +49,7 @@ export function CutReview({ clip, res, checked, onToggle, onToggleAll, onApply, 
         </div>
       </div>
 
+      {res.cost && <RunCostLine cost={res.cost} />}
       {res.warning && <div className="sec"><div className="note warn">{res.warning}</div></div>}
       {s.keepsNothing && (
         <div className="sec"><div className="note bad"><b>That would remove the whole clip.</b> Untick at least one cut to apply.</div></div>
@@ -59,10 +65,10 @@ export function CutReview({ clip, res, checked, onToggle, onToggleAll, onApply, 
         {res.cuts.map((c, i) => (
           <label key={i} className={`cut${checked[i] ? "" : " off"}`}>
             <input type="checkbox" checked={checked[i]} onChange={() => onToggle(i)}
-              aria-label={`Remove "${c.text}" at ${formatTimecode(c.start_seq_s, clip.fps)}`} />
+              aria-label={`Remove "${c.text}" at ${formatTimecode(c.start_seq_s, snap.fps)}`} />
             <span>
               <span className="row1">
-                <span className="tc">{formatTimecode(c.start_seq_s, clip.fps)}</span>
+                <span className="tc">{formatTimecode(c.start_seq_s, snap.fps)}</span>
                 <span className="why">{c.reason}</span>
                 <span className="len">−{(c.end - c.start).toFixed(1)}s</span>
               </span>
@@ -73,12 +79,13 @@ export function CutReview({ clip, res, checked, onToggle, onToggleAll, onApply, 
       </div>
       <div className="sec">
         <div className={`note${effects.length ? " warn" : ""}`}>
-          Genius Cut rebuilds this clip from the source, so effects, grades, keyframes and audio gain on it
+          Genius Cut rebuilds {snap.video.length + snap.audio.length > 1 ? "these clips" : "this clip"} from the source, so effects, grades, keyframes and audio gain
           aren't kept. Trim first, then grade.
+          {effects.length > 0 && <div>{"Their effects aren't kept: " + effects.join(" · ") + "."}</div>}
           {effects.length > 0 && (
             <label className="ack">
               <input type="checkbox" checked={ack} onChange={(e) => setAck(e.target.checked)} />
-              <span>Remove <b>{effects.join(", ")}</b> from this clip and apply</span>
+              <span>Remove these effects and apply</span>
             </label>
           )}
         </div>

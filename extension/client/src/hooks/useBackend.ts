@@ -11,12 +11,12 @@ export function useBackend() {
 
   const connect = useCallback(async () => {
     setState({ kind: "checking" });
-    let s = await ensureBackend({ health: runtime.backend.health, spawn: runtime.spawn, sleep });
+    let s = await ensureBackend({ health: runtime.backend.health, spawn: runtime.spawn, kill: runtime.kill, sleep });
     // First run downloads ~3 GB, so "starting" can last minutes; keep checking quietly.
     while (alive.current && s.kind === "starting") {
       setState(s);
       await sleep(2000);
-      s = await ensureBackend({ health: runtime.backend.health, spawn: () => {}, sleep, attempts: 1 });
+      s = await ensureBackend({ health: runtime.backend.health, spawn: () => {}, kill: runtime.kill, sleep, attempts: 1 });
     }
     if (alive.current) setState(s);
   }, []);

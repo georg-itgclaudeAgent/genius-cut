@@ -1,32 +1,22 @@
 import { describe, it, expect } from "vitest";
-import { keptSpansSource, reviewSummary } from "./review";
-import { parseClipName } from "./prompt";
+import { removedSpans, reviewSummary } from "./review";
+import { parseClipName, submitsPrompt } from "./prompt";
 import { formatTimecode, formatDuration } from "./timecode";
-import { backendPaths } from "./paths";
-import { ensureBackend } from "./lifecycle";
+import { backendPaths, parseRuntimePointer, liveRuntimePython } from "./paths";
+import { API_VERSION, ensureBackend, startingMessage } from "./lifecycle";
 import type { Health, SequenceCut } from "../api/types";
 
 const cut = (start: number, end: number, reason = "filler"): SequenceCut => ({
   start, end, text: "x", reason, start_seq_s: start, end_seq_s: end,
 });
 
-describe("keptSpansSource — mirrors backend trim.kept_spans", () => {
-  const clip = { in_s: 10, out_s: 14 };
-  it("is the complement of the checked cuts, in source time", () => {
-    const cuts = [cut(0.5, 0.8), cut(2.0, 2.2)];
-    expect(keptSpansSource(cuts, [true, true], clip)).toEqual([
-      { start: 10, end: 10.5 }, { start: 10.8, end: 12 }, { start: 12.2, end: 14 },
-    ]);
+describe("removedSpans", () => {
+  it("merges the ticked cuts", () => {
+    expect(removedSpans([cut(2, 3), cut(2.5, 4), cut(7, 8)], [true, true, false])).toEqual([{ start: 2, end: 4 }]);
   });
-  it("unticked cuts stay in the clip", () => {
-    const cuts = [cut(0.5, 0.8), cut(2.0, 2.2)];
-    expect(keptSpansSource(cuts, [false, true], clip)).toEqual([{ start: 10, end: 12 }, { start: 12.2, end: 14 }]);
-  });
-  it("clamps cuts past the clip edges and never emits zero-length spans", () => {
-    expect(keptSpansSource([cut(0, 0.3), cut(3.5, 4.5)], [true, true], clip)).toEqual([{ start: 10.3, end: 13.5 }]);
-  });
-  it("keeps everything when nothing is ticked", () => {
-    expect(keptSpansSource([cut(1, 2)], [false], clip)).toEqual([{ start: 10, end: 14 }]);
+  it("sorts, keeps separate cuts apart and returns nothing when none is ticked", () => {
+    expect(removedSpans([cut(5, 6), cut(1, 2)], [true, true])).toEqual([{ start: 1, end: 2 }, { start: 5, end: 6 }]);
+    expect(removedSpans([cut(1, 2)], [false])).toEqual([]);
   });
 });
 
@@ -53,6 +43,11 @@ describe("parseClipName", () => {
     ["trim interview_take3", "interview_take3"],
     ["interview_take3", "interview_take3"],
     ["  clip named   A-cam 02  ", "A-cam 02"],
+    // Extra instructions after the name aren't part of it (they still go to the AI).
+    ["trim the clip named interview_take3 and cut the tangents", "interview_take3"],
+    ["trim the clip named interview_take3, keep the jokes", "interview_take3"],
+    ["trim the clip named A-cam 02 but keep the pauses", "A-cam 02"],
+    ["trim the clip named \"Q and A.mp4\" and cut fillers", "Q and A.mp4"],
   ])("%s → %s", (input, name) => {
     expect(parseClipName(input)).toBe(name);
   });
@@ -60,6 +55,7 @@ describe("parseClipName", () => {
     expect(parseClipName("")).toBeNull();
     expect(parseClipName("trim it")).toBeNull();
     expect(parseClipName("tighten this")).toBeNull();
+    expect(parseClipName("trim the selected clip, but keep the natural ums")).toBeNull();
   });
 });
 
@@ -77,7 +73,7 @@ describe("timecode", () => {
 
 describe("backendPaths", () => {
   it("dev layout: backend sits next to the extension folder", () => {
-    const p = backendPaths("C:/src/genius-cut/extension", (x) => x === "C:/src/genius-cut/backend/server.py");
+    const p = backendPaths("C:/src/genius-cut/extension", (x) => x === "C:/src/genius-cut/backend/server.py", undefined);
     expect(p).toEqual({
       python: "C:/src/genius-cut/backend/.venv/Scripts/python.exe",
       server: "C:/src/genius-cut/backend/server.py",
@@ -86,16 +82,45 @@ describe("backendPaths", () => {
   });
   it("installed layout: backend bundled inside the extension", () => {
     const p = backendPaths("C:/Users/x/AppData/Roaming/Adobe/CEP/extensions/com.attract.genius-cut",
-      (x) => x.endsWith("com.attract.genius-cut/backend/server.py"));
-    expect(p?.server).toBe("C:/Users/x/AppData/Roaming/Adobe/CEP/extensions/com.attract.genius-cut/backend/server.py");
+      (x) => x.endsWith("com.attract.genius-cut/backend/server.py"), undefined);
+    expect(p).toMatchObject({ server: "C:/Users/x/AppData/Roaming/Adobe/CEP/extensions/com.attract.genius-cut/backend/server.py" });
   });
   it("no backend anywhere → null", () => {
-    expect(backendPaths("C:/nowhere/extension", () => false)).toBeNull();
+    expect(backendPaths("C:/nowhere/extension", () => false, undefined)).toBeNull();
+  });
+  it("installed layout with the runtime: python comes from runtime.json", () => {
+    const root = "C:/Users/x/AppData/Roaming/Adobe/CEP/extensions/com.attract.genius-cut";
+    const py = "C:/Users/x/AppData/Local/itGenius/genius-cut/runtime/1.0.0/python.exe";
+    expect(backendPaths(root, (p) => p.endsWith("/backend/server.py"), py)).toEqual({
+      python: py, server: `${root}/backend/server.py`, cwd: `${root}/backend`,
+    });
+  });
+  it("installed layout without a runtime asks for setup instead of guessing a venv", () => {
+    const root = "C:/Users/x/AppData/Roaming/Adobe/CEP/extensions/com.attract.genius-cut";
+    expect(backendPaths(root, (p) => p.endsWith("/backend/server.py"), null)).toEqual({ needsSetup: true });
+  });
+  it("dev layout ignores the runtime pointer", () => {
+    expect(backendPaths("C:/src/genius-cut/extension", (x) => x === "C:/src/genius-cut/backend/server.py", null))
+      .toEqual({
+        python: "C:/src/genius-cut/backend/.venv/Scripts/python.exe",
+        server: "C:/src/genius-cut/backend/server.py",
+        cwd: "C:/src/genius-cut/backend",
+      });
+  });
+});
+
+describe("parseRuntimePointer", () => {
+  it("returns the python path", () => {
+    expect(parseRuntimePointer('{"version":"1.0.0","flavour":"cpu","python":"C:\\\\r\\\\python.exe"}')).toBe("C:\\r\\python.exe");
+  });
+  it("treats malformed, empty or python-less files as no runtime", () => {
+    for (const t of ["", "not json", "null", "[]", '{"version":"1"}', '{"python":5}', '{"python":""}'])
+      expect(parseRuntimePointer(t)).toBeNull();
   });
 });
 
 describe("ensureBackend", () => {
-  const ready: Health = { status: "ok", version: "0.1.0", stt_device: "cuda" };
+  const ready: Health = { status: "ok", version: "0.1.0", stt_device: "cuda", api: API_VERSION };
   it("reuses a backend that already answers, without spawning", async () => {
     let spawned = 0;
     const r = await ensureBackend({ health: async () => ready, spawn: () => { spawned++; }, sleep: async () => {} });
@@ -129,11 +154,81 @@ describe("ensureBackend", () => {
     });
     expect(r).toEqual({ kind: "failed", message: expect.stringContaining("python.exe not found") });
   });
+  it("a setup-needed spawn error surfaces its exact message", async () => {
+    const msg = "Genius Cut needs a one-time setup. Open Genius Installer Manager and click Finish setup.";
+    const r = await ensureBackend({
+      health: async () => { throw new Error("ECONNREFUSED"); },
+      spawn: () => { throw Object.assign(new Error(msg), { needsSetup: true }); }, sleep: async () => {},
+    });
+    expect(r).toEqual({ kind: "failed", message: msg });
+  });
   it("a load error from /health is a failure, not a spinner", async () => {
     const r = await ensureBackend({
-      health: async (): Promise<Health> => ({ status: "error", version: "0.1.0", stt_device: "failed", error: "disk full" }),
+      health: async (): Promise<Health> => ({ status: "error", version: "0.1.0", stt_device: "failed", error: "disk full", api: API_VERSION }),
       spawn: () => {}, sleep: async () => {},
     });
     expect(r).toEqual({ kind: "failed", message: expect.stringContaining("disk full") });
+  });
+});
+
+describe("liveRuntimePython", () => {
+  const text = '{"python":"C:/r/python.exe"}';
+  it("returns python when the file exists", () => {
+    expect(liveRuntimePython(text, () => true)).toBe("C:/r/python.exe");
+  });
+  it("stale pointer (python.exe gone) counts as no runtime, so setup is asked for", () => {
+    expect(liveRuntimePython(text, () => false)).toBeNull();
+  });
+  it("malformed pointer is null without probing the filesystem", () => {
+    expect(liveRuntimePython("nope", () => { throw new Error("should not be called"); })).toBeNull();
+  });
+});
+
+describe("startingMessage", () => {
+  // Checkpoint B (2026-10-07): the panel said "downloads about 3 GB" on every start, though the
+  // model was cached and only loading into the graphics card.
+  const h = (stt_phase?: "loading" | "downloading") => ({ status: "ok" as const, version: "0.1.0", stt_device: "loading", stt_phase });
+  it("says loading, not downloading, when the model is already on this PC", () => {
+    expect(startingMessage(h("loading"))).toBe("Loading the speech model (about 30 seconds)…");
+  });
+  it("mentions the download only when one is really happening", () => {
+    expect(startingMessage(h("downloading"))).toBe("Downloading the speech model. This happens once and is about 3 GB.");
+  });
+  it("falls back to loading for a backend that doesn't report a phase", () => {
+    expect(startingMessage(h())).toBe("Loading the speech model (about 30 seconds)…");
+  });
+});
+
+describe("submitsPrompt", () => {
+  // The instruction box works like a chat prompt: Enter runs, Shift+Enter is a new line.
+  it("Enter submits", () => expect(submitsPrompt({ key: "Enter", shiftKey: false, isComposing: false })).toBe(true));
+  it("Shift+Enter adds a line", () => expect(submitsPrompt({ key: "Enter", shiftKey: true, isComposing: false })).toBe(false));
+  it("Enter while an IME is composing doesn't submit", () => expect(submitsPrompt({ key: "Enter", shiftKey: false, isComposing: true })).toBe(false));
+  it("other keys don't submit", () => expect(submitsPrompt({ key: "a", shiftKey: false, isComposing: false })).toBe(false));
+});
+
+describe("ensureBackend with an outdated backend", () => {
+  const current: Health = { status: "ok", version: "0.1.0", stt_device: "cuda", api: API_VERSION, pid: 2 };
+  const old: Health = { status: "ok", version: "0.1.0", stt_device: "cuda", api: API_VERSION - 1, pid: 1 };
+  it("stops a backend from an older version and starts a fresh one", async () => {
+    let state: "old" | "down" | "new" = "old";
+    const killed: number[] = []; let spawned = 0;
+    const r = await ensureBackend({
+      health: async () => { if (state === "old") return old; if (state === "down") throw new Error("ECONNREFUSED"); return current; },
+      kill: (pid) => { killed.push(pid); state = "down"; },
+      spawn: () => { spawned++; state = "new"; }, sleep: async () => {},
+    });
+    expect(killed).toEqual([1]);
+    expect(spawned).toBe(1);
+    expect(r).toEqual({ kind: "ready", health: current });
+  });
+  it("says so plainly when the old backend can't be stopped (no process id)", async () => {
+    const r = await ensureBackend({ health: async () => ({ ...old, pid: undefined, api: undefined }), kill: () => {}, spawn: () => {}, sleep: async () => {} });
+    expect(r).toEqual({ kind: "failed", message: "An older Genius Cut backend is still running. Restart Premiere, or end its python.exe in Task Manager, then try again." });
+  });
+  it("reuses a backend on the current version", async () => {
+    let spawned = 0;
+    const r = await ensureBackend({ health: async () => current, kill: () => { throw new Error("no"); }, spawn: () => { spawned++; }, sleep: async () => {} });
+    expect(r.kind).toBe("ready"); expect(spawned).toBe(0);
   });
 });

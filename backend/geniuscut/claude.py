@@ -1,14 +1,16 @@
 """One place that talks to Claude.
 
 - Model `claude-opus-5-5` (override with GENIUSCUT_CLAUDE_MODEL).
-- Provider: the Anthropic API (default, key from env/GSM) or Google Cloud Vertex AI
-  (GENIUSCUT_CLAUDE_PROVIDER=vertex; bills the GCP project, uses the gcloud login).
+- Provider: the Anthropic API (key from env/GSM) or Google Cloud Vertex AI
+  (GENIUSCUT_LLM_PROVIDER or GENIUSCUT_CLAUDE_PROVIDER = vertex; bills the GCP project,
+  uses the gcloud login). Reached through `llm.py`, whose default is Gemini.
 - JSON comes back through structured outputs (`output_config.format`). Forced
   `tool_choice` returns a 400 on this model.
 - Effort is always set explicitly; this model's default is `medium`.
 - On the Anthropic API, server-side refusal fallback is on (`fallbacks="default"`), so a
   policy decline is retried on a fallback model inside the same call. Vertex doesn't offer it.
 - A refusal or a truncated reply raises instead of being silently parsed.
+- Usage is recorded in the spend ledger; Claude has no price there, so it costs `None`.
 """
 
 import json
@@ -16,17 +18,22 @@ import os
 
 import anthropic
 
-from geniuscut import secrets
+from geniuscut import secrets, spend
+from geniuscut.errors import LLMError
 
 MODEL = os.environ.get("GENIUSCUT_CLAUDE_MODEL", "claude-opus-5-5")
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
 
 
-class ClaudeError(RuntimeError):
+class ClaudeError(LLMError):
     pass
 
 
 def provider() -> str:
+    """Which Claude endpoint: `anthropic` or `vertex`. GENIUSCUT_LLM_PROVIDER wins when it names one."""
+    chosen = (os.environ.get("GENIUSCUT_LLM_PROVIDER") or "").strip().lower()
+    if chosen in ("anthropic", "vertex"):
+        return chosen
     return (os.environ.get("GENIUSCUT_CLAUDE_PROVIDER") or "anthropic").strip().lower()
 
 
@@ -82,6 +89,9 @@ def _call(prompt: str, *, system: str | None, client, output_config: dict, max_t
             raise ClaudeError("No Google Cloud login for Vertex AI on this machine. "
                               "Run: gcloud auth application-default login") from e
         raise
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        spend.record(MODEL, int(getattr(usage, "input_tokens", 0) or 0), int(getattr(usage, "output_tokens", 0) or 0))
     if response.stop_reason == "refusal":
         details = getattr(response, "stop_details", None)
         raise ClaudeError(f"Claude declined the request ({getattr(details, 'category', None) or 'no category'}).")

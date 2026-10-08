@@ -1,13 +1,13 @@
-"""Claude proposes which words to cut, in the editor's style.
+"""The AI (Gemini by default, see `llm.py`) proposes which words to cut, in the editor's style.
 
-Claude returns inclusive *word index* ranges, never timecodes. It's reliable at indices
+The model returns inclusive *word index* ranges, never timecodes. It's reliable at indices
 and unreliable at arithmetic on times, so indices are resolved to times here, and any
 range that is out of bounds, backwards or overlapping is dropped rather than applied.
 """
 
 import logging
 
-from geniuscut import claude
+from geniuscut import llm, spend
 from geniuscut.library import FewShot
 from geniuscut.models import CutSpan, Word
 
@@ -89,11 +89,39 @@ def validate_ranges(raw: list[dict], n_words: int) -> list[tuple[int, int, str]]
     return kept
 
 
-def propose_cuts(words: list[Word], fewshot: FewShot, instruction: str = "", client=None) -> list[CutSpan]:
+# Long transcripts go to the model in chunks: a 90-minute clip is ~16,000 words, and one reply
+# listing every cut risks the output cap (Checkpoint B, 2026-10-07). ~2,400 words is ~16 minutes.
+CHUNK_WORDS = 2400
+SENTENCE_END = (".", "?", "!")
+
+
+def chunk_bounds(words: list[Word], size: int = CHUNK_WORDS, slack: int | None = None) -> list[tuple[int, int]]:
+    """[start, end) word ranges of about `size` words, each ending at the last sentence end
+    within `slack` words of the target, or exactly at `size` if there's none."""
+    slack = size // 4 if slack is None else slack
+    bounds, i, n = [], 0, len(words)
+    while i < n:
+        if n - i <= size + slack:
+            bounds.append((i, n))
+            break
+        ends = [j for j in range(i + size - slack - 1, min(n, i + size + slack))
+                if words[j].w.rstrip().endswith(SENTENCE_END)]
+        end = ends[-1] + 1 if ends else i + size
+        bounds.append((i, end))
+        i = end
+    return bounds
+
+
+def propose_cuts(words: list[Word], fewshot: FewShot, instruction: str = "", client=None,
+                 chunk_words: int = CHUNK_WORDS) -> list[CutSpan]:
     if not words:
         return []
-    reply = claude.ask_json(build_prompt(words, fewshot, instruction), SCHEMA, system=SYSTEM, client=client)
-    ranges = validate_ranges(reply.get("cuts", []), len(words))
+    ranges = []
+    for a, b in chunk_bounds(words, chunk_words):
+        part = words[a:b]
+        with spend.tagged("trim"):  # also when called outside run_trim, and when the call raises
+            reply = llm.ask_json(build_prompt(part, fewshot, instruction), SCHEMA, system=SYSTEM, client=client)
+        ranges += [(s + a, e + a, reason) for s, e, reason in validate_ranges(reply.get("cuts", []), len(part))]
     return [
         CutSpan(start=words[s].start, end=words[e].end,
                 text=" ".join(w.w for w in words[s:e + 1]), reason=reason)

@@ -1,6 +1,6 @@
 /** Everything that only exists inside Premiere's CEP runtime. */
 import type { Transport } from "./backend";
-import { backendPaths } from "../lib/paths";
+import { backendPaths, liveRuntimePython } from "../lib/paths";
 
 declare global {
   interface Window {
@@ -54,19 +54,38 @@ export function logPath(): string {
   return node("path").join(dataDir(), "backend.log");
 }
 
+const SETUP_MESSAGE = "Genius Cut needs a one-time setup. Open Genius Installer Manager and click Finish setup.";
+
+/** python.exe from the installer's runtime pointer (%LOCALAPPDATA%/itGenius/genius-cut/runtime.json), or null. */
+function readRuntimePython(): string | null {
+  try {
+    const fs = node("fs"), path = node("path");
+    const file = path.join(node("process").env.LOCALAPPDATA, "itGenius", "genius-cut", "runtime.json");
+    return fs.existsSync(file) ? liveRuntimePython(fs.readFileSync(file, "utf8"), (p: string) => fs.existsSync(p)) : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Start the backend detached so it outlives the panel; its output goes to backend.log. */
 export function spawnBackend(): void {
   const fs = node("fs");
   const cs = new window.CSInterface!();
   const root = fs.realpathSync(cs.getSystemPath("extension")); // resolve the dev symlink
-  const paths = backendPaths(root, (p) => fs.existsSync(p));
+  const paths = backendPaths(root, (p) => fs.existsSync(p), readRuntimePython());
   if (!paths) throw new Error(`No backend found next to ${root}.`);
+  if ("needsSetup" in paths) throw Object.assign(new Error(SETUP_MESSAGE), { needsSetup: true });
   if (!fs.existsSync(paths.python)) throw new Error(`Python not found at ${paths.python}. Set up backend/.venv first.`);
   fs.mkdirSync(dataDir(), { recursive: true });
   const log = fs.openSync(logPath(), "a");
   node("child_process")
     .spawn(paths.python, [paths.server], { cwd: paths.cwd, detached: true, windowsHide: true, stdio: ["ignore", log, log] })
     .unref();
+}
+
+/** Stop a process by id: used only for an outdated Genius Cut backend found on our port. */
+export function killProcess(pid: number): void {
+  node("process").kill(pid);
 }
 
 export function evalScript(script: string): Promise<string> {

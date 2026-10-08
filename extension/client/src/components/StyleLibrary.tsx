@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { runtime } from "../api/runtime";
-import type { ClipInfo, Library, TrimResponse } from "../api/types";
+import type { Library, Snapshot, TrimResponse } from "../api/types";
 
-export interface LastTrim { clip: ClipInfo; res: TrimResponse; checked: boolean[] }
+export interface LastTrim { snap: Snapshot; res: TrimResponse; checked: boolean[] }
 
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
@@ -32,7 +32,7 @@ export function StyleLibrary({ ready, lastTrim }: { ready: boolean; lastTrim: La
     if (!lastTrim) return;
     setBusy(true);
     try {
-      await runtime.backend.addExample(lastTrim.res.words, finalText, lastTrim.clip.name);
+      await runtime.backend.addExample(lastTrim.res.words, finalText, lastTrim.snap.video[0].name);
       setAdding(false);
       await load();
     } catch (e) { setError(errMsg(e)); }
@@ -81,7 +81,7 @@ export function StyleLibrary({ ready, lastTrim }: { ready: boolean; lastTrim: La
 
         {adding && lastTrim ? (
           <div className="stack">
-            <div className="lbl">Final text for {lastTrim.clip.name}</div>
+            <div className="lbl">Final text for {lastTrim.snap.video[0].name}</div>
             <textarea className="field" value={finalText} onChange={(e) => setFinalText(e.target.value)} aria-label="Final text" />
             <div className="muted">Edit it to read exactly how you'd cut it. The removed words are worked out from the difference.</div>
             <div className="prompt">

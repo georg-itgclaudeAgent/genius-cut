@@ -1,9 +1,7 @@
-/** Regression tests for the panel review (C1, I3, I5). I1/I2/I4 are covered where they live. */
+/** Regression tests for the panel review (C1, I3). I1/I2/I4 are covered where they live. */
 import { describe, it, expect } from "vitest";
 import { round3 } from "./review";
-import { clipProblem } from "./clip";
 import { cepHost, HostUnavailable } from "../api/host";
-import type { ClipInfo } from "../api/types";
 
 describe("C1: round3 matches Python round(x, 3)", () => {
   it.each([
@@ -19,34 +17,22 @@ describe("C1: round3 matches Python round(x, 3)", () => {
   });
 });
 
-const CLIP: ClipInfo = {
-  found: true, name: "a.mp4", mediaPath: "C:/a.mp4", trackIndex: 0, startTicks: "0", inS: 0, outS: 5, startS: 0,
-  fps: 23.976, matchCount: 1, selectedUsed: true, speed: 1, effects: [],
-};
-
-describe("I5: clips Phase 1 can't trim correctly are refused before analysis", () => {
-  it("a normal clip is fine", () => expect(clipProblem(CLIP)).toBeNull());
-  it("a clip that wasn't found", () => expect(clipProblem({ ...CLIP, found: false })).toMatch(/No matching clip/));
-  it("a sped-up or slowed clip", () => expect(clipProblem({ ...CLIP, speed: 1.5 })).toMatch(/150%/));
-  it("a reversed clip", () => expect(clipProblem({ ...CLIP, speed: -1 })).toMatch(/reversed/));
-});
-
 describe("I3: only a genuinely missing gcut* function means 'Phase C not installed'", () => {
   it("wraps each call in a typeof probe", async () => {
     let script = "";
-    await cepHost(async (s) => { script = s; return "{}"; }).findClip("x");
-    expect(script).toMatch(/^typeof gcutFindClip === "function"/);
+    await cepHost(async (s) => { script = s; return "{}"; }).snapshotSelection("x");
+    expect(script).toMatch(/^typeof gcutSnapshotSelection === "function"/);
   });
   it("the missing-function sentinel is HostUnavailable", async () => {
-    await expect(cepHost(async () => "__GCUT_MISSING__").findClip("x")).rejects.toBeInstanceOf(HostUnavailable);
+    await expect(cepHost(async () => "__GCUT_MISSING__").snapshotSelection("x")).rejects.toBeInstanceOf(HostUnavailable);
   });
   it("a runtime ExtendScript error is a real error, not 'arrives with Phase C'", async () => {
-    const err = await cepHost(async () => "EvalScript error.").findClip("x").catch((e) => e);
+    const err = await cepHost(async () => "EvalScript error.").snapshotSelection("x").catch((e) => e);
     expect(err).not.toBeInstanceOf(HostUnavailable);
     expect(err.message).toMatch(/Premiere script failed/);
   });
   it("normal output that happens to contain 'is undefined' is parsed, not misread", async () => {
-    const out = JSON.stringify({ found: false, name: "clip is undefined" });
-    await expect(cepHost(async () => out).findClip("x")).resolves.toMatchObject({ name: "clip is undefined" });
+    const out = JSON.stringify({ found: false, message: "clip is undefined" });
+    await expect(cepHost(async () => out).snapshotSelection("x")).resolves.toMatchObject({ message: "clip is undefined" });
   });
 });

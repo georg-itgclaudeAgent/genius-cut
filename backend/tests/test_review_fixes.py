@@ -28,7 +28,7 @@ def fake_extract(media_path, in_s, out_s, out_dir=None):
     return out
 
 
-REQ = dict(media_path="C:/f/take.mp4", in_s=10.0, out_s=12.0, clip_start_s=0.0)
+REQ = dict(media_path="C:/f/take.mp4", in_s=10.0, out_s=12.0, clip_start_s=0.0, cut_pauses=False)
 
 
 def app(tmp_path, *, transcriber=lambda: FakeTranscriber(), propose=lambda w, f, i: [], **kw):
@@ -53,7 +53,8 @@ def test_i1_cutting_the_whole_clip_is_refused_not_returned(tmp_path):
 def test_i1_heavy_cuts_come_back_flagged(tmp_path):
     heavy = [CutSpan(start=0.0, end=1.5, text="hello", reason="tangent")]
     r = trim.run_trim(TrimRequest(**REQ), FakeTranscriber(), tmp_path,
-                      propose=lambda w, f, i: heavy, extract=fake_extract)
+                      propose=lambda w, f, i: heavy, extract=fake_extract,
+                      refine=lambda c, w, d, env=None: c)  # the threshold, not edge refinement
     assert r.cut_fraction == pytest.approx(0.75)
     assert r.warning and "75%" in r.warning
 
@@ -100,7 +101,8 @@ def test_i3_gpu_failure_during_transcription_retries_on_cpu(tmp_path):
     assert t.device == "cuda"
     words = t.transcribe(wav)
     assert [w.w for w in words] == ["hi"]
-    assert t.device == "cpu" and "out of memory" in t.cuda_error
+    # Only that request moved to the CPU (Checkpoint B, 2026-10-07): the GPU stays in use.
+    assert t.device == "cuda" and "out of memory" in t.cuda_error
 
 
 # ── I4: loopback only, even through DNS rebinding ──────────────────

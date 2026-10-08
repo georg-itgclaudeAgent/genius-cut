@@ -11,3 +11,6 @@ extension/client/dist/
 *.wav
 !backend/tests/fixtures/*.wav
 *.zip
+
+# CEP remote debugging (local only)
+extension/.debug

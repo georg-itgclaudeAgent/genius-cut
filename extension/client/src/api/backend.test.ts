@@ -21,11 +21,11 @@ describe("backend client", () => {
   });
 
   it("posts the trim request as JSON", async () => {
-    const f = fake(200, { words: [], cuts: [], kept_spans_source: [], stt_device: "cuda", cut_fraction: 0, warning: null });
+    const f = fake(200, { words: [], cuts: [], kept_spans_source: [], kept_spans: [], stt_device: "cuda", cut_fraction: 0, warning: null });
     const api = createBackend({ transport: f.transport, token: () => "tok" });
-    await api.trim({ media_path: "C:/a.mp4", in_s: 0, out_s: 5, clip_start_s: 0, prompt: "" });
+    await api.trim({ duration_s: 5, range_start_seq_s: 0, audio: [{ media_path: "C:/a.mp4", in_s: 0, offset_s: 0, duration_s: 5 }], prompt: "" });
     expect(f.seen[0]).toMatchObject({ method: "POST", path: "/trim" });
-    expect(JSON.parse(f.seen[0].body!)).toMatchObject({ media_path: "C:/a.mp4", out_s: 5 });
+    expect(JSON.parse(f.seen[0].body!)).toMatchObject({ duration_s: 5, audio: [{ media_path: "C:/a.mp4", in_s: 0, offset_s: 0, duration_s: 5 }] });
     expect(f.seen[0].headers["Content-Type"]).toBe("application/json");
   });
 
@@ -34,10 +34,20 @@ describe("backend client", () => {
       transport: fake(502, { detail: "Anthropic API error 400: Your credit balance is too low." }).transport,
       token: () => "tok",
     });
-    const err = await api.trim({ media_path: "x", in_s: 0, out_s: 1, clip_start_s: 0, prompt: "" }).catch((e) => e);
+    const err = await api.trim({ duration_s: 1, range_start_seq_s: 0, audio: [{ media_path: "x", in_s: 0, offset_s: 0, duration_s: 5 }], prompt: "" }).catch((e) => e);
     expect(err).toBeInstanceOf(BackendError);
     expect(err.status).toBe(502);
     expect(err.message).toContain("credit balance is too low");
+  });
+
+  it("the monthly AI limit (402) comes through as the backend's own message", async () => {
+    const detail = "This run could cost up to $0.06, and this month's AI spend is $1.97 of the $2.00 limit. " +
+      "Raise GENIUSCUT_MONTHLY_LIMIT_USD to continue.";
+    const api = createBackend({ transport: fake(402, { detail }).transport, token: () => "tok" });
+    const err = await api.trim({ duration_s: 1, range_start_seq_s: 0, audio: [{ media_path: "x", in_s: 0, offset_s: 0, duration_s: 5 }], prompt: "" }).catch((e) => e);
+    expect(err).toBeInstanceOf(BackendError);
+    expect(err.status).toBe(402);
+    expect(err.message).toBe(detail);
   });
 
   it("validation errors (422 with a list) still read as one sentence", async () => {
@@ -54,5 +64,14 @@ describe("backend client", () => {
     const err = await api.library().catch((e) => e);
     expect(err.status).toBe(500);
     expect(err.message).toContain("Internal Server Error");
+  });
+});
+
+describe("trim timeout", () => {
+  it("waits up to 2 hours: a 90-minute clip takes longer than 10 minutes to transcribe", async () => {
+    const f = fake(200, {});
+    await createBackend({ transport: f.transport, token: () => "tok" })
+      .trim({ duration_s: 1, range_start_seq_s: 0, audio: [{ media_path: "a", in_s: 0, offset_s: 0, duration_s: 5 }], prompt: "" });
+    expect(f.seen[0].timeoutMs).toBe(2 * 60 * 60_000);
   });
 });

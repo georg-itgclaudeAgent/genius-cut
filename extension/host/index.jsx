@@ -179,12 +179,14 @@ function gcutFits(srcFps, clock) {
  * reports a track item's in point floored to the SEQUENCE's frames, but the clip really starts on
  * one of its own frames (where Premiere floored the set point), in [reported, reported + a sequence
  * frame). Re-laying from the reported value would floor again and slip a frame earlier on every
- * Apply or Restore. Exact when the clip's own frames are longer than the sequence's (only one of
- * them fits there); otherwise the last one that fits, which maps back to itself every time.
+ * Apply or Restore. Takes the EARLIEST own frame at or after the reported value: exact when the
+ * clip's own frames are longer than the sequence's (only one of them fits there), and when the in
+ * point sits on both grids (a 59.94 clip from 0 in 30); otherwise still a fixed point, so it never
+ * drifts. (The latest own frame that fits drifted later every cycle when own frames are shorter.)
  */
 function gcutTrueInS(reportedS, ownFrameS, seqFrameS) {
-    var own = Math.floor((reportedS + seqFrameS) / ownFrameS - 1e-6) * ownFrameS;
-    return own >= reportedS - 1e-9 ? own : reportedS;
+    var own = Math.ceil(reportedS / ownFrameS - 1e-6) * ownFrameS;
+    return own < reportedS + seqFrameS - 1e-9 ? own : reportedS;
 }
 
 function gcutEffects(item, intrinsic, out) {
@@ -905,12 +907,25 @@ function gcutRemoveStrays(seq, found, plan, fromT, toT, clock, others) {
  * rollback). Everything of ours inside the items' span goes first. True if verifiably back.
  */
 function gcutRelayAll(seq, rec, clock, others) {
-    var nodes = [], whole = [], i, span = gcutSpan(rec.items);
-    for (i = 0; i < rec.items.length; i++) { nodes.push(rec.items[i].node); whole.push(gcutWhole(rec.items[i])); }
-    gcutRemoveRange(seq, nodes, span.fromT, span.toT, clock, others);
-    gcutLayAll(seq, rec.items, whole, span.fromT, span.toT, clock, others);
-    for (i = 0; i < rec.items.length; i++) if (gcutVerifyItems(seq, rec.items[i], whole[i], clock)) return false;
-    return !gcutStrayLeft(seq, rec.items, whole, span.fromT, span.toT, clock, others);
+    var whole = [];
+    for (var i = 0; i < rec.items.length; i++) whole.push(gcutWhole(rec.items[i]));
+    return gcutRelay(seq, rec.items, whole, clock, others);
+}
+
+/**
+ * Clear everything of ours inside the items' span (keeping `others`), lay plan[i] for items[i], and
+ * check. True if every piece verifiably landed and nothing stray is left; false (never throws) if not.
+ */
+function gcutRelay(seq, items, plan, clock, others) {
+    try {
+        var span = gcutSpan(items), i;
+        gcutRemoveRange(seq, gcutNodes(items), span.fromT, span.toT, clock, others);
+        gcutLayAll(seq, items, plan, span.fromT, span.toT, clock, others);
+        for (i = 0; i < items.length; i++) if (gcutVerifyItems(seq, items[i], plan[i], clock)) return false;
+        return !gcutStrayLeft(seq, items, plan, span.fromT, span.toT, clock, others);
+    } catch (e) {
+        return false;
+    }
 }
 
 /**
@@ -1075,8 +1090,14 @@ function gcutRestoreMulti(specJson) {
             for (var m = 0; m < marks.length; m++) if (marks[m].node === rec.items[k].node) seen = true;
             if (!seen) marks.push({ pi: rec.items[k].pi, node: rec.items[k].node, inS: rec.items[k].pi.getInPoint().seconds, outS: rec.items[k].pi.getOutPoint().seconds });
         }
-        // If Restore fails, the record is kept as it was, so Close gap still sees the gap.
-        if (!gcutRelayAll(seq, rec, clock, others)) throw new Error("The original clips didn't go back as expected. Use Premiere's Undo.");
+        // If Restore fails part-way the timeline would hold a mix of whole clips and pieces: lay the
+        // cut version back from the record, so it is exactly as Apply left it (and the record, kept
+        // as it was, still matches it for another Restore or Close gap). Only if that fails too, Undo.
+        if (!gcutRelayAll(seq, rec, clock, others)) {
+            var cutBack = gcutRelay(seq, rec.items, gcutPlan(rec.items, rec.cutsT), clock, others);
+            throw new Error(cutBack ? "The original clips didn't go back as expected, so the cut version was put back as it was. Try Restore again, or use Premiere's Undo."
+                : "The original clips didn't go back as expected, and the cut version couldn't be put back either. Use Premiere's Undo.");
+        }
         var hit = gcutSnapshotIntact(seq, others, clock);
         if (hit) throw new Error("Restoring changed something on " + hit + ". Use Premiere's Undo.");
         delete gcutState().gcutStash["m@" + spec.startTicks];

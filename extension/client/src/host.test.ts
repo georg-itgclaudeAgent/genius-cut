@@ -1001,15 +1001,41 @@ describe("gcutRestoreMulti", () => {
     expect(restoreMulti(s)).toEqual({ ok: true });
     expect(layout(s.seq.videoTracks[3])).toEqual([[104, 106], [108.5, 109.5]]);
   });
-  it("a Restore that fails part-way keeps the record, so Close gap still sees the gap", () => {
+  const cutVersion = (s: ReturnType<typeof multiScene>) => {
+    for (const [t, inS] of [[0, 10], [1, 12], [2, 5]] as const) {
+      expect(pieces(s.seq.videoTracks[t])).toEqual([[100, 102, inS], [102, 106, inS + 3], [106, 108, inS + 8]]);
+    }
+    expect(pieces(s.seq.audioTracks[0])).toEqual([[100, 102, 10], [102, 106, 13], [106, 108, 18]]);
+    expect(s.seq.audioTracks[1].clips.numItems + s.seq.audioTracks[2].clips.numItems).toBe(0);
+    expect(layout(s.seq.videoTracks[3])).toEqual([[104, 106]]);
+  };
+  it("a Restore that fails part-way puts the cut version back exactly and keeps the record: Restore and Close gap still work", () => {
     const s = multiScene({ music: false });
     applyCuts(s);
     s.seq.dropSpanIndex = 9; // 9 placements so far (V1-V3; A1 comes with V1): Restore's first (V1) silently fails
-    expect(() => restoreMulti(s)).toThrow(/Undo/);
+    expect(() => restoreMulti(s)).toThrow("The original clips didn't go back as expected, so the cut version was put back as it was. " +
+      "Try Restore again, or use Premiere's Undo.");
+    cutVersion(s); // never a mix of whole clips and pieces
     const rec = (s.host.ctx as any).$.global.gcutStash["m@" + START];
     expect([rec.rebuiltEndT, rec.gapClosed]).toEqual([108 * TICKS, false]);
-    // The clips that did go back whole aren't planned pieces, so Close gap refuses them as changed since Apply.
-    expect(() => closeGapMulti(s)).toThrow("A rebuilt clip on V2 changed since Apply. Close the gap by hand.");
+    expect(restoreMulti(s)).toEqual({ ok: true });
+    for (const [t, inS] of [[0, 10], [1, 12], [2, 5]] as const) expect(pieces(s.seq.videoTracks[t])).toEqual([[100, 110, inS]]);
+  });
+  it("a Restore that fails part-way, then Close gap: the gap closes", () => {
+    const s = multiScene({ music: false });
+    applyCuts(s);
+    s.seq.dropSpanIndex = 9;
+    expect(() => restoreMulti(s)).toThrow(/cut version was put back/);
+    expect(closeGapMulti(s)).toEqual({ ok: true, movedCount: 1 }); // the title, 104–106 → 103–105
+    expect(layout(s.seq.videoTracks[3])).toEqual([[103, 105]]);
+  });
+  it("a Restore whose cut version can't be put back either says to use Undo", () => {
+    const s = multiScene({ music: false });
+    applyCuts(s);
+    const v1 = s.seq.videoTracks[0], real = v1.overwriteClip.bind(v1);
+    v1.overwriteClip = () => { throw new Error("Premiere refused"); }; // every lay on V1 fails, both ways
+    expect(() => restoreMulti(s)).toThrow("The original clips didn't go back as expected, and the cut version couldn't be put back either. Use Premiere's Undo.");
+    v1.overwriteClip = real;
   });
 });
 
@@ -1577,6 +1603,42 @@ describe("measured in Premiere 26.5.2: classify by EXACT frame rate, audio follo
       if (onGrid) expect(ins[0]).toBeCloseTo(inS, 9);
       for (const x of ins) expect(x).toBeCloseTo(ins[0], 9);
     });
+  describe("own frames SHORTER than the sequence's (59.94 or 50 in 30): no drift, exact", () => {
+    /** One clip at 100–104 s in a 30 fps sequence from source `inS`, on its own frames; mic.wav on A1. */
+    function shortScene(fps: number, inS: number, onSeqGrid: boolean, toMediaEnd = false) {
+      const seq = new Seq(1, 1);
+      seq.timebase = String(TPF30); seq.inPointOnSeqGrid = onSeqGrid;
+      const cam = measured("cam.mov", "node-c", toMediaEnd ? inS + 4 : 900, fps, false);
+      cam.clampToMedia = toMediaEnd;
+      const v1 = seq.videoTracks[0].add(cam, 100, inS, inS + 4);
+      const a1 = seq.audioTracks[0].add(wav("mic.wav", "node-m", 900), 100, 50, 54);
+      v1.selected = true; a1.selected = true;
+      return { seq, host: load(seq) };
+    }
+    const cycles = (s: { seq: Seq; host: ReturnType<typeof load> }, inS: number, n: number) => {
+      for (let cycle = 0; cycle < n; cycle++) {
+        reselect([s.seq.videoTracks[0], s.seq.audioTracks[0]]);
+        const snap = snapshot(s);
+        expect(applyCuts(s, [{ start: 1, end: 2 }], snap), `cycle ${cycle}`).toMatchObject({ ok: true });
+        expect(s.seq.videoTracks[0].clips.map((i: TrackItem) => [i.start.t / TPF30, i.end.t / TPF30])).toEqual([[3000, 3030], [3030, 3090]]);
+        expect(s.host.call("gcutRestoreMulti", { startTicks: snap.startTicks }), `cycle ${cycle}`).toEqual({ ok: true });
+        const v = s.seq.videoTracks[0].clips;
+        expect(v.map((i: TrackItem) => [i.start.t / TPF30, i.end.t / TPF30])).toEqual([[3000, 3120]]);
+        expect(v[0].trueIn.seconds, `cycle ${cycle}`).toBeCloseTo(inS, 9);
+      }
+    };
+    it.each([["floored to the sequence's frames (measured)", true], ["as it is", false]])(
+      "59.94 in 30 from source 0, in point reported %s: four Apply → Restore cycles never move it in its source", (_, onSeqGrid) => {
+        cycles(shortScene(60000 / 1001, 0, onSeqGrid), 0, 4);
+      });
+    it("50 in 30, in point reported as it is: four cycles never move it in its source", () => {
+      cycles(shortScene(50, 10, false), 10, 4);
+    });
+    it("59.94 in 30 from source 0 running to the media's end: Apply and Restore are both exact", () => {
+      cycles(shortScene(60000 / 1001, 0, true, true), 0, 1);
+    });
+  });
+
   const removedBefore = (cutsF: number[][], t: number) => cutsF.reduce((n, [a, b]) => n + (b <= t ? b - a : a < t ? t - a : 0), 0);
   /** An item's kept pieces, the host's mapping: [atFrame, endFrame, fromFrame]. */
   const plan = (startF: number, endF: number, cutsF: number[][]) => {
@@ -1753,7 +1815,7 @@ describe("measured in Premiere 26.5.2: classify by EXACT frame rate, audio follo
       }
     });
     it.each([["on the sequence grid", true], ["as it is", false]])(
-      "59.94 in 29.97, a clip from an odd 59.94 frame, its in point reported %s: Apply and Restore land exactly", (_, onSeqGrid) => {
+      "59.94 in 29.97, a clip from an odd 59.94 frame, its in point reported %s: Apply and Restore land on the exact timeline frames", (_, onSeqGrid) => {
         const F2 = 1001 / 60000, tpf = Math.round(F * TICKS);
         const seq = new Seq(1, 1);
         seq.timebase = String(tpf); seq.inPointOnSeqGrid = onSeqGrid;

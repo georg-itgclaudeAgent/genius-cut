@@ -170,6 +170,19 @@ function gcutFits(srcFps, clock) {
     return Math.round(ratio) >= 1 && Math.abs(ratio - Math.round(ratio)) < 1e-5;
 }
 
+/**
+ * A loose clip's true source in point, from the one Premiere reports. Premiere 26.5.2 (measured)
+ * reports a track item's in point floored to the SEQUENCE's frames, but the clip really starts on
+ * one of its own frames (where Premiere floored the set point), in [reported, reported + a sequence
+ * frame). Re-laying from the reported value would floor again and slip a frame earlier on every
+ * Apply or Restore. Exact when the clip's own frames are longer than the sequence's (only one of
+ * them fits there); otherwise the last one that fits, which maps back to itself every time.
+ */
+function gcutTrueInS(reportedS, ownFrameS, seqFrameS) {
+    var own = Math.floor((reportedS + seqFrameS) / ownFrameS - 1e-6) * ownFrameS;
+    return own >= reportedS - 1e-9 ? own : reportedS;
+}
+
 function gcutEffects(item, intrinsic, out) {
     if (!item || !item.components) return;
     for (var i = 0; i < item.components.numItems; i++) {
@@ -380,9 +393,10 @@ function gcutRefind(seq, spec, clock) {
             if (gcutFits(srcFps, clock)) srcFrameS = 1 / srcFps;
             else { loose = true; mediaFrameS = 1 / srcFps; }
         }
+        var inS = loose ? gcutTrueInS(it.inPoint.seconds, mediaFrameS, clock.frameS) : it.inPoint.seconds;
         found.push({ kind: x.kind, trackIndex: x.trackIndex, label: label, item: it, pi: it.projectItem,
                      node: it.projectItem.nodeId, startT: gcutT(it.start), endT: gcutT(it.end),
-                     inS: it.inPoint.seconds, outS: it.outPoint.seconds, srcFrameS: srcFrameS,
+                     inS: inS, outS: it.outPoint.seconds, srcFrameS: srcFrameS,
                      loose: loose, mediaFrameS: mediaFrameS });
     }
     return found;
@@ -519,7 +533,8 @@ function gcutItemPieces(item, cutsT, srcFrameS) {
 
 /**
  * An item laid whole at its own original place, from its own in point (Restore and rollback). A
- * loose item's in point is used as it is: it isn't on the sequence grid its pieces snap to.
+ * loose item's in point (its true one, gcutTrueInS) is used as it is: it isn't on the sequence
+ * grid its pieces snap to, and snapping it would slip it a frame.
  */
 function gcutWhole(f) {
     var srcIn = f.loose ? f.inS : Math.round(f.inS / f.srcFrameS) * f.srcFrameS;
@@ -664,13 +679,14 @@ function gcutTrimTo(track, f, atT, endT, clock) {
 /**
  * True if a laid piece's in point, as Premiere reports it (gotS), fits the planned srcIn. Premiere
  * floors the set point to the source's frames (up to gcutSlackS(f) early), and Premiere 26.5.2
- * (measured) reports a track item's in point floored again, to the SEQUENCE's frames. So: no more
- * than half a sequence frame late, and no earlier than the sequence frame holding srcIn less the
- * slack, less half a frame. For a source whose frames are the sequence's, that is srcIn to half a frame.
+ * (measured) reports a track item's in point floored again, to the SEQUENCE's frames. Both only
+ * ever floor, so: never later than srcIn (to float error), and no earlier than the sequence frame
+ * holding srcIn less the slack, less half a frame. Reported on the sequence's frames, a piece one
+ * frame late reads past srcIn; reported as it is, an exact piece reads srcIn or a little earlier.
  */
 function gcutInPointOk(gotS, srcIn, f, clock) {
     var low = Math.floor((srcIn - gcutSlackS(f)) / clock.frameS + 1e-6) * clock.frameS;
-    return gotS <= srcIn + clock.frameS / 2 && gotS >= low - clock.frameS / 2;
+    return gotS <= srcIn + clock.frameS * 1e-6 && gotS >= low - clock.frameS / 2;
 }
 
 /**

@@ -7,7 +7,7 @@ import type { Health } from "../api/types";
 /** The backend contract this panel speaks (backend/geniuscut/config.py API_VERSION). A backend
  *  left running from an older version is stopped and replaced (Checkpoint B, 2026-10-08: a
  *  day-old backend answered the new panel with "Field required" x4). */
-export const API_VERSION = 2;
+export const API_VERSION = 3; // 3: TrimRequest.frame_s (clean cuts, 2026-10-08)
 
 export const OUTDATED_BACKEND =
   "An older Genius Cut backend is still running. Restart Premiere, or end its python.exe in Task Manager, then try again.";

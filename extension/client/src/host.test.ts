@@ -43,11 +43,14 @@ class ProjectItem {
    *  after the in point already set, floored (off by default). */
   outFromIn = false;
   mediaFps = FPS;
+  /** A file with pictures (a camera, a screen recording). An audio-only file (a .wav, see `wav`) has none, and
+   *  reports no frame rate, or its sample rate. */
+  hasVideo = true;
   constructor(public name: string, public nodeId: string, public durationS: number, public unit: Unit = "seconds", public hasAudio = true) {
     this.outS = durationS;
   }
   getMediaPath() { return `D:/Footage/${this.name}`; }
-  getFootageInterpretation() { return { frameRate: this.mediaFps }; }
+  getFootageInterpretation() { return { frameRate: this.hasVideo || this.mediaFps > 1000 ? this.mediaFps : 0 }; }
   private toSeconds(v: any) {
     const s = this.unit === "seconds" ? Number(v) : Number(v) / TICKS;
     return this.floorToFrames ? Math.floor(s * this.mediaFps) / this.mediaFps : s;
@@ -194,12 +197,25 @@ class Seq {
     const outS = (this.ignoreInOut ? pi.durationS : pi.outS) + (n === this.lateSpanIndex ? this.lateInS : 0);
     const tpf = Number(this.timebase), snap = (ticks: number) => Math.round(ticks / tpf) * tpf; // this sequence's own grid
     const s = snap(startT), durT = snap(Math.round((outS - inS) * TICKS));
-    const v = track.place(pi, s, inS, durT);
+    const it = track.place(pi, s, inS, durT);
+    // Premiere 26.5.2 (measured 2026-10-08) places a file's picture AND sound whichever kind of track it's
+    // called on: a video clip's sound on A(same number), audio from a video file's picture on V(same number).
     if (track.kind === "video" && pi.hasAudio) {
       const a = this.audioTracks[this.audioTrackFor(track.index)].place(pi, s, inS, durT);
-      v.linked = [a]; a.linked = [v];
+      it.linked = [a]; a.linked = [it];
+    }
+    if (track.kind === "audio" && pi.hasVideo && track.index < this.videoTracks.numTracks) {
+      const v = this.videoTracks[track.index].place(pi, s, inS, durT);
+      it.linked = [v]; v.linked = [it];
     }
   }
+}
+
+/** An audio-only file (a .wav): no pictures, so placing it drops nothing on a video track. */
+function wav(name: string, nodeId: string, durationS: number) {
+  const pi = new ProjectItem(name, nodeId, durationS);
+  pi.hasVideo = false;
+  return pi;
 }
 
 function load(seq: Seq) {
@@ -240,7 +256,7 @@ function multiScene({ music = true } = {}) {
   const v3 = seq.videoTracks[2].add(screen, 100, 5, 15);
   const a1 = seq.audioTracks[0].add(wide, 100, 10, 20);
   v1.linked = [a1]; a1.linked = [v1];
-  if (music) seq.audioTracks[2].add(new ProjectItem("music.wav", "node-m", 300, "seconds", false), 90, 0, 40);
+  if (music) seq.audioTracks[2].add(wav("music.wav", "node-m", 300), 90, 0, 40);
   seq.videoTracks[3].add(new ProjectItem("title", "node-t", 30, "seconds", false), 104, 0, 2);
   for (const v of [v1, v2, v3, a1]) v.selected = true;
   wide.inS = 2; wide.outS = 58; close.inS = 0; close.outS = 600;
@@ -252,7 +268,7 @@ function multiScene({ music = true } = {}) {
 function georgScene() {
   const seq = new Seq(4, 3);
   const a = new ProjectItem("Camera A.mov", "node-a", 900), b = new ProjectItem("Camera B.mov", "node-b", 900, "seconds", false);
-  const scr = new ProjectItem("Restream.mov", "node-r", 900, "seconds", false), mic = new ProjectItem("mic.wav", "node-m", 900, "seconds", false);
+  const scr = new ProjectItem("Restream.mov", "node-r", 900, "seconds", false), mic = wav("mic.wav", "node-m", 900);
   const v1 = seq.videoTracks[0].add(a, 100, 10, 20);          // 100–110
   const v2 = seq.videoTracks[1].add(b, 100.24, 30, 39.6);     // 100.24–109.84: starts 0.24 s later, ends 0.16 s earlier
   const v3 = seq.videoTracks[2].add(scr, 100.28, 5, 14.72);   // 100.28–110: starts 0.28 s later
@@ -432,7 +448,7 @@ describe("gcutApplyCutsMulti: one clip", () => {
 
   it("C3: refuses, before changing anything, when unrecorded audio sits where linked audio could land", () => {
     const s = scene();
-    const music = new ProjectItem("music.wav", "node-9", 300);
+    const music = wav("music.wav", "node-9", 300);
     s.seq.audioTracks[1].add(music, 90, 0, 40);
     s.seq.audioTrackFor = () => 1; // Premiere puts the rebuilt audio on A2, over the music
     const items = [{ kind: "video", trackIndex: 0 }, { kind: "audio", trackIndex: 0 }].map((i) => ({ ...i, startTicks: START, endTicks: String(110 * TICKS) }));
@@ -519,7 +535,7 @@ describe("gcutCloseGapMulti: one clip", () => {
     const lv = s.seq.videoTracks[0].add(later, 110, 0, 5);
     const la = s.seq.audioTracks[0].add(later, 110, 0, 5);
     lv.linked = [la]; la.linked = [lv];
-    s.seq.audioTracks[2].add(new ProjectItem("sfx.wav", "node-4", 10), 112, 0, 3);
+    s.seq.audioTracks[2].add(wav("sfx.wav", "node-4", 10), 112, 0, 3);
     applyCuts(s);
   });
 
@@ -538,7 +554,7 @@ describe("gcutCloseGapMulti: one clip", () => {
   });
 
   it("refuses, naming it, a clip on another track that crosses a cut, and moves nothing", () => {
-    s.seq.audioTracks[1].add(new ProjectItem("music.wav", "node-3", 60), 107.5, 0, 1); // 107.5–108.5 crosses 107–108
+    s.seq.audioTracks[1].add(wav("music.wav", "node-3", 60), 107.5, 0, 1); // 107.5–108.5 crosses 107–108
     expect(() => closeGap(s)).toThrow("music.wav on A2 crosses a cut at 1:47.0. Move it, or close the gap by hand.");
     expect(s.seq.videoTracks[0].clips.at(-1).start.seconds).toBeCloseTo(110, 1);
   });
@@ -565,7 +581,7 @@ describe("gcutSnapshotSelection (timeline model)", () => {
   });
   it("uses only the selected audio", () => {
     const s = georgScene();
-    s.seq.audioTracks[2].add(new ProjectItem("music.wav", "node-x", 300, "seconds", false), 90, 0, 40); // unselected
+    s.seq.audioTracks[2].add(wav("music.wav", "node-x", 300), 90, 0, 40); // unselected
     expect(snapshot(s).audio.map((x: any) => x.label)).toEqual(["A1"]);
   });
   it("prompts when no audio is selected", () => {
@@ -575,18 +591,18 @@ describe("gcutSnapshotSelection (timeline model)", () => {
   it("refuses linked audio that isn't selected", () => {
     const s = multiScene({ music: false }); // A1 is V1's own audio (same node)
     s.a1.selected = false;
-    s.seq.audioTracks[1].add(new ProjectItem("mic.wav", "node-m2", 900, "seconds", false), 100, 0, 10).selected = true;
+    s.seq.audioTracks[1].add(wav("mic.wav", "node-m2", 900), 100, 0, 10).selected = true;
     expect(snapshot(s).problems).toContain("A1 is linked to V1 but isn't selected. Select it too, or unlink it.");
   });
   it("flags unselected audio under the selected video clips (a music bed), because the rebuild could overwrite it", () => {
     const s = georgScene();
-    s.seq.audioTracks[2].add(new ProjectItem("music.wav", "node-x", 300, "seconds", false), 90, 0, 40);
+    s.seq.audioTracks[2].add(wav("music.wav", "node-x", 300), 90, 0, 40);
     expect(snapshot(s).problems).toEqual([
       "A3 (music.wav) sits under the selected video clips, and rebuilding them could overwrite it. Select it too, or move it off the clips' time, then Analyse again."]);
   });
   it("doesn't flag unselected audio that lies outside the selected video clips' time", () => {
     const s = georgScene();
-    s.seq.audioTracks[2].add(new ProjectItem("sfx.wav", "node-x", 30, "seconds", false), 110, 0, 5); // starts where the video ends
+    s.seq.audioTracks[2].add(wav("sfx.wav", "node-x", 30), 110, 0, 5); // starts where the video ends
     expect(snapshot(s).problems).toEqual([]);
   });
   it("doesn't count audio from a selected clip's source that lies elsewhere on the timeline as linked", () => {
@@ -601,7 +617,7 @@ describe("gcutSnapshotSelection (timeline model)", () => {
   // A selected item outside the range would only slide at Apply, with no cut and no explanation.
   it("names a selected audio clip that lies wholly outside the video clips' time", () => {
     const s = georgScene();
-    s.seq.audioTracks[1].add(new ProjectItem("lav.wav", "node-v", 900, "seconds", false), 200, 0, 10).selected = true;
+    s.seq.audioTracks[1].add(wav("lav.wav", "node-v", 900), 200, 0, 10).selected = true;
     const r = snapshot(s);
     expect([r.startS, r.durationS]).toEqual([100, 10]);
     expect(r.problems).toEqual(["A2 (lav.wav) is selected but lies outside the video clips' time. Deselect it, then Analyse again."]);
@@ -749,15 +765,15 @@ describe("gcutApplyCutsMulti", () => {
     expect(pieces(s.seq.videoTracks[1])).toEqual([[100, 102, 12], [102, 106, 15], [106, 108, 20]]);
   });
 
-  it("refuses unrecorded audio under the clips (here added after Analyse), naming it, before changing anything", () => {
+  it("refuses unrecorded audio where an angle's own sound lands (here added after Analyse), naming both, before changing anything", () => {
     const s = multiScene({ music: false });
     const snap = snapshot(s);
-    // An angle's linked audio would land on A2 (sim) and destroy it, so it must be caught up front.
-    s.seq.audioTracks[1].add(new ProjectItem("sfx.wav", "node-x", 5, "seconds", false), 103, 0, 1);
+    // V2's own sound lands on A2 (measured: the same track number) and would destroy it, so it must be caught up front.
+    s.seq.audioTracks[1].add(wav("sfx.wav", "node-x", 5), 103, 0, 1);
     const all = () => [...[0, 1, 2, 3].map((t) => pieces(s.seq.videoTracks[t])), ...[0, 1, 2].map((t) => pieces(s.seq.audioTracks[t]))];
     const before = all();
     expect(() => applyCuts(s, cuts, snap)).toThrow(
-      "A2 (sfx.wav) sits under the selected video clips, and rebuilding them could overwrite it. Select it too, or move it off the clips' time, then Analyse again.");
+      "Placing V2 also drops its own sound onto A2, which would cover sfx.wav. Move that clip off A2's time.");
     expect(all()).toEqual(before);
     expect(pieces(s.seq.audioTracks[1])).toEqual([[103, 104, 0]]);
   });
@@ -776,7 +792,7 @@ describe("gcutApplyCutsMulti: stash and rollback safety", () => {
     s.seq.audioTracks[0].clips[0].selected = true;
     const snap2 = snapshot(s);
     expect(snap2).toMatchObject({ found: true, startTicks: START, problems: [] });
-    s.seq.dropSpanIndex = 12; // 12 placements so far: the re-apply's first one silently fails
+    s.seq.dropSpanIndex = 9; // 9 placements so far (V1-V3; A1 comes with V1): the re-apply's first one silently fails
     expect(applyCuts(s, [{ start: 1, end: 2 }], snap2)).toMatchObject({ ok: false, rolledBack: true });
     const rec = stash(s)["m@" + START];
     expect(rec).toBe(first);
@@ -955,7 +971,7 @@ describe("gcutRestoreMulti", () => {
   it("refuses, naming the track, if something was placed in the gap since", () => {
     const s = multiScene({ music: false });
     applyCuts(s);
-    s.seq.audioTracks[2].add(new ProjectItem("hit.wav", "node-h", 5, "seconds", false), 108.5, 0, 1);
+    s.seq.audioTracks[2].add(wav("hit.wav", "node-h", 5), 108.5, 0, 1);
     expect(() => restoreMulti(s)).toThrow(/gap on A3/);
     expect(pieces(s.seq.videoTracks[0])).toEqual([[100, 102, 10], [102, 106, 13], [106, 108, 18]]);
   });
@@ -970,7 +986,7 @@ describe("gcutRestoreMulti", () => {
     const s = multiScene({ music: false });
     applyCuts(s);
     // A2 holds nothing recorded, but the angles' linked audio lands there when Restore re-lays them.
-    s.seq.audioTracks[1].add(new ProjectItem("sfx.wav", "node-x", 5, "seconds", false), 101, 0, 0.5);
+    s.seq.audioTracks[1].add(wav("sfx.wav", "node-x", 5), 101, 0, 0.5);
     expect(() => restoreMulti(s)).toThrow(/A2/);
     expect(pieces(s.seq.audioTracks[1])).toEqual([[101, 101.5, 0]]);
     for (const [t, inS] of [[0, 10], [1, 12], [2, 5]] as const) {
@@ -988,7 +1004,7 @@ describe("gcutRestoreMulti", () => {
   it("a Restore that fails part-way keeps the record, so Close gap still sees the gap", () => {
     const s = multiScene({ music: false });
     applyCuts(s);
-    s.seq.dropSpanIndex = 12; // 12 placements so far: Restore's first (V1) silently fails
+    s.seq.dropSpanIndex = 9; // 9 placements so far (V1-V3; A1 comes with V1): Restore's first (V1) silently fails
     expect(() => restoreMulti(s)).toThrow(/Undo/);
     const rec = (s.host.ctx as any).$.global.gcutStash["m@" + START];
     expect([rec.rebuiltEndT, rec.gapClosed]).toEqual([108 * TICKS, false]);
@@ -1001,7 +1017,7 @@ describe("gcutCloseGapMulti", () => {
   function later(s: ReturnType<typeof multiScene>) {
     const broll = new ProjectItem("broll.mov", "node-b", 60);
     s.seq.videoTracks[0].add(broll, 110, 0, 5);
-    s.seq.audioTracks[2].add(new ProjectItem("sfx.wav", "node-x", 5, "seconds", false), 112, 0, 2);
+    s.seq.audioTracks[2].add(wav("sfx.wav", "node-x", 5), 112, 0, 2);
   }
   it("pulls everything after the edit left by the gap, on every track", () => {
     const s = multiScene({ music: false });
@@ -1014,7 +1030,7 @@ describe("gcutCloseGapMulti", () => {
   it("slides a clip placed after the last cut since Apply by the total", () => {
     const s = multiScene({ music: false });
     applyCuts(s);
-    s.seq.audioTracks[2].add(new ProjectItem("hit.wav", "node-h", 5, "seconds", false), 108.5, 0, 1);
+    s.seq.audioTracks[2].add(wav("hit.wav", "node-h", 5), 108.5, 0, 1);
     expect(closeGapMulti(s)).toEqual({ ok: true, movedCount: 2 });
     expect(layout(s.seq.audioTracks[2])).toEqual([[106.5, 107.5]]);
     expect(layout(s.seq.videoTracks[3])).toEqual([[103, 105]]); // the title (104–106) had one cut before it
@@ -1023,7 +1039,7 @@ describe("gcutCloseGapMulti", () => {
     const s = multiScene({ music: false });
     later(s);
     applyCuts(s);
-    s.seq.audioTracks[2].add(new ProjectItem("hit.wav", "node-h", 5, "seconds", false), 107.5, 0, 1);
+    s.seq.audioTracks[2].add(wav("hit.wav", "node-h", 5), 107.5, 0, 1);
     expect(() => closeGapMulti(s)).toThrow("hit.wav on A3 crosses a cut at 1:47.0. Move it, or close the gap by hand.");
     expect(layout(s.seq.videoTracks[0]).at(-1)).toEqual([110, 115]);
     expect(layout(s.seq.audioTracks[2])).toEqual([[107.5, 108.5], [112, 114]]);
@@ -1118,7 +1134,7 @@ describe("audio items and the frame-rate check", () => {
     const seq = new Seq(1, 1);
     seq.timebase = String(Math.round(F * TICKS));
     const cam = new ProjectItem("cam.mov", "node-c", 900, "seconds", false);
-    const mic = new ProjectItem("mic.wav", "node-m", 900, "seconds", false);
+    const mic = wav("mic.wav", "node-m", 900);
     cam.mediaFps = 30000 / 1001; mic.mediaFps = micFps;
     const v1 = seq.videoTracks[0].add(cam, 2997 * F, 300 * F, 600 * F);
     const a1 = seq.audioTracks[0].add(mic, 2997 * F, 1500 * F, 1800 * F);
@@ -1244,7 +1260,7 @@ describe("a clip whose own frame rate doesn't fit the sequence (cut on timeline 
     const seq = new Seq(2, 1);
     const v1 = seq.videoTracks[0].add(loosePi("Camera B.mov", "node-b"), 100, floorSrc(inS), floorSrc(inS) + 4); // on its own frames, as Premiere lays it
     seq.videoTracks[0].add(new ProjectItem("X.mov", "node-x", 900, "seconds", false), 104, 0, 3);
-    const a1 = seq.audioTracks[0].add(new ProjectItem("mic.wav", "node-m", 900, "seconds", false), 99, 50, 58);
+    const a1 = seq.audioTracks[0].add(wav("mic.wav", "node-m", 900), 99, 50, 58);
     const sel = [v1, a1];
     if (v2) sel.push(seq.videoTracks[1].add(loosePi("Camera C.mov", "node-c"), 100, floorSrc(30.16), floorSrc(30.16) + 6));
     for (const x of sel) x.selected = true;
@@ -1297,7 +1313,7 @@ describe("a clip whose own frame rate doesn't fit the sequence (cut on timeline 
       const seq = new Seq(1, 1);
       seq.timebase = String(TPF30);
       const v1 = seq.videoTracks[0].add(loosePi("Camera B.mov", "node-b"), 100, floorSrc(inS), floorSrc(inS) + 4); // on its own frames, as Premiere lays it
-      const a1 = seq.audioTracks[0].add(new ProjectItem("mic.wav", "node-m", 900, "seconds", false), 99, 50, 56);
+      const a1 = seq.audioTracks[0].add(wav("mic.wav", "node-m", 900), 99, 50, 56);
       v1.selected = true; a1.selected = true;
       return { seq, host: load(seq) };
     }
@@ -1335,7 +1351,7 @@ describe("a clip whose own frame rate doesn't fit the sequence (cut on timeline 
       const pi = new ProjectItem("Camera B.mov", "node-b", floorSrc(inS) + 4, "seconds", false);
       pi.mediaFps = SRC_FPS; pi.floorToFrames = true; pi.clampToMedia = true;
       const v1 = seq.videoTracks[0].add(pi, 100, floorSrc(inS), floorSrc(inS) + 4); // on its own frames, as Premiere lays it
-      const a1 = seq.audioTracks[0].add(new ProjectItem("mic.wav", "node-m", 900, "seconds", false), 99, 50, 56);
+      const a1 = seq.audioTracks[0].add(wav("mic.wav", "node-m", 900), 99, 50, 56);
       v1.selected = true; a1.selected = true;
       return { seq, pi, host: load(seq) };
     }
@@ -1449,27 +1465,29 @@ describe("measured in Premiere 26.5.2: classify by EXACT frame rate, audio follo
   // measured), so a clip already on the timeline starts on one of its own frames.
   const RS_IN = ownGrid(785.3, RESTREAM), B_IN = ownGrid(700.1, CAM_B), A_IN = ownGrid(1002.478, CAM_A);
   /** Georg's sequence (30 fps): Restream on V1 with its own audio on A1 (0–120 s, from ≈785.3 s), Camera B
-   *  on V2 (0.5–119 s), Camera A on V3 (1–121 s) whose source ends exactly where the clip does. */
-  function restreamScene() {
-    const seq = new Seq(3, 1);
+   *  on V2 (0.5–119 s), Camera A on V3 (1–121 s) whose source ends exactly where the clip does. With
+   *  `camerasSound` (the 2026-10-08 field run on copies), the cameras bring their own sound too, which Premiere
+   *  drops on A2 and A3 (empty, unrecorded); `len` shortens every clip (the field copies were 20 s). */
+  function restreamScene({ camerasSound = false, len = 120 } = {}) {
+    const seq = new Seq(3, camerasSound ? 3 : 1);
     seq.timebase = String(TPF30); seq.inPointOnSeqGrid = true;
     const rs = measured("Restream.io.mp4", "node-r", 6219.453, RESTREAM, true);
-    const camB = measured("Camera B.mov", "node-b", 3600, CAM_B, false);
-    const camA = measured("Camera A.mov", "node-a", A_IN + 120, CAM_A, false);
+    const camB = measured("Camera B.mov", "node-b", 3600, CAM_B, camerasSound);
+    const camA = measured("Camera A.mov", "node-a", A_IN + len, CAM_A, camerasSound);
     camA.clampToMedia = true;
-    const v1 = seq.videoTracks[0].add(rs, 0, RS_IN, RS_IN + 120);
-    const a1 = seq.audioTracks[0].add(rs, 0, RS_IN, RS_IN + 120);
+    const v1 = seq.videoTracks[0].add(rs, 0, RS_IN, RS_IN + len);
+    const a1 = seq.audioTracks[0].add(rs, 0, RS_IN, RS_IN + len);
     v1.linked = [a1]; a1.linked = [v1];
-    const v2 = seq.videoTracks[1].add(camB, 0.5, B_IN, B_IN + 118.5);
-    const v3 = seq.videoTracks[2].add(camA, 1, A_IN, A_IN + 120);
+    const v2 = seq.videoTracks[1].add(camB, 0.5, B_IN, B_IN + len - 1.5);
+    const v3 = seq.videoTracks[2].add(camA, 1, A_IN, A_IN + len);
     for (const x of [v1, v2, v3, a1]) x.selected = true;
-    return { seq, rs, camB, camA, host: load(seq) };
+    /** Each track's clip: [startFrame, endFrame, true source in, own frame length]. */
+    const orig: [number, number, number, number][] = [[0, 30 * len, RS_IN, 1 / RESTREAM], [15, 30 * (len - 1), B_IN, 1 / CAM_B],
+      [30, 30 * (len + 1), A_IN, 1 / CAM_A], [0, 30 * len, RS_IN, 1 / RESTREAM]];
+    return { seq, rs, camB, camA, orig, host: load(seq) };
   }
   type Scene = ReturnType<typeof restreamScene>;
   const tracks = (s: Scene) => [s.seq.videoTracks[0], s.seq.videoTracks[1], s.seq.videoTracks[2], s.seq.audioTracks[0]];
-  /** Each track's clip: [startFrame, endFrame, true source in, own frame length]. */
-  const ORIGINAL: [number, number, number, number][] = [[0, 3600, RS_IN, 1 / RESTREAM], [15, 3570, B_IN, 1 / CAM_B],
-    [30, 3630, A_IN, 1 / CAM_A], [0, 3600, RS_IN, 1 / RESTREAM]];
   /** Select every clip again, as the editor would after Restore lays fresh ones. */
   const reselect = (t: Track[]) => { for (const x of t) for (const i of x.items) i.selected = true; };
 
@@ -1539,7 +1557,7 @@ describe("measured in Premiere 26.5.2: classify by EXACT frame rate, audio follo
       const seq = new Seq(1, 1);
       seq.inPointOnSeqGrid = true;
       const camB = measured("Camera B.mov", "node-b", 900, CAM_B, false);
-      const mic = new ProjectItem("mic.wav", "node-m", 900, "seconds", false);
+      const mic = wav("mic.wav", "node-m", 900);
       mic.mediaFps = 0;
       const inS = onGrid ? ownGrid(30, CAM_B) : 30;
       const v1 = seq.videoTracks[0].add(camB, 100.24, inS, inS + 9.6);
@@ -1572,7 +1590,7 @@ describe("measured in Premiere 26.5.2: classify by EXACT frame rate, audio follo
   /** Every piece exactly on its planned sequence frames, and its true source in point no later than planned and
    *  at most one sequence frame (the reported in point is floored to them) plus one own frame earlier. */
   const expectLayout = (s: Scene, cutsF: number[][]) => tracks(s).forEach((t, k) => {
-    const [startF, endF, inS, ownF] = ORIGINAL[k], want = plan(startF, endF, cutsF), clips = t.clips;
+    const [startF, endF, inS, ownF] = s.orig[k], want = plan(startF, endF, cutsF), clips = t.clips;
     expect(clips.map((i: TrackItem) => [i.start.t, i.end.t]), `track ${k}`).toEqual(want.map(([a, b]) => [a * TPF30, b * TPF30]));
     want.forEach(([, , from], i) => {
       const planned = inS + (from - startF) / 30, got = clips[i].trueIn.seconds;
@@ -1616,13 +1634,62 @@ describe("measured in Premiere 26.5.2: classify by EXACT frame rate, audio follo
     expectOriginal(s);
   });
 
+  describe("the 2026-10-08 field run: Restream's own sound on A1, the cameras' own sound dropped on A2 and A3", () => {
+    // Field: "Kept span 4 of 4 on V1 didn't land where or as expected", and a rollback that left V1 0–19.9667 plus a
+    // 1-frame clip: laying A1 (Restream's sound, from a video file) dropped untrimmed pictures on V1 over its pieces.
+    const FIELD: number[][] = [[2, 3], [7, 8.5], [12.3, 12.9]];
+    const field = (len = 120) => restreamScene({ camerasSound: true, len });
+    const noStrays = (s: Scene) => expect([1, 2].map((t) => pieces(s.seq.audioTracks[t]))).toEqual([[], []]);
+    const backToBack = (s: Scene) => {
+      for (const t of tracks(s)) for (let i = 1; i < t.clips.numItems; i++) expect(t.clips[i].start.t).toBe(t.clips[i - 1].end.t);
+    };
+
+    it("the field's 20 s copies and cuts: Apply lays every track exactly with no camera sound left; Restore puts every clip back exactly", () => {
+      const s = field(20), snap = snapshot(s);
+      expect(applyCuts(s, cutsOf(FIELD), snap)).toMatchObject({ ok: true, clipCount: 4 });
+      expectLayout(s, toF(FIELD));
+      backToBack(s);
+      noStrays(s);
+      expect(s.host.call("gcutRestoreMulti", { startTicks: snap.startTicks })).toEqual({ ok: true });
+      expectOriginal(s);
+      noStrays(s);
+    });
+
+    it.each(cases)("120 s clips, cuts %j: Apply lays every track exactly with no camera sound left; Restore puts every clip back exactly", (...c) => {
+      const s = field(), snap = snapshot(s);
+      expect(applyCuts(s, cutsOf(c), snap)).toMatchObject({ ok: true, clipCount: 4 });
+      expectLayout(s, toF(c));
+      backToBack(s);
+      noStrays(s);
+      expect(s.host.call("gcutRestoreMulti", { startTicks: snap.startTicks })).toEqual({ ok: true });
+      expectOriginal(s);
+      noStrays(s);
+    });
+
+    // 12 placements: V1, V2 and V3 four pieces each (A1 comes with V1's). 0: V1's first; 3: V1's last; 4: V2's first; 11: V3's last.
+    it.each([0, 3, 4, 11])("20 s copies: a piece landing wrong (placement %s) rolls every clip back to its exact original place", (n) => {
+      const s = field(20);
+      s.seq.dropSpanIndex = n;
+      expect(applyCuts(s, cutsOf(FIELD))).toMatchObject({ ok: false, rolledBack: true });
+      expectOriginal(s);
+      noStrays(s);
+    });
+
+    it("records A1 as audio from a video file, and the cameras' clips as video", () => {
+      const s = field();
+      expect(applyCuts(s, cutsOf(FIELD))).toMatchObject({ ok: true });
+      const rec: any = Object.values((s.host.ctx as any).$.global.gcutStash)[0];
+      expect(rec.items.map((i: any) => [i.label, i.av])).toEqual([["V1", false], ["V2", false], ["V3", false], ["A1", true]]);
+    });
+  });
+
   it("accepts a piece whose reported in point is floored twice (its own frames, then the sequence's)", () => {
     // Camera A alone at 100–104 s from A_IN; the mic is an audio-only file. Find a piece whose planned source time
     // Premiere reports more than half a sequence frame plus one of Camera A's frames early.
     const seq = new Seq(1, 1);
     seq.timebase = String(TPF30); seq.inPointOnSeqGrid = true;
     const camA = measured("Camera A.mov", "node-a", A_IN + 120, CAM_A, false);
-    const mic = new ProjectItem("mic.wav", "node-m", 900, "seconds", false);
+    const mic = wav("mic.wav", "node-m", 900);
     mic.mediaFps = 0;
     const v1 = seq.videoTracks[0].add(camA, 100, A_IN, A_IN + 4);
     const a1 = seq.audioTracks[0].add(mic, 100, 50, 54);
@@ -1653,7 +1720,7 @@ describe("measured in Premiere 26.5.2: classify by EXACT frame rate, audio follo
     const seq = new Seq(1, 1);
     seq.timebase = String(TPF30); seq.inPointOnSeqGrid = true;
     const camB = measured("Camera B.mov", "node-b", 3600, CAM_B, false);
-    const mic = new ProjectItem("mic.wav", "node-m", 900, "seconds", false);
+    const mic = wav("mic.wav", "node-m", 900);
     mic.mediaFps = 0;
     const v1 = seq.videoTracks[0].add(camB, 100, IN, IN + 4);
     const a1 = seq.audioTracks[0].add(mic, 100, 50, 54);
@@ -1691,7 +1758,7 @@ describe("measured in Premiere 26.5.2: classify by EXACT frame rate, audio follo
         const seq = new Seq(1, 1);
         seq.timebase = String(tpf); seq.inPointOnSeqGrid = onSeqGrid;
         const cam = measured("cam.mov", "node-c", 900, 60000 / 1001, false);
-        const mic = new ProjectItem("mic.wav", "node-m", 900, "seconds", false);
+        const mic = wav("mic.wav", "node-m", 900);
         mic.mediaFps = 0;
         const v1 = seq.videoTracks[0].add(cam, 2997 * F, 601 * F2, 601 * F2 + 300 * F);
         const a1 = seq.audioTracks[0].add(mic, 2997 * F, 1500 * F, 1800 * F);
@@ -1707,5 +1774,110 @@ describe("measured in Premiere 26.5.2: classify by EXACT frame rate, audio follo
         expect(s.host.call("gcutRestoreMulti", { startTicks: snap.startTicks })).toEqual({ ok: true });
         expect(seq.videoTracks[0].clips.map((i: TrackItem) => [i.start.t / tpf, i.end.t / tpf])).toEqual([[2997, 3297]]);
       });
+  });
+});
+
+describe("measured in Premiere 26.5.2: a file's picture and sound land together, whichever kind of track it's placed on", () => {
+  /** Camera A (no sound of its own here) on V1 at 100–110, and Zoom.mp4's sound (a video file) selected on A(zoomOn+1)
+   *  at 99–111 from 50 s; with zoomOn = 1, mic.wav (audio-only) on A1 at 99–111 too. All selected. */
+  function zoomScene({ nV = 2, zoomOn = 1, loose = false } = {}) {
+    const seq = new Seq(nV, 2);
+    const cam = new ProjectItem("Camera A.mov", "node-a", 900, "seconds", false);
+    const zoom = new ProjectItem("Zoom.mp4", "node-z", 900);
+    let zoomIn = 50;
+    if (loose) { zoom.mediaFps = 29.9950808; zoom.floorToFrames = true; zoom.outFromIn = true; zoomIn = Math.floor(50 * zoom.mediaFps) / zoom.mediaFps; }
+    const sel = [seq.videoTracks[0].add(cam, 100, 10, 20), seq.audioTracks[zoomOn].add(zoom, 99, zoomIn, zoomIn + 12)];
+    if (zoomOn === 1) sel.push(seq.audioTracks[0].add(wav("mic.wav", "node-m", 900), 99, 50, 62));
+    for (const x of sel) x.selected = true;
+    return { seq, zoom, host: load(seq) };
+  }
+  const everything = (seq: Seq) => [...Array.from({ length: seq.videoTracks.numTracks }, (_, t) => layout(seq.videoTracks[t])),
+    ...Array.from({ length: seq.audioTracks.numTracks }, (_, t) => layout(seq.audioTracks[t]))];
+  const APPLIED = [[[100, 102], [102, 106], [106, 108]], [], [[99, 102], [102, 106], [106, 109]], [[99, 102], [102, 106], [106, 109]]];
+  const ORIGINAL = [[[100, 110]], [], [[99, 111]], [[99, 111]]];
+
+  it.each([["fitting", false], ["loose (29.995 fps in 25)", true]])(
+    "%s audio from a video file over an empty video track: the picture it drops is removed; Apply, Restore and rollback are exact", (_, loose) => {
+      const s = zoomScene({ loose });
+      expect(applyCuts(s, cuts)).toMatchObject({ ok: true, clipCount: 3 });
+      expect(everything(s.seq)).toEqual(APPLIED);
+      expect(s.host.call("gcutRestoreMulti", { startTicks: START })).toEqual({ ok: true });
+      expect(everything(s.seq)).toEqual(ORIGINAL);
+
+      const bad = zoomScene({ loose });
+      bad.seq.dropSpanIndex = 4; // Zoom's 3 pieces go first, then V1's: the 5th placement is V1's second piece
+      expect(applyCuts(bad, cuts)).toMatchObject({ ok: false, rolledBack: true });
+      expect(everything(bad.seq)).toEqual(ORIGINAL);
+    });
+
+  it("refuses audio from a video file whose picture would land on a clip it didn't record, changing nothing", () => {
+    const s = zoomScene();
+    s.seq.videoTracks[1].add(new ProjectItem("logo.png", "node-l", 5, "seconds", false), 104, 0, 2); // on V2, not selected
+    const before = everything(s.seq);
+    expect(() => applyCuts(s, cuts)).toThrow("A2's audio comes from a video file, and Premiere drops its picture onto V2 when it's placed. " +
+      "Move that audio to a track whose video track has nothing else under it, or select that video too.");
+    expect(everything(s.seq)).toEqual(before);
+  });
+
+  it("refuses audio from a video file under a selected video clip from a different file, changing nothing", () => {
+    const s = zoomScene({ zoomOn: 0 });
+    const before = everything(s.seq);
+    expect(() => applyCuts(s, cuts)).toThrow("A1's audio and V1's video come from different files, so Genius Cut can't place both on these tracks. " +
+      "Put the audio on a track number with no selected video.");
+    expect(everything(s.seq)).toEqual(before);
+  });
+
+  it("refuses audio from a video file on a track number the sequence has no video track for, changing nothing", () => {
+    const s = zoomScene({ nV: 1 });
+    const before = everything(s.seq);
+    expect(() => applyCuts(s, cuts)).toThrow("A2's audio comes from a video file, and Premiere drops its picture onto V2 when it's placed, " +
+      "but this sequence has no V2. Add a video track, then Apply again.");
+    expect(everything(s.seq)).toEqual(before);
+  });
+
+  it.each([["starts before it (a J cut)", 99, 9], ["has slipped out of sync", 100, 10.5]])(
+    "refuses a camera's own sound that %s, changing nothing", (_, startS, inS) => {
+      const s = scene();
+      s.a.start = Time.s(startS); s.a.inPoint = Time.s(inS);
+      const before = everything(s.seq);
+      expect(() => applyCuts(s)).toThrow("A1's audio comes from the same file as V1's video but doesn't start with it in sync, so Genius Cut " +
+        "can't place both on these tracks. Line them up, or put the audio on a track number with no selected video.");
+      expect(everything(s.seq)).toEqual(before);
+    });
+
+  it.each([["fitting", 25], ["loose (24 fps in 25)", 24]])("%s: a camera's own sound running past its picture (an L cut) keeps its tail; Restore is exact", (_, fps) => {
+    const s = scene();
+    s.pi.mediaFps = fps; s.pi.floorToFrames = true;
+    s.a.end = Time.s(112);
+    expect(applyCuts(s)).toMatchObject({ ok: true });
+    expect(everything(s.seq)).toEqual([[[100, 102], [102, 106], [106, 108]], [], [[100, 102], [102, 106], [106, 110]], [], []]);
+    expect(span(s.seq.audioTracks[0]).map((x: number[]) => x[2])).toEqual([10, 13, 18]);
+    expect(restore(s)).toEqual({ ok: true });
+    expect(everything(s.seq)).toEqual([[[100, 110]], [], [[100, 112]], [], []]);
+  });
+
+  it("Restore refuses when a clip was placed where a camera's own sound would drop its picture, beyond the camera's clip", () => {
+    const s = scene();
+    s.a.end = Time.s(112);
+    expect(applyCuts(s)).toMatchObject({ ok: true });
+    s.seq.videoTracks[0].add(new ProjectItem("logo.png", "node-l", 5, "seconds", false), 110.4, 0, 0.6); // past V1's 110, under A1's 112
+    expect(() => restore(s)).toThrow(/V1/);
+    expect(layout(s.seq.videoTracks[0])).toContainEqual([110.4, 111]);
+  });
+
+  it("an audio-only mic.wav (Georg's A1) is laid last and drops nothing; the cameras' own sound is removed", () => {
+    const s = georgScene();
+    s.b.hasAudio = true; // Camera A and Camera B both bring their own sound, onto A1 and A2
+    expect(applyCuts(s, cuts)).toMatchObject({ ok: true, clipCount: 4 });
+    expect(span(s.seq.videoTracks[0])).toEqual([[100, 102, 10], [102, 106, 13], [106, 108, 18]]);
+    expect(span(s.seq.videoTracks[1])).toEqual([[100.24, 102, 30], [102, 106, 32.76], [106, 107.84, 37.76]]);
+    expect(span(s.seq.audioTracks[0])).toEqual([[99, 102, 50], [102, 106, 54], [106, 109, 59]]);
+    expect(s.seq.audioTracks[1].clips.numItems + s.seq.audioTracks[2].clips.numItems).toBe(0);
+    const rec = (s.host.ctx as any).$.global.gcutStash["m@" + START];
+    expect(rec.items.find((i: any) => i.label === "A1").av).toBe(false);
+    expect(s.host.call("gcutRestoreMulti", { startTicks: START })).toEqual({ ok: true });
+    expect(span(s.seq.audioTracks[0])).toEqual([[99, 111, 50]]);
+    expect(span(s.seq.videoTracks[1])).toEqual([[100.24, 109.84, 30]]);
+    expect(s.seq.audioTracks[1].clips.numItems + s.seq.audioTracks[2].clips.numItems).toBe(0);
   });
 });

@@ -1192,7 +1192,7 @@ describe("audio items and the frame-rate check", () => {
     // The cut is frames 3057–3087: 2997–3057 from 10 s, then 3057–3267 from 10 s + 90 sequence frames.
     expect(v.map((i: TrackItem) => [i.start.t / tpf, i.end.t / tpf])).toEqual([[2997, 3057], [3057, 3267]]);
     expect(v[0].inPoint.seconds).toBeCloseTo(10, 6);
-    expect(v[1].inPoint.seconds).toBeCloseTo(10 + 90 * F, 6);
+    expect(v[1].inPoint.seconds).toBeCloseTo(Math.round((10 + 90 * F) * 25) / 25, 6); // the nearest 25 fps frame (clean cuts)
   });
 });
 
@@ -1234,11 +1234,11 @@ describe("a clip whose own frame rate doesn't fit the sequence (cut on timeline 
     expect(applyCuts(s, cuts)).toMatchObject({ ok: true, clipCount: 4 });
     const v2 = s.seq.videoTracks[1].clips;
     expect(ticks(s.seq.videoTracks[1])).toEqual([[at(100.24), at(102)], [at(102), at(106)], [at(106), at(107.84)]]);
-    // From the original in point plus the piece's offset, floored to a source frame at most.
+    // From the original in point plus the piece's offset, on the nearest source frame (clean cuts): half a frame at most.
     [0, 2.76, 7.76].forEach((off, i) => {
       const want = floorSrc(30) + off, got = v2[i].inPoint.seconds;
-      expect(got).toBeLessThanOrEqual(want + 1e-9);
-      expect(got).toBeGreaterThan(want - SRC_FRAME);
+      expect(Math.abs(got - want)).toBeLessThanOrEqual(SRC_FRAME / 2 + 1e-9);
+      expect(Math.abs(got * SRC_FPS - Math.round(got * SRC_FPS))).toBeLessThan(1e-6);
     });
     fitting(s);
     expect(span(s.seq.videoTracks[3])).toEqual([[112, 115, 0]]);
@@ -1649,15 +1649,17 @@ describe("measured in Premiere 26.5.2: classify by EXACT frame rate, audio follo
     push(cursor, endF);
     return out;
   };
-  /** Every piece exactly on its planned sequence frames, and its true source in point no later than planned and
-   *  at most one sequence frame (the reported in point is floored to them) plus one own frame earlier. */
+  /** Every piece exactly on its planned sequence frames, and its true source in point on the NEAREST of its own
+   *  frames to the plan: within half an own frame either side (clean cuts, 2026-10-08). The one exception is a piece
+   *  that runs to its media's very end (Camera A's last): it can't start later, so it starts on the frame below. */
   const expectLayout = (s: Scene, cutsF: number[][]) => tracks(s).forEach((t, k) => {
     const [startF, endF, inS, ownF] = s.orig[k], want = plan(startF, endF, cutsF), clips = t.clips;
     expect(clips.map((i: TrackItem) => [i.start.t, i.end.t]), `track ${k}`).toEqual(want.map(([a, b]) => [a * TPF30, b * TPF30]));
     want.forEach(([, , from], i) => {
       const planned = inS + (from - startF) / 30, got = clips[i].trueIn.seconds;
-      expect(got, `track ${k} piece ${i}`).toBeLessThanOrEqual(planned + 1e-9);
-      expect(got, `track ${k} piece ${i}`).toBeGreaterThan(planned - SEQ_F - ownF);
+      const toMediaEnd = k === 2 && i === want.length - 1;
+      expect(got, `track ${k} piece ${i}`).toBeLessThanOrEqual(planned + (toMediaEnd ? 1e-9 : ownF / 2 + 1e-9));
+      expect(got, `track ${k} piece ${i}`).toBeGreaterThan(planned - (toMediaEnd ? ownF : ownF / 2 + 1e-9));
     });
   });
   const expectOriginal = (s: Scene) => expectLayout(s, []);
@@ -1745,9 +1747,9 @@ describe("measured in Premiere 26.5.2: classify by EXACT frame rate, audio follo
     });
   });
 
-  it("accepts a piece whose reported in point is floored twice (its own frames, then the sequence's)", () => {
+  it("accepts a piece on its nearest own frame whose reported in point is then floored to the sequence's frames", () => {
     // Camera A alone at 100–104 s from A_IN; the mic is an audio-only file. Find a piece whose planned source time
-    // Premiere reports more than half a sequence frame plus one of Camera A's frames early.
+    // Premiere reports more than half a sequence frame early: the nearest own frame below it, floored again.
     const seq = new Seq(1, 1);
     seq.timebase = String(TPF30); seq.inPointOnSeqGrid = true;
     const camA = measured("Camera A.mov", "node-a", A_IN + 120, CAM_A, false);
@@ -1757,8 +1759,8 @@ describe("measured in Premiere 26.5.2: classify by EXACT frame rate, audio follo
     const a1 = seq.audioTracks[0].add(mic, 100, 50, 54);
     v1.selected = true; a1.selected = true;
     const s = { seq, host: load(seq) };
-    const reported = (p: number) => seqGrid(ownGrid(p, CAM_A));
-    const j = Array.from({ length: 104 }, (_, k) => k + 16).find((k) => reported(A_IN + k / 30) < A_IN + k / 30 - SEQ_F / 2 - 1 / CAM_A)!;
+    const reported = (p: number) => seqGrid(Math.round(p * CAM_A) / CAM_A);
+    const j = Array.from({ length: 104 }, (_, k) => k + 16).find((k) => reported(A_IN + k / 30) < A_IN + k / 30 - SEQ_F / 2 - 1e-6)!;
     expect(j).toBeDefined();
     expect(applyCuts(s, [{ start: j / 30 - 0.5, end: j / 30 }])).toMatchObject({ ok: true });
     const piece = seq.videoTracks[0].clips[1];

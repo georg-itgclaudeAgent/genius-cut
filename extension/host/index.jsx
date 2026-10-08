@@ -519,17 +519,19 @@ function gcutNewEnd(f, cutsT) { return f.endT - gcutRemovedBefore(cutsT, f.endT)
  * An item {startT, endT, inS}'s kept stretches [{fromT, durT, atT, srcIn}]: each lands at
  * atT = fromT - removedBefore(fromT), the same mapping for every item, from source in point
  * inS + (fromT - startT) snapped to the grid srcFrameS: the source's frames (Premiere rounds set
- * points down to them), or the sequence's for audio. A loose item's (see gcutRefind) is used as it
- * is: snapped, it could sit up to half a frame late, and a piece running to the very end of its
- * source would then need media past the end to reach its planned length.
+ * points down to them), or the sequence's for audio. A loose item's (see gcutRefind) goes to the
+ * NEAREST of its own frames (clean cuts, 2026-10-08): Premiere would floor it up to a whole own frame
+ * early (58 ms for Camera B), which moved quiet cut edges onto speech; the nearest is at most half
+ * a frame off. rawIn keeps the exact time: a piece running to the very end of its source can't
+ * start later than that, and gcutLayItem falls back to the frame below it (gcutLayPiece).
  */
 function gcutItemPieces(item, cutsT, srcFrameS) {
     var out = [], cursor = item.startT;
     function push(fromT, toT) {
         if (toT <= fromT) return;
-        var srcIn = item.inS + (fromT - item.startT) / GCUT_TICKS;
-        if (!item.loose) srcIn = Math.round(srcIn / srcFrameS) * srcFrameS;
-        out.push({ fromT: fromT, durT: toT - fromT, atT: fromT - gcutRemovedBefore(cutsT, fromT), srcIn: srcIn });
+        var rawIn = item.inS + (fromT - item.startT) / GCUT_TICKS;
+        var srcIn = item.loose ? Math.round(rawIn / item.mediaFrameS) * item.mediaFrameS : Math.round(rawIn / srcFrameS) * srcFrameS;
+        out.push({ fromT: fromT, durT: toT - fromT, atT: fromT - gcutRemovedBefore(cutsT, fromT), srcIn: srcIn, rawIn: item.loose ? rawIn : undefined });
     }
     for (var i = 0; i < cutsT.length; i++) {
         var c = cutsT[i];
@@ -708,23 +710,47 @@ function gcutLayItem(seq, f, pieces, clock, sound) {
     var overT = f.loose ? Math.max(1, Math.ceil(f.mediaFrameS / clock.frameS - 1e-9)) * clock.tpf : 0;
     var lastEndT = pieces.length ? pieces[pieces.length - 1].atT + pieces[pieces.length - 1].durT : 0;
     for (var p = 0; p < pieces.length; p++) {
-        // srcIn is already on the source frame grid (Premiere rounds set points down to it); a
-        // quarter frame later is the fallback when floating-point error rounds it a frame low.
-        var srcIn = pieces[p].srcIn, endT = pieces[p].atT + pieces[p].durT, nudge = f.srcFrameS / 4;
+        var endT = pieces[p].atT + pieces[p].durT;
         var spill = f.loose && endT + overT + f.mediaFrameS * GCUT_TICKS <= lastEndT;
-        var srcOut = srcIn + (pieces[p].durT + (spill ? overT : 0)) / GCUT_TICKS;
-        try { gcutSetRange(f.pi, srcIn, srcOut, tolS); }
-        catch (rangeErr) { gcutSetRange(f.pi, srcIn + nudge, srcOut + nudge, tolS); }
-        if (f.loose && !spill) {
-            var shortOut = f.pi.getInPoint().seconds + pieces[p].durT / GCUT_TICKS;
-            if (f.pi.getOutPoint().seconds > shortOut && !gcutSetOne(f.pi, "out", shortOut, tolS)) {
-                throw new Error("Premiere didn't accept the source out point " + shortOut.toFixed(3) + " s.");
-            }
+        try {
+            gcutLayPiece(track, f, pieces[p], pieces[p].srcIn, spill ? overT : 0, tolS, clock);
+        } catch (layErr) {
+            // A piece set on the own frame after its exact time needs that much media past its
+            // end: at the very end of the source there is none, and its end won't extend. Lay it
+            // again from the frame below its exact time, where it always fits.
+            var below = pieces[p].rawIn === undefined ? null : Math.floor(pieces[p].rawIn / f.mediaFrameS + 1e-6) * f.mediaFrameS;
+            if (below === null || below >= pieces[p].srcIn - 1e-9) throw layErr;
+            pieces[p].srcIn = below;
+            gcutLayPiece(track, f, pieces[p], below, 0, tolS, clock);
         }
-        track.overwriteClip(f.pi, String(pieces[p].atT));
-        if (f.loose) gcutTrimTo(track, f, pieces[p].atT, endT, clock);
         if (sound && sound.ends[p] !== null) gcutTrimTo(soundTrack, sound.f, pieces[p].atT, sound.ends[p], clock);
     }
+}
+
+/**
+ * Lay one piece ({durT, atT}) from source time srcIn, overrunning by overT ticks (a loose piece
+ * laid long, see gcutLayItem), and set a loose piece's end to its planned end. srcIn is on the
+ * source frame grid (a fitting item's frames, a loose item's own: Premiere rounds set points down
+ * to them). A loose piece's set point is aimed a quarter of an own frame after its frame, so the
+ * floor lands on that frame whatever the float error (if Premiere holds the aim as it is, without
+ * flooring, the frame itself is set instead); a fitting item falls back to a quarter frame later
+ * only when float error rounds it a frame low.
+ */
+function gcutLayPiece(track, f, piece, srcIn, overT, tolS, clock) {
+    var endT = piece.atT + piece.durT, nudge = f.srcFrameS / 4, lenS = (piece.durT + overT) / GCUT_TICKS;
+    var frame = f.loose ? Math.floor(srcIn / f.mediaFrameS + 1e-6) * f.mediaFrameS : srcIn;
+    var aim = f.loose ? frame + f.mediaFrameS / 4 : srcIn;
+    try { gcutSetRange(f.pi, aim, aim + lenS, tolS); }
+    catch (rangeErr) { gcutSetRange(f.pi, aim + nudge, aim + nudge + lenS, tolS); }
+    if (f.loose && f.pi.getInPoint().seconds > frame + f.mediaFrameS / 8) gcutSetRange(f.pi, frame, frame + lenS, tolS);
+    if (f.loose && !overT) {
+        var shortOut = f.pi.getInPoint().seconds + piece.durT / GCUT_TICKS;
+        if (f.pi.getOutPoint().seconds > shortOut && !gcutSetOne(f.pi, "out", shortOut, tolS)) {
+            throw new Error("Premiere didn't accept the source out point " + shortOut.toFixed(3) + " s.");
+        }
+    }
+    track.overwriteClip(f.pi, String(piece.atT));
+    if (f.loose) gcutTrimTo(track, f, piece.atT, endT, clock);
 }
 
 /** The clip of `f`'s source starting at atT on this track, or null. */
@@ -747,7 +773,9 @@ function gcutTrimTo(track, f, atT, endT, clock) {
 }
 
 /**
- * True if a laid piece's in point, as Premiere reports it (gotS), fits the planned srcIn. Premiere
+ * True if a laid piece's in point, as Premiere reports it (gotS), fits the planned srcIn. A loose
+ * piece's srcIn is already the own frame it is placed on: the nearest to its exact time, up to half
+ * an own frame LATER than that (gcutItemPieces), so the bound below is against that frame. Premiere
  * floors the set point to the source's frames (up to gcutSlackS(f) early), and Premiere 26.5.2
  * (measured) reports a track item's in point floored again, to the SEQUENCE's frames. Both only
  * ever floor, so: never later than srcIn (to float error), and no earlier than the sequence frame

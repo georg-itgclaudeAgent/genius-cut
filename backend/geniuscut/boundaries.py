@@ -82,3 +82,57 @@ def refine(cuts: list[CutSpan], words: list[Word], duration: float, pad: float =
             end = max(c.end, _quietest(end, max(c.end, next_start - SEARCH_S), min(duration, next_start + 0.05), env, quiet))
         out.append(CutSpan(start=round(start, 3), end=round(end, 3), text=c.text, reason=c.reason))
     return out
+
+
+def _level(t: float, env: np.ndarray) -> float:
+    i = min(len(env) - 1, max(0, int(round(t * 100))))
+    return float(env[i])
+
+
+def _snap_edge(edge: float, lo: float, hi: float, frame_s: float, env: np.ndarray | None) -> float:
+    """The quietest frame boundary within one frame of `edge` that lies in [lo, hi] (ties: the
+    nearest); if none does, the nearest boundary in [lo, hi]; if there's none at all, `edge`."""
+    if hi < lo:
+        return edge
+    k = round(edge / frame_s)
+    near = [j * frame_s for j in range(k - 2, k + 3)]
+    fits = [b for b in near if abs(b - edge) <= frame_s + EPS / 10 and lo - 1e-9 <= b <= hi + 1e-9]
+    if not fits:
+        first, last = int(np.ceil(lo / frame_s - 1e-9)), int(np.floor(hi / frame_s + 1e-9))
+        inside = [j * frame_s for j in range(first, last + 1)]
+        return min(inside, key=lambda b: abs(b - edge)) if inside else edge
+    if env is None or not len(env):
+        return min(fits, key=lambda b: abs(b - edge))
+    return min(fits, key=lambda b: (_level(b, env), abs(b - edge)))
+
+
+def snap_to_frames(cuts: list[CutSpan], words: list[Word], duration: float, frame_s: float,
+                   env: np.ndarray | None = None) -> list[CutSpan]:
+    """Put each cut edge on a sequence frame boundary (frames counted from the range start, which
+    is on the timeline's grid), so the host's snap to whole frames leaves it where it is: on the
+    real 5:37 clip (2026-10-08) that rounding moved 24 of 34 quiet edges onto speech. Each edge goes
+    to the quietest boundary within one frame, never into a neighbouring word as Whisper timed it,
+    and never so the cut leaves part of a word it removes. Cuts that touched still touch."""
+    if frame_s <= 0:
+        raise ValueError("frame_s must be positive")
+    out: list[CutSpan] = []
+    prev_orig_end = None
+    for c in sorted(cuts, key=lambda c: c.start):
+        inside = [x for x in words if x.end > c.start + EPS and x.start < c.end - EPS]
+        before = [min(x.end, c.start) for x in words if x.start < c.start - EPS]
+        after = [max(x.start, c.end) for x in words if x.end > c.end + EPS]
+        if c.start <= EPS:
+            start = c.start
+        elif prev_orig_end is not None and abs(c.start - prev_orig_end) <= EPS:
+            start = out[-1].end  # shares its edge with the cut before: keep them touching
+        else:
+            start = _snap_edge(c.start, max(before, default=0.0), min([x.start for x in inside] + [c.end]), frame_s, env)
+        if c.end >= duration - EPS:
+            end = c.end
+        else:
+            end = _snap_edge(c.end, max([x.end for x in inside] + [start]), min(after + [duration]), frame_s, env)
+        if end <= start + 1e-9:
+            start, end = c.start, c.end
+        prev_orig_end = c.end
+        out.append(CutSpan(start=round(start, 6), end=round(end, 6), text=c.text, reason=c.reason))
+    return out

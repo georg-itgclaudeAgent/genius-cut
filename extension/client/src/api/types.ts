@@ -54,6 +54,8 @@ export interface TrimRequest {
   range_start_seq_s: number;
   audio: AudioSource[];
   prompt: string;
+  /** The sequence's frame length, seconds: cut edges come back on its frames. Omitted: edges as found. */
+  frame_s?: number;
 }
 
 /** What one run's AI calls cost, and where the month stands afterwards. USD throughout. */

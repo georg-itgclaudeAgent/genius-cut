@@ -124,3 +124,66 @@ def test_envelope_is_ten_millisecond_frames():
 def test_negative_pad_is_rejected(pad):
     with pytest.raises(ValueError):
         boundaries.refine([cut(1, 2)], WORDS, duration=14.0, pad=pad)
+
+
+# ── edges on the sequence's frames (clean cuts, 2026-10-08) ─────────
+# Georg's 5:37 Apply: the host snapped each quiet edge to the 30 fps grid (±17 ms) and 24 of 34 splices
+# landed on sound. With the sequence's frame length, each edge goes to the quietest frame boundary
+# within one frame instead, so the host's rounding leaves it where it is.
+
+F30 = 1 / 30
+# "a" really sounds until 1.14 and "um" from 1.21; the gap is quiet. "b" really starts at 1.56.
+SNAP_WORDS = [w("a", 0.0, 1.0), w("um", 1.2, 1.4), w("b", 1.6, 2.5)]
+
+
+def _on_grid(x, frame):
+    return abs(x / frame - round(x / frame)) < 1e-4  # edges are rounded to the microsecond
+
+
+def test_each_edge_goes_to_the_quieter_frame_boundary_within_a_frame():
+    env = boundaries.envelope(_tone([(0.0, 1.14), (1.21, 1.4), (1.56, 2.5)], 3.0))
+    out = boundaries.snap_to_frames([cut(1.145, 1.555)], SNAP_WORDS, 3.0, F30, env=env)
+    # start: 1.1333 is nearer but on "a"'s tail; 1.1667 is in the quiet. end: 1.5667 is on "b", 1.5333 is quiet.
+    assert [(c.start, c.end) for c in out] == [(round(35 / 30, 6), round(46 / 30, 6))]
+    assert all(_on_grid(x, F30) for x in (out[0].start, out[0].end))
+    assert (out[0].text, out[0].reason) == ("uh", "filler")
+
+
+def test_without_the_envelope_each_edge_goes_to_the_nearest_frame_boundary():
+    out = boundaries.snap_to_frames([cut(1.145, 1.555)], SNAP_WORDS, 3.0, F30)
+    assert [(c.start, c.end) for c in out] == [(round(34 / 30, 6), round(47 / 30, 6))]
+
+
+def test_an_edge_never_crosses_into_a_neighbour_as_whisper_timed_it():
+    words = [w("a", 0.0, 1.14), w("um", 1.2, 1.4), w("b", 1.55, 2.5)]
+    out = boundaries.snap_to_frames([cut(1.145, 1.545)], words, 3.0, F30)
+    # 1.1333 would cut into "a" (ends 1.14), 1.5667 into "b" (starts 1.55): the other boundary each time.
+    assert [(c.start, c.end) for c in out] == [(round(35 / 30, 6), round(46 / 30, 6))]
+
+
+def test_a_cut_never_shrinks_below_the_words_it_removes():
+    words = [w("a", 0.0, 1.0), w("um", 1.16, 1.42), w("b", 1.6, 2.5)]
+    out = boundaries.snap_to_frames([cut(1.16, 1.42)], words, 3.0, F30)
+    # 1.1667 would leave the start of "um" (1.16), 1.4 would leave its end (1.42).
+    assert [(c.start, c.end) for c in out] == [(round(34 / 30, 6), round(43 / 30, 6))]
+
+
+def test_an_edge_with_no_frame_boundary_in_its_gap_stays_where_it_was():
+    words = [w("a", 0.0, 1.14), w("um", 1.16, 1.4), w("b", 1.6, 2.5)]
+    out = boundaries.snap_to_frames([cut(1.15, 1.5)], words, 3.0, F30)
+    assert out[0].start == 1.15  # no boundary in [1.14, 1.16]: the host's rounding decides
+    assert _on_grid(out[0].end, F30)
+
+
+def test_a_pause_cut_is_snapped_too_and_stays_inside_the_range():
+    words = [w("so", 0.1, 0.4), w("anyway", 3.3, 3.8)]
+    out = boundaries.snap_to_frames([cut(0.65, 3.05, reason="pause"), cut(3.95, 4.0, reason="pause")], words, 4.0, 0.12)
+    assert [(c.start, c.end) for c in out] == [(0.6, 3.0), (3.96, 4.0)]
+
+
+def test_cuts_that_touched_still_touch():
+    # A Claude cut and a pause cut sharing an edge must not leave a sliver of a frame between them.
+    words = [w("a", 0.0, 1.0), w("um", 1.2, 1.4), w("b", 3.0, 3.5)]
+    out = boundaries.snap_to_frames([cut(1.1, 1.45), cut(1.45, 2.75, reason="pause")], words, 4.0, F30)
+    assert out[0].end == out[1].start
+    assert all(_on_grid(x, F30) for c in out for x in (c.start, c.end))

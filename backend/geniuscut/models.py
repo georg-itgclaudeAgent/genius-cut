@@ -56,6 +56,8 @@ class TrimRequest(BaseModel):
     cut_pauses: bool = True
     min_pause_s: float = Field(default=1.0, le=30, allow_inf_nan=False,
                                description="Silences at least this long become pause cuts")
+    frame_s: float | None = Field(default=None, gt=0, le=1, allow_inf_nan=False,
+                                  description="The sequence's frame length: cut edges go on its frames (None: as found)")
 
     @model_validator(mode="before")
     @classmethod

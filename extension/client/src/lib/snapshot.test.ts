@@ -48,7 +48,14 @@ describe("trimRequestFor", () => {
   it("sends the range and the chosen audio sources", () => {
     const a = { ...three.audio[0], startTicks: String(95.5 * T), endTicks: String(742.9 * T) };
     expect(trimRequestFor(three, [a], "trim it")).toEqual({
-      duration_s: 647.4, range_start_seq_s: 95.5, audio: [{ media_path: "D:/wide.mov", in_s: 10, offset_s: 0, duration_s: 647.4 }], prompt: "trim it" });
+      duration_s: 647.4, range_start_seq_s: 95.5, audio: [{ media_path: "D:/wide.mov", in_s: 10, offset_s: 0, duration_s: 647.4 }], prompt: "trim it",
+      frame_s: 1 / 30 });
+  });
+
+  it("sends the sequence's frame length, so the backend puts cut edges on its frames", () => {
+    const a = { ...three.audio[0], startTicks: String(95.5 * T), endTicks: String(742.9 * T) };
+    expect(trimRequestFor({ ...three, fps: 29.97 }, [a], "x").frame_s).toBeCloseTo(1 / 29.97, 12);
+    expect(trimRequestFor({ ...three, fps: 0 }, [a], "x").frame_s).toBeUndefined(); // no frame rate: edges as found
   });
 
   it("each source covers its overlap with the range, placed at its offset", () => {

@@ -204,3 +204,32 @@ def test_health_reports_the_api_version_and_process_id(tmp_path):
     body = _health(tmp_path, "cuda", None)
     assert body["api"] == config.API_VERSION and isinstance(body["api"], int)
     assert body["pid"] == os.getpid()
+
+
+# ── frame_s: edges on the sequence's frames (clean cuts) ────────────
+
+def test_with_frame_s_every_cut_edge_lands_on_the_sequences_frames(tmp_path):
+    req = TrimRequest(**{**REQ.model_dump(), "frame_s": 0.12})
+    r = trim.run_trim(req, FakeTranscriber(), tmp_path, propose=lambda w, f, i: CUTS, extract=fake_extract, refine=as_proposed)
+    # Nearest boundary that still removes the whole word and stays out of its neighbours.
+    assert [(c.start, c.end) for c in r.cuts] == [(0.48, 0.84), (1.92, 2.28)]
+    assert [(s.start, s.end) for s in r.kept_spans_source] == [(10.0, 10.48), (10.84, 11.92), (12.28, 14.0)]
+
+
+def test_pause_cuts_are_snapped_too(tmp_path):
+    req = TrimRequest(**{**REQ.model_dump(), "cut_pauses": True, "frame_s": 0.12})
+    r = trim.run_trim(req, PauseyTranscriber(), tmp_path, propose=lambda w, f, i: [], extract=fake_extract)
+    assert [(c.start, c.end, c.reason) for c in r.cuts] == [(1.2, 3.0, "pause")]
+
+
+def test_without_frame_s_nothing_is_snapped(tmp_path):
+    assert TrimRequest(**REQ.model_dump()).frame_s is None
+    r = run(tmp_path)
+    assert [(c.start, c.end) for c in r.cuts] == [(0.5, 0.8), (2.0, 2.2)]
+
+
+@pytest.mark.parametrize("bad", [0, -0.1, 2])
+def test_an_impossible_frame_length_is_a_422(tmp_path, bad):
+    c, auth = api(tmp_path, FakeTranscriber())
+    r = c.post("/trim", json={**REQ.model_dump(), "frame_s": bad}, headers=auth)
+    assert r.status_code == 422

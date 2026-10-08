@@ -76,6 +76,8 @@ def run_trim(
     cut_spans = refine(cut_spans, words, duration, env=env)
     if req.cut_pauses:
         cut_spans = pauses.merge_cuts(cut_spans, pauses.find_pauses(words, duration, req.min_pause_s, PAUSE_KEEP_S))
+    if req.frame_s is not None:
+        cut_spans = boundaries.snap_to_frames(cut_spans, words, duration, req.frame_s, env=env)
     kept = kept_spans(cut_spans, duration)
     if not kept:
         raise TrimRefused("The proposal would remove the whole clip, so nothing was changed. "

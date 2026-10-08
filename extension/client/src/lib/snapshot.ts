@@ -31,7 +31,7 @@ export function audioChoice(s: Snapshot, remembered: string | null): AudioChoice
   return { kind: "ask", preselect: still ? remembered : null };
 }
 
-/** Each source covers its overlap with the range; a source that doesn't reach into it is left out. */
+/** Each source covers its overlap with the range; a source that doesn't reach into it is left out. Sends the sequence's frame length (frame_s). */
 export function trimRequestFor(s: Snapshot, sources: SnapshotItem[], prompt: string): TrimRequest {
   const r0 = s.startS, r1 = r0 + s.durationS;
   const audio: AudioSource[] = [];
@@ -42,7 +42,10 @@ export function trimRequestFor(s: Snapshot, sources: SnapshotItem[], prompt: str
     audio.push({ media_path: a.mediaPath, in_s: round3(a.inS + (from - aStart)), offset_s: round3(from - r0), duration_s: round3(to - from) });
   }
   if (!audio.length) throw new Error("The selected audio doesn't overlap the selected video clips, so there's nothing to transcribe.");
-  return { duration_s: s.durationS, range_start_seq_s: s.startS, audio, prompt };
+  // The sequence's frame length: the backend puts each cut edge on a quiet frame boundary, so the
+  // host's snap to whole frames can't move it onto speech.
+  const frame = s.fps > 0 ? { frame_s: 1 / s.fps } : {};
+  return { duration_s: s.durationS, range_start_seq_s: s.startS, audio, prompt, ...frame };
 }
 
 const KEY = (seqId: string) => `geniuscut.audio.${seqId}`;

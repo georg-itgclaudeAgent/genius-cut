@@ -6,6 +6,8 @@ Two clocks appear in this project and must never be mixed:
 Field names carry the clock where it matters (`*_source_s`, `*_seq_s`).
 """
 
+from typing import Literal
+
 from pydantic import BaseModel, Field, model_validator
 
 
@@ -44,7 +46,7 @@ class AudioSource(BaseModel):
     duration_s: float | None = Field(default=None, gt=0, allow_inf_nan=False, description="How long that part is")
 
 
-class TrimRequest(BaseModel):
+class AudioRange(BaseModel):
     """A timeline range (synced clips that start and end together) and the audio to transcribe.
     Several sources are mixed for transcription only."""
 
@@ -52,6 +54,34 @@ class TrimRequest(BaseModel):
     range_start_seq_s: float = Field(default=0.0, ge=0, allow_inf_nan=False,
                                      description="Where the range starts on the timeline, display only")
     audio: list[AudioSource] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _sources_fit_the_range(self):
+        for s in self.audio:
+            part = s.duration_s if s.duration_s is not None else self.duration_s - s.offset_s
+            if part <= 0 or s.offset_s + part > self.duration_s + 0.001:
+                raise ValueError(f"Audio source {s.media_path} doesn't fit inside the {self.duration_s}s range")
+        return self
+
+
+class TranscriptRequest(AudioRange):
+    """`POST /transcript`: a TrimRequest's audio and range (its other fields are ignored)."""
+
+
+class TranscriptJob(BaseModel):
+    """A transcript job. `words` (range-relative seconds) only once `status` is "done";
+    "loading" means queued until the speech model is ready."""
+
+    id: str
+    status: Literal["running", "loading", "done", "error"]
+    progress: float = 0.0
+    words: list[Word] | None = None
+    error: str | None = None
+
+
+class TrimRequest(AudioRange):
+    """An AudioRange to propose cuts for."""
+
     prompt: str = ""
     cut_pauses: bool = True
     min_pause_s: float = Field(default=1.0, le=30, allow_inf_nan=False,
@@ -73,14 +103,6 @@ class TrimRequest(BaseModel):
             d["range_start_seq_s"] = d.pop("clip_start_s", 0.0)
             return d
         return data
-
-    @model_validator(mode="after")
-    def _sources_fit_the_range(self):
-        for s in self.audio:
-            part = s.duration_s if s.duration_s is not None else self.duration_s - s.offset_s
-            if part <= 0 or s.offset_s + part > self.duration_s + 0.001:
-                raise ValueError(f"Audio source {s.media_path} doesn't fit inside the {self.duration_s}s range")
-        return self
 
     @model_validator(mode="after")
     def _pause_leaves_breathing_room(self):

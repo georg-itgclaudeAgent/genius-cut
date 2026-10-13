@@ -6,6 +6,9 @@ The Whisper model loads in the background, so `/health` answers straight away
 (`stt_device: "loading"`) and `/trim` returns 503 until it's ready. A failed load
 is reported as `status: "error"` and retried on the next `/trim`.
 
+`POST /transcript` + `GET /transcript/{id}?wait=` serve the assistant transcripts as jobs
+(geniuscut/transcripts.py); a lock keeps them and `/trim` to one Whisper run at a time.
+
 The panel calls this through Node's `http` module (CEP `--enable-nodejs`), so no
 CORS is configured: a browser page can't reach the API, and the Host check below
 also stops DNS-rebinding tricks.
@@ -35,9 +38,9 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel
 
-from geniuscut import audio, config, cuts, library, llm, secrets, spend, trim
+from geniuscut import audio, config, cuts, library, llm, secrets, spend, transcripts, trim
 from geniuscut.llm import LLMError
-from geniuscut.models import StyleExample, TrimRequest, TrimResponse, Word
+from geniuscut.models import StyleExample, TranscriptJob, TranscriptRequest, TrimRequest, TrimResponse, Word
 
 log = logging.getLogger("geniuscut")
 
@@ -110,23 +113,51 @@ def create_app(
             body.update(status="error", error=f"The speech model failed to load: {err}")
         return body
 
+    whisper = threading.Lock()  # one Whisper run at a time, between /trim and transcript jobs
+    jobs = transcripts.Jobs(
+        transcribe=lambda req, t: trim.transcribe_range(req, transcripts.OneAtATime(t, whisper), extract=extract)[0],
+        transcriber=transcriber, load_error=load_error)
+
+    def failed_load() -> HTTPException | None:
+        err = load_error()
+        if not err:
+            return None
+        retry_load()
+        return HTTPException(status_code=503, detail=(
+            f"The speech model failed to load ({err}). Retrying now; try again in a minute."))
+
     @app.post("/trim", dependencies=auth)
     def post_trim(req: TrimRequest) -> TrimResponse:
         t = transcriber()
         if t is None:
-            err = load_error()
+            err = failed_load()
             if err:
-                retry_load()
-                raise HTTPException(status_code=503, detail=(
-                    f"The speech model failed to load ({err}). Retrying now; try again in a minute."))
+                raise err
             raise HTTPException(status_code=503,
                                 detail="The speech model is still loading. The first start downloads about 3 GB.")
         try:
-            return trim.run_trim(req, t, lib_dir, propose=propose, extract=extract)
+            return trim.run_trim(req, transcripts.OneAtATime(t, whisper), lib_dir, propose=propose, extract=extract)
         except (trim.TrimRefused, audio.FfmpegError, ValueError) as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
         except (secrets.MissingKeyError, LLMError) as e:
             raise ai_errors(e) from e
+
+    @app.post("/transcript", dependencies=auth)
+    def post_transcript(req: TranscriptRequest) -> TranscriptJob:
+        """Cached words (status done), or a job (running, or loading while the model loads)."""
+        if transcriber() is None:
+            err = failed_load()
+            if err:
+                raise err
+        return jobs.submit(req)
+
+    @app.get("/transcript/{job_id}", dependencies=auth)
+    def get_transcript(job_id: str, wait: float = 0.0) -> TranscriptJob:
+        """The job's state; with `wait`, long-polls until it finishes (at most 60 s)."""
+        job = jobs.get(job_id, wait)
+        if job is None:
+            raise HTTPException(status_code=404, detail="No such transcript job; ask for the transcript again.")
+        return job
 
     @app.post("/reload", dependencies=auth, status_code=202)
     def post_reload() -> dict:

@@ -12,7 +12,8 @@ from pathlib import Path
 from typing import Callable
 
 from geniuscut import audio, boundaries, cuts, library, llm, pauses, spend
-from geniuscut.models import PAUSE_KEEP_S, CutSpan, SequenceCut, Span, TrimRequest, TrimResponse
+from geniuscut.models import (PAUSE_KEEP_S, AudioRange, CutSpan, SequenceCut, Span, TrimRequest, TrimResponse,
+                              Word)
 from geniuscut.stt import Transcriber, read_wav_16k_mono
 
 
@@ -40,16 +41,15 @@ def kept_spans(cut_spans: list[CutSpan], duration: float) -> list[Span]:
     return [s for s in kept if s.end - s.start > 1e-6]
 
 
-def run_trim(
-    req: TrimRequest,
+def transcribe_range(
+    req: AudioRange,
     transcriber: Transcriber,
-    library_dir: Path,
-    propose: Callable = cuts.propose_cuts,
     extract: Callable = audio.extract_span,
-    refine: Callable = boundaries.refine,
-    mix: Callable = audio.mix_wavs,
     place: Callable = audio.place_in_range,
-) -> TrimResponse:
+    mix: Callable = audio.mix_wavs,
+) -> tuple[list[Word], object]:
+    """The range's words (range-relative seconds) and its loudness envelope (None if unreadable).
+    Each source is extracted, placed at its offset and mixed; the temp files are removed."""
     work = Path(tempfile.mkdtemp(prefix="geniuscut-"))
     env = None
     duration = req.duration_s
@@ -71,6 +71,21 @@ def run_trim(
             env = None
     finally:
         shutil.rmtree(work, ignore_errors=True)
+    return words, env
+
+
+def run_trim(
+    req: TrimRequest,
+    transcriber: Transcriber,
+    library_dir: Path,
+    propose: Callable = cuts.propose_cuts,
+    extract: Callable = audio.extract_span,
+    refine: Callable = boundaries.refine,
+    mix: Callable = audio.mix_wavs,
+    place: Callable = audio.place_in_range,
+) -> TrimResponse:
+    duration = req.duration_s
+    words, env = transcribe_range(req, transcriber, extract=extract, place=place, mix=mix)
     with spend.meter(kind="trim") as m:
         cut_spans = propose(words, library.build_fewshot(library_dir), req.prompt)
     cut_spans = refine(cut_spans, words, duration, env=env)

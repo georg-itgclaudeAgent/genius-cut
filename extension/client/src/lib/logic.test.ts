@@ -1,4 +1,6 @@
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "fs";
+import { resolve } from "path";
 import { removedSpans, reviewSummary } from "./review";
 import { parseClipName, submitsPrompt } from "./prompt";
 import { formatTimecode, formatDuration } from "./timecode";
@@ -230,5 +232,13 @@ describe("ensureBackend with an outdated backend", () => {
     let spawned = 0;
     const r = await ensureBackend({ health: async () => current, kill: () => { throw new Error("no"); }, spawn: () => { spawned++; }, sleep: async () => {} });
     expect(r.kind).toBe("ready"); expect(spawned).toBe(0);
+  });
+});
+
+describe("API_VERSION", () => {
+  it("is 4 (transcript jobs) and matches the backend's config.py", () => {
+    const py = readFileSync(resolve(__dirname, "../../../../backend/geniuscut/config.py"), "utf8");
+    expect(API_VERSION).toBe(4);
+    expect(py).toMatch(/^API_VERSION = 4\b/m);
   });
 });

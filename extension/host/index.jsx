@@ -1018,10 +1018,9 @@ function gcutQeClipAt(qt, atT, clock) {
  * so Restore lays in the same order (gcutLayAll).
  */
 function gcutApplyCutsMulti(specJson) {
-    var seq, clock, marks = [], k;
     try {
-        var spec = gcutParse(specJson);
-        seq = gcutSequence(); clock = gcutClock(seq);
+        var spec = gcutParse(specJson), k;
+        var seq = gcutSequence(), clock = gcutClock(seq);
         if (spec.sequenceId && gcutSeqId(seq) !== String(spec.sequenceId)) {
             throw new Error("A different sequence is open than the one you analysed. Open that sequence, or Analyse this one.");
         }
@@ -1039,14 +1038,9 @@ function gcutApplyCutsMulti(specJson) {
         gcutAudioUnder(seq, spec, vSpan.fromT, vSpan.toT, clock);
         gcutCovers(seq, found, cutsT, clock);
         // Every piece lands inside span: an item only ever slides left, and never past the first cut.
-        var span = gcutSpan(found), plan = gcutPlan(found, cutsT), removedT = gcutRemovedBefore(cutsT, endT), rebuiltEndT = span.fromT;
+        var span = gcutSpan(found), rebuiltEndT = span.fromT;
         for (k = 0; k < found.length; k++) rebuiltEndT = Math.max(rebuiltEndT, gcutNewEnd(found[k], cutsT));
         var others = gcutOthers(seq, found, span.fromT, span.toT);
-        for (k = 0; k < found.length; k++) {
-            var seen = false;
-            for (var m = 0; m < marks.length; m++) if (marks[m].node === found[k].node) seen = true;
-            if (!seen) marks.push({ pi: found[k].pi, node: found[k].node, inS: found[k].pi.getInPoint().seconds, outS: found[k].pi.getOutPoint().seconds });
-        }
         var key = "m@" + spec.startTicks;
         var rec = { sequenceId: gcutSeqId(seq), startT: startT, endT: endT, cutsT: cutsT, rebuiltEndT: rebuiltEndT,
                     gapClosed: false, items: found, others: others };
@@ -1054,6 +1048,40 @@ function gcutApplyCutsMulti(specJson) {
         // the timeline changed again); if this one rolls back cleanly, the earlier record comes back.
         var stash = gcutState().gcutStash, hadPrev = stash.hasOwnProperty(key), prev = stash[key];
         stash[key] = rec; // written before anything changes, so it can always be rolled back
+        var r;
+        try {
+            r = gcutCutCore(seq, clock, found, cutsT, rec);
+        } catch (early) { // it throws only before changing anything
+            if (hadPrev) stash[key] = prev; else delete stash[key];
+            throw early;
+        }
+        if (r.ok) return gcutOk(r);
+        if (r.rolledBack) { if (hadPrev) stash[key] = prev; else delete stash[key]; }
+        return gcutOk(gcutCutFailed(seq, clock, r, others));
+    } catch (e) {
+        return gcutFail(e);
+    }
+}
+
+/**
+ * The cut itself, shared by Apply and the assistant's cut tool: take the recorded items `found` off,
+ * lay their pieces for cutsT, verify every piece, then crossfade the recorded audio. All or nothing:
+ * any failure lays every item back at its own original place (gcutRelayAll over rec, keeping
+ * rec.others). The bin items' own in/out marks are always left as they were. It throws only before
+ * changing anything; otherwise it returns Apply's reply { ok: true, appliedCount, clipCount,
+ * expectedDuration, actualDuration, trailingGapS, crossfades, warning? }, or { ok: false, rolledBack,
+ * message } with a neutral message (what went wrong, no advice): see gcutCutFailed.
+ * rec: { startT, endT, items: found, others, ... } as Apply records it.
+ */
+function gcutCutCore(seq, clock, found, cutsT, rec) {
+    var marks = [], k;
+    try {
+        for (k = 0; k < found.length; k++) {
+            var seen = false;
+            for (var m = 0; m < marks.length; m++) if (marks[m].node === found[k].node) seen = true;
+            if (!seen) marks.push({ pi: found[k].pi, node: found[k].node, inS: found[k].pi.getInPoint().seconds, outS: found[k].pi.getOutPoint().seconds });
+        }
+        var span = gcutSpan(found), plan = gcutPlan(found, cutsT), removedT = gcutRemovedBefore(cutsT, rec.endT), others = rec.others;
         try {
             for (k = 0; k < found.length; k++) found[k].item.remove(false, false);
             var nodes = [];
@@ -1071,32 +1099,34 @@ function gcutApplyCutsMulti(specJson) {
             if (stray) throw new Error(gcutStrayMessage(stray));
             var hit = gcutSnapshotIntact(seq, others, clock);
             if (hit) throw new Error("The rebuild overwrote something on " + hit + ".");
-            var keptS = (endT - startT - removedT) / GCUT_TICKS; // the range, once the cuts are out
+            var keptS = (rec.endT - rec.startT - removedT) / GCUT_TICKS; // the range, once the cuts are out
             // Verified: the edit stands whatever happens next. Crossfades are a finish on top.
             var fades = { added: 0, wanted: 0 };
             try { fades = gcutCrossfades(seq, found, plan, clock); } catch (fadeErr) { fades = { added: 0, wanted: 0 }; }
             var missed = fades.wanted - fades.added;
-            return gcutOk({ ok: true, appliedCount: cutsT.length, clipCount: found.length,
+            return { ok: true, appliedCount: cutsT.length, clipCount: found.length,
                 expectedDuration: keptS, actualDuration: keptS, trailingGapS: removedT / GCUT_TICKS, crossfades: fades.added,
-                warning: missed > 0 ? "Couldn't add " + missed + " crossfade" + (missed === 1 ? "" : "s") + "; the cuts are in place." : undefined });
+                warning: missed > 0 ? "Couldn't add " + missed + " crossfade" + (missed === 1 ? "" : "s") + "; the cuts are in place." : undefined };
         } catch (inner) {
             var back = false;
             try { back = gcutRelayAll(seq, rec, clock, others); } catch (ignored) { back = false; }
-            if (back) { if (hadPrev) stash[key] = prev; else delete stash[key]; }
-            var damage = gcutSnapshotIntact(seq, others, clock);
-            return gcutOk({ ok: false, rolledBack: back, appliedCount: 0, clipCount: 0, expectedDuration: 0,
-                actualDuration: 0, trailingGapS: 0,
-                message: inner.message + (back ? " Every clip was put back." : " They couldn't be put back automatically: use Premiere's Undo.") +
-                    (damage ? " Something on " + damage + " was changed too: use Undo to recover it." : "") });
+            return { ok: false, rolledBack: back, message: inner.message };
         }
-    } catch (e) {
-        return gcutFail(e);
     } finally {
         // Always leave the bin items' own in/out marks as they were.
         for (k = 0; k < marks.length; k++) {
             try { gcutSetRange(marks[k].pi, marks[k].inS, marks[k].outS, clock.frameS / 2); } catch (ignored2) { /* best effort */ }
         }
     }
+}
+
+/** The reply for a gcutCutCore that failed (r): whether every clip went back, and anything else that changed. */
+function gcutCutFailed(seq, clock, r, others) {
+    var damage = gcutSnapshotIntact(seq, others, clock);
+    return { ok: false, rolledBack: r.rolledBack, appliedCount: 0, clipCount: 0, expectedDuration: 0,
+        actualDuration: 0, trailingGapS: 0,
+        message: r.message + (r.rolledBack ? " Every clip was put back." : " They couldn't be put back automatically: use Premiere's Undo.") +
+            (damage ? " Something on " + damage + " was changed too: use Undo to recover it." : "") };
 }
 
 // ── gcutRestoreMulti: every recorded clip back as it was ────────────────────────────

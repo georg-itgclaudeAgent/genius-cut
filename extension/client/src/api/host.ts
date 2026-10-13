@@ -40,8 +40,9 @@ export interface Host {
 
 const MISSING = "__GCUT_MISSING__";
 
-export function cepHost(evalScript: (s: string) => Promise<string>): Host {
-  async function call(fn: string, ...args: unknown[]): Promise<any> {
+/** Calls a gcut* host function with JSON arguments; its "Error: …" reply becomes a thrown Error. */
+export function hostCaller(evalScript: (s: string) => Promise<string>) {
+  return async function call(fn: string, ...args: unknown[]): Promise<any> {
     const argList = args.map((a) => JSON.stringify(JSON.stringify(a))).join(",");
     // Probe first: "EvalScript error." is what CEP returns for ANY uncaught ExtendScript
     // exception, so it can't tell "function missing" apart from "function failed".
@@ -51,7 +52,11 @@ export function cepHost(evalScript: (s: string) => Promise<string>): Host {
     if (!out || out === "EvalScript error.") throw new Error(`The Premiere script failed in ${fn}. Nothing further was changed.`);
     if (out.startsWith("Error:")) throw new Error(out.slice(6).trim());
     return JSON.parse(out);
-  }
+  };
+}
+
+export function cepHost(evalScript: (s: string) => Promise<string>): Host {
+  const call = hostCaller(evalScript);
   const refusal = (r: any) => {
     if (r && r.ok === false) throw new Error(r.message || "Premiere couldn't do that. Use Undo.");
   };

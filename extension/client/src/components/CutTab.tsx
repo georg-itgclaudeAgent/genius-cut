@@ -5,6 +5,7 @@ import type { AiStatus, Health, Snapshot, SnapshotItem, TrimResponse } from "../
 import { afterTrimRefresh, watchAiStatus } from "../lib/aiStatus";
 import { budgetEstimate } from "../lib/cost";
 import { parseClipName, submitsPrompt } from "../lib/prompt";
+import { whileBusy } from "../lib/busy";
 import { removedSpans } from "../lib/review";
 import { audioChoice, recalledAudio, rememberAudio, snapshotSummary, trimRequestFor } from "../lib/snapshot";
 import { formatDuration } from "../lib/timecode";
@@ -85,7 +86,7 @@ export function CutTab({ health, ready, onTrimmed }: {
     const mine = ++epoch.current;
     setPhase({ k: "finding" });
     try {
-      const found = await runtime.host.snapshotSelection(parseClipName(instruction));
+      const found = await whileBusy(() => runtime.host.snapshotSelection(parseClipName(instruction)));
       if (epoch.current !== mine) return;
       if (!found.found) return go({ k: "error", message: found.message });
       // Problems (no audio, speed-changed, out of sync...) stop here, before any audio is chosen.
@@ -104,8 +105,8 @@ export function CutTab({ health, ready, onTrimmed }: {
     const mine = epoch.current;
     try {
       // The refresh isn't awaited: the review shouldn't wait on /health.
-      const res = await afterTrimRefresh(() => runtime.backend.trim(trimRequestFor(found, sources, instruction)),
-        async () => { aiWatch.current?.refresh(); });
+      const res = await whileBusy(() => afterTrimRefresh(() => runtime.backend.trim(trimRequestFor(found, sources, instruction)),
+        async () => { aiWatch.current?.refresh(); }));
       if (epoch.current !== mine) return;
       const checked = res.cuts.map(() => true);
       setPhase({ k: "review", snap: found, res, checked });
@@ -135,7 +136,7 @@ export function CutTab({ health, ready, onTrimmed }: {
     const { snap: c, res, checked } = phase;
     go({ k: "applying", snap: c, res, checked });
     try {
-      const result = await runtime.host.applyCuts(c, removedSpans(res.cuts, checked));
+      const result = await whileBusy(() => runtime.host.applyCuts(c, removedSpans(res.cuts, checked)));
       if (!result.ok) {
         go({ k: "error", snap: c, restorable: offersRestore(result), message: result.message ||
           `The rebuilt clip is ${result.actualDuration.toFixed(2)} s, expected ${result.expectedDuration.toFixed(2)} s. ` +
@@ -155,7 +156,7 @@ export function CutTab({ health, ready, onTrimmed }: {
     const start = phase, mine = ++epoch.current;
     setPhase({ ...start, busy: true });
     try {
-      await runtime.host.closeGap(start.snap);
+      await whileBusy(() => runtime.host.closeGap(start.snap));
       if (epoch.current === mine) setPhase({ ...start, gapClosed: true, busy: false });
     } catch (e) {
       if (epoch.current === mine) go(errorPhase(e, start.snap, true));
@@ -166,7 +167,7 @@ export function CutTab({ health, ready, onTrimmed }: {
     const mine = ++epoch.current;
     if (phase.k === "applied") setPhase({ ...phase, busy: true });
     try {
-      await runtime.host.restore(c);
+      await whileBusy(() => runtime.host.restore(c));
       if (epoch.current === mine) go({ k: "idle" });
     } catch (e) {
       if (epoch.current === mine) go(errorPhase(e, c, true));

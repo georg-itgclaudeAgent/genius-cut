@@ -59,6 +59,20 @@ function gcutSource(it) {
     try { return String(it.projectItem.getMediaPath()); } catch (e) { return String(it.projectItem.name); }
 }
 
+/**
+ * The clip's true source in point: a loose clip's (see gcutRefind: its own frame rate doesn't fit the
+ * sequence's) is reported floored to the sequence's frames, so it is corrected with gcutTrueInS, the
+ * way gcutRefind records it. Any other clip's is as reported.
+ */
+function gcutClipInS(kind, it, clock) {
+    var reported = it.inPoint.seconds;
+    if (!it.projectItem) return reported;
+    var srcFps = kind === "audio" ? gcutMediaFps(it.projectItem) : gcutSourceFps(it.projectItem, clock);
+    if (kind === "audio" && srcFps > GCUT_MAX_FRAME_RATE) srcFps = 0;
+    if (srcFps > 0 && !gcutFits(srcFps, clock)) return gcutTrueInS(reported, 1 / srcFps, clock.frameS);
+    return reported;
+}
+
 /** The sequence's markers, in timeline order. */
 function gcutMarkerList(seq) {
     var out = [], m = seq.markers.getFirstMarker();
@@ -77,7 +91,7 @@ function gcutMarkerRecord(m) {
 /**
  * args: { fromS?, toS? } — limits the clips and markers to those overlapping that stretch.
  * Returns { sequenceId, name, fps, durationS, tracks: [{kind, index, name, muted}], clips: [{id, track,
- * name, startS, endS, inS, source, selected, enabled}], markers: [{id, startS, endS, name, comments,
+ * name, startS, endS, inS (a loose clip's true one, gcutClipInS), source, selected, enabled}], markers: [{id, startS, endS, name, comments,
  * colour}], selection: [clip ids] }. Track index and clip track are 1-based, as Premiere shows them.
  */
 function gcutToolGetSequence(argsJson) {
@@ -98,7 +112,7 @@ function gcutToolGetSequence(argsJson) {
                 if ((fromT !== null && e <= fromT) || (toT !== null && s >= toT)) continue;
                 var id = gcutClipId(kind, tr.index, it), sel = typeof it.isSelected === "function" && !!it.isSelected();
                 out.clips.push({ id: id, track: tr.label, name: String(it.name), startS: s / GCUT_TICKS, endS: e / GCUT_TICKS,
-                                 inS: it.inPoint.seconds, source: gcutSource(it), selected: sel, enabled: it.disabled !== true });
+                                 inS: gcutClipInS(kind, it, clock), source: gcutSource(it), selected: sel, enabled: it.disabled !== true });
                 if (sel) out.selection.push(id);
             }
         }

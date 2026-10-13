@@ -75,3 +75,19 @@ describe("trim timeout", () => {
     expect(f.seen[0].timeoutMs).toBe(2 * 60 * 60_000);
   });
 });
+
+describe("transcript jobs (the assistant)", () => {
+  it("posts the audio range to /transcript and long-polls GET /transcript/{id}?wait=", async () => {
+    const f = fake(200, { id: "j1", status: "running", progress: 0.2 });
+    const api = createBackend({ transport: f.transport, token: () => "tok" });
+    const req = { duration_s: 5, range_start_seq_s: 100, audio: [{ media_path: "C:/a.mp4", in_s: 0, offset_s: 0, duration_s: 5 }] };
+    expect(await api.transcript(req)).toEqual({ id: "j1", status: "running", progress: 0.2 });
+    expect(f.seen[0]).toMatchObject({ method: "POST", path: "/transcript" });
+    expect(JSON.parse(f.seen[0].body!)).toEqual(req);
+    await api.transcriptJob("j1", 60);
+    expect(f.seen[1]).toMatchObject({ method: "GET", path: "/transcript/j1?wait=60" });
+    expect(f.seen[1].headers.Authorization).toBe("Bearer tok");
+    // The long poll holds up to 60 s: the request must outlive it.
+    expect(f.seen[1].timeoutMs!).toBeGreaterThan(60_000);
+  });
+});

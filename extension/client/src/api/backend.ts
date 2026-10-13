@@ -3,7 +3,7 @@
  * Node's http module (CEP --enable-nodejs), so CORS never applies; in a browser it's the
  * sample-data mock.
  */
-import type { Health, Library, RunCost, StyleExample, TrimRequest, TrimResponse, Word } from "./types";
+import type { Health, Library, RunCost, StyleExample, TranscriptJob, TranscriptRequest, TrimRequest, TrimResponse, Word } from "./types";
 
 export interface TransportRequest {
   method: "GET" | "POST";
@@ -54,6 +54,10 @@ export function createBackend({ transport, token }: { transport: Transport; toke
       call<StyleExample>("POST", "/library/examples", { body: { raw_words, final_text, source_clip } }),
     summarize: () => call<{ summary: string; cost?: RunCost | null }>("POST", "/library/summarize", { timeoutMs: 5 * 60_000 }),
     reload: () => call<{ status: string }>("POST", "/reload", { timeoutMs: 2000 }),
+    // The assistant's transcripts: cached words, or a job to long-poll (the backend holds a GET up to `waitS`, at most 60 s).
+    transcript: (req: TranscriptRequest) => call<TranscriptJob>("POST", "/transcript", { body: req, timeoutMs: 30_000 }),
+    transcriptJob: (id: string, waitS: number) =>
+      call<TranscriptJob>("GET", `/transcript/${encodeURIComponent(id)}?wait=${waitS}`, { timeoutMs: (waitS + 30) * 1000 }),
   };
 }
 

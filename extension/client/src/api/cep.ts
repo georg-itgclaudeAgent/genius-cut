@@ -15,12 +15,14 @@ export function isCEP(): boolean {
   return typeof window !== "undefined" && !!window.cep_node && !!window.CSInterface;
 }
 
-function node<T = any>(id: string): T {
+/** Node's require inside the panel (CEP --enable-nodejs). */
+export function node<T = any>(id: string): T {
   if (!window.cep_node) throw new Error("Node isn't available: this panel must run inside Premiere with --enable-nodejs.");
   return window.cep_node.require(id);
 }
 
-function dataDir(): string {
+/** %APPDATA%/itGenius/genius-cut: the backend's token and log, the assistant's bridge.json. */
+export function dataDir(): string {
   const path = node("path");
   return path.join(node("process").env.APPDATA, "itGenius", "genius-cut");
 }
@@ -67,11 +69,15 @@ function readRuntimePython(): string | null {
   }
 }
 
+/** The installed extension's folder, with the dev symlink resolved. */
+export function extensionRoot(): string {
+  return node("fs").realpathSync(new window.CSInterface!().getSystemPath("extension"));
+}
+
 /** Start the backend detached so it outlives the panel; its output goes to backend.log. */
 export function spawnBackend(): void {
   const fs = node("fs");
-  const cs = new window.CSInterface!();
-  const root = fs.realpathSync(cs.getSystemPath("extension")); // resolve the dev symlink
+  const root = extensionRoot();
   const paths = backendPaths(root, (p) => fs.existsSync(p), readRuntimePython());
   if (!paths) throw new Error(`No backend found next to ${root}.`);
   if ("needsSetup" in paths) throw Object.assign(new Error(SETUP_MESSAGE), { needsSetup: true });

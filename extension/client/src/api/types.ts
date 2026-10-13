@@ -58,6 +58,18 @@ export interface TrimRequest {
   frame_s?: number;
 }
 
+/** `POST /transcript` (the assistant): a TrimRequest's audio and range. */
+export type TranscriptRequest = Pick<TrimRequest, "duration_s" | "range_start_seq_s" | "audio">;
+
+/** A transcript job. `words` (range-relative seconds) only once `status` is "done"; "loading": queued until the speech model is ready. */
+export interface TranscriptJob {
+  id: string;
+  status: "running" | "loading" | "done" | "error";
+  progress: number;
+  words?: Word[] | null;
+  error?: string | null;
+}
+
 /** What one run's AI calls cost, and where the month stands afterwards. USD throughout. */
 export interface RunCost {
   model: string;

@@ -1,5 +1,8 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { dataDir, evalScript, extensionRoot, node } from "./api/cep";
 import { runtime } from "./api/runtime";
+import { startAssistant, type Bridge } from "./bridge/server";
+import { cutTabBusy } from "./lib/busy";
 import type { Snapshot, TrimResponse } from "./api/types";
 import { useBackend } from "./hooks/useBackend";
 import { startingMessage } from "./lib/lifecycle";
@@ -31,8 +34,27 @@ function BackendStatus({ state, onRetry }: { state: ReturnType<typeof useBackend
   );
 }
 
+/**
+ * The Claude assistant's bridge: personal builds only. The literal check lets the bundler drop the
+ * bridge from every other build; startAssistant also refuses outside live mode.
+ */
+function useAssistantBridge() {
+  useEffect(() => {
+    if (import.meta.env.VITE_GENIUSCUT_CLAUDE !== "1") return;
+    let bridge: Bridge | null = null, gone = false;
+    const stop = () => { gone = true; void bridge?.stop(); bridge = null; };
+    startAssistant({ flag: import.meta.env.VITE_GENIUSCUT_CLAUDE, mode: runtime.mode, evalScript, node, extensionRoot, dataDir,
+      backend: runtime.backend, busy: cutTabBusy, panelVersion: VERSION })
+      .then((b) => { if (gone) void b?.stop(); else bridge = b; })
+      .catch((e) => console.warn("Genius Cut assistant bridge didn't start:", e));
+    window.addEventListener("unload", stop);
+    return () => { window.removeEventListener("unload", stop); stop(); };
+  }, []);
+}
+
 export function App() {
   const { state, retry } = useBackend();
+  useAssistantBridge();
   const [lastTrim, setLastTrim] = useState<LastTrim | null>(null);
   const ready = state.kind === "ready";
   const health = state.kind === "ready" || state.kind === "starting" ? state.health : null;

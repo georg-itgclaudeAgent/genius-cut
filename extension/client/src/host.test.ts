@@ -1928,8 +1928,10 @@ describe("measured in Premiere 26.5.2: classify by EXACT frame rate, audio follo
       expect(r).toMatchObject({ fps: 30, durationS: 121 });
       expect(r.clips.map((c: any) => [c.id, c.startS, c.endS])).toEqual([
         [`V1@0#node-r`, 0, 120], [`V2@${15 * TPF30}#node-b`, 0.5, 119], [`V3@${30 * TPF30}#node-a`, 1, 121], [`A1@0#node-r`, 0, 120]]);
-      // In points as Premiere 26.5.2 reports them: floored to the sequence's frames.
-      expect(r.clips[0].inS).toBeCloseTo(seqGrid(RS_IN), 9);
+      // Premiere 26.5.2 reports a loose clip's in point floored to the sequence's frames; get_sequence
+      // gives its true one (gcutTrueInS), the one the transcript request needs.
+      expect(tracks(s)[0].items[0].inPoint.seconds).toBeCloseTo(seqGrid(RS_IN), 9);
+      r.clips.forEach((c: any, i: number) => expect(c.inS, c.id).toBeCloseTo(s.orig[i][2], 9));
       const got = (s.host.ctx as any).gcutResolveIds(s.seq, r.clips.map((c: any) => c.id));
       got.forEach((x: any, i: number) => expect(x.item).toBe(tracks(s)[i].items[0]));
     });

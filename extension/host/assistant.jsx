@@ -203,6 +203,175 @@ function gcutUndoMarkers(seq, record, clock) {
     return { ok: true };
 }
 
+// ── cut_ranges: Apply's engine on chosen clips ─────────────────────────────────────
+
+/** Apply's pre-check refusals, worded for the tool: there is no Analyse, Claude reads the timeline again. */
+function gcutToolAdvice(e) {
+    return new Error(String(e && e.message ? e.message : e).replace(/Analyse again/g, "read the timeline again"));
+}
+
+/**
+ * The record Undo needs, as pure data (it survives a panel reload): the cut's place, its cuts, each
+ * item as gcutRefind recorded it but without the live TrackItem and ProjectItem, and the others
+ * exactly as gcutOthers gave them.
+ */
+function gcutCutRecord(rec) {
+    var items = [], cutsT = [], others = [], i, f, o;
+    for (i = 0; i < rec.items.length; i++) {
+        f = rec.items[i];
+        items.push({ kind: f.kind, trackIndex: f.trackIndex, label: f.label, node: f.node, startT: f.startT, endT: f.endT,
+                     inS: f.inS, outS: f.outS, srcFrameS: f.srcFrameS, loose: f.loose, mediaFrameS: f.mediaFrameS, av: f.av });
+    }
+    for (i = 0; i < rec.cutsT.length; i++) cutsT.push({ startT: rec.cutsT[i].startT, endT: rec.cutsT[i].endT });
+    for (i = 0; i < rec.others.length; i++) {
+        o = rec.others[i];
+        others.push({ label: o.label, t: o.t, start: o.start, end: o.end, inS: o.inS, node: o.node });
+    }
+    return { kind: "cuts", sequenceId: rec.sequenceId, startT: rec.startT, endT: rec.endT, cutsT: cutsT,
+             rebuiltEndT: rec.rebuiltEndT, items: items, others: others };
+}
+
+/** The project item with this nodeId, anywhere in the project's bins, or null (measured: a walk of app.project.rootItem). */
+function gcutProjectItemByNode(node) {
+    var stack = [app.project.rootItem];
+    while (stack.length) {
+        var it = stack.pop();
+        if (!it) continue;
+        if (it.nodeId === node) return it;
+        if (it.children) for (var k = 0; k < it.children.numItems; k++) stack.push(it.children[k]);
+    }
+    return null;
+}
+
+/** A cut record (gcutCutRecord) back to what Restore's machinery works with: each item with its live project item. */
+function gcutRehydrate(record) {
+    if (!gcutIsArray(record.items) || !record.items.length || !gcutIsArray(record.cutsT) || !gcutIsArray(record.others)) {
+        throw new Error("This undo record is incomplete, so nothing was undone.");
+    }
+    var items = [], pis = {}, i, x;
+    for (i = 0; i < record.items.length; i++) {
+        x = record.items[i];
+        var pi = pis.hasOwnProperty("n" + x.node) ? pis["n" + x.node] : (pis["n" + x.node] = gcutProjectItemByNode(x.node));
+        if (!pi) throw new Error(x.label + "'s source isn't in the project any more, so the cut can't be undone. Use Premiere's Undo instead.");
+        items.push({ kind: x.kind, trackIndex: x.trackIndex, label: x.label, pi: pi, node: x.node, startT: x.startT, endT: x.endT,
+                     inS: x.inS, outS: x.outS, srcFrameS: x.srcFrameS, loose: x.loose, mediaFrameS: x.mediaFrameS, av: x.av });
+    }
+    return { sequenceId: record.sequenceId, startT: record.startT, endT: record.endT, cutsT: record.cutsT,
+             rebuiltEndT: record.rebuiltEndT, items: items, others: record.others };
+}
+
+/**
+ * args: { sequenceId, clipIds, ranges: [{fromS, toS}] } — cut these sequence-time ranges out of the
+ * chosen clips (ids from get_sequence), with Apply's engine and guarantees: the clips are found and
+ * checked as Apply finds its recorded ones (locked tracks, speed, loose sources, audio from video
+ * files), Apply's pre-checks refuse what the rebuild would overwrite, and the cut is all or nothing.
+ * The ranges are clipped to the chosen clips' span [earliest start, latest end]. Returns { ok,
+ * cutCount, clipCount, removedS, crossfades, warning?, undo } (undo: gcutCutRecord). Never touches
+ * the Apply/Restore stash.
+ */
+function gcutToolCutRanges(argsJson) {
+    try {
+        var args = gcutParse(argsJson) || {}, k;
+        var seq = gcutSequence(), clock = gcutClock(seq);
+        gcutSameSequence(seq, args.sequenceId);
+        var chosen = gcutResolveIds(seq, args.clipIds), spec = { items: [] };
+        for (k = 0; k < chosen.length; k++) {
+            spec.items.push({ kind: chosen[k].kind, trackIndex: chosen[k].trackIndex,
+                              startTicks: chosen[k].item.start.ticks, endTicks: chosen[k].item.end.ticks });
+        }
+        var found, span, cutsT;
+        try {
+            found = gcutRefind(seq, spec, clock);
+            span = gcutSpan(found);
+            var ranges = gcutIsArray(args.ranges) ? args.ranges : [], cuts = [], startS = span.fromT / GCUT_TICKS;
+            for (k = 0; k < ranges.length; k++) {
+                var x = ranges[k] || {};
+                if (!gcutIsTime(x.fromS) || !gcutIsTime(x.toS)) throw new Error("Range " + (k + 1) + " needs fromS and toS, in seconds on the sequence.");
+                cuts.push({ start: x.fromS - startS, end: x.toS - startS });
+            }
+            cutsT = gcutCutTicks(cuts, span.fromT, clock, span.toT);
+            gcutDropsCheck(seq, found, cutsT, clock); // before gcutAudioUnder: it names what lands where
+            var vSpan = gcutSpan(found, "video");
+            if (vSpan) gcutAudioUnder(seq, spec, vSpan.fromT, vSpan.toT, clock);
+            gcutCovers(seq, found, cutsT, clock);
+        } catch (pre) {
+            throw gcutToolAdvice(pre);
+        }
+        var rebuiltEndT = span.fromT;
+        for (k = 0; k < found.length; k++) rebuiltEndT = Math.max(rebuiltEndT, gcutNewEnd(found[k], cutsT));
+        var others = gcutOthers(seq, found, span.fromT, span.toT);
+        var rec = { sequenceId: gcutSeqId(seq), startT: span.fromT, endT: span.toT, cutsT: cutsT, rebuiltEndT: rebuiltEndT,
+                    items: found, others: others };
+        var r = gcutCutCore(seq, clock, found, cutsT, rec);
+        if (!r.ok) throw new Error(gcutCutFailed(seq, clock, r, others).message);
+        return gcutOk({ ok: true, cutCount: r.appliedCount, clipCount: r.clipCount, removedS: r.trailingGapS,
+                        crossfades: r.crossfades, warning: r.warning, undo: gcutCutRecord(rec) });
+    } catch (e) {
+        return gcutFail(e);
+    }
+}
+
+/**
+ * True if nothing of the cut is left: every recorded item is back at its own original place (same
+ * source, start and end), and none of the pieces only the cut made is on the timeline.
+ */
+function gcutCutGone(seq, rec, clock) {
+    var plan = gcutPlan(rec.items, rec.cutsT);
+    for (var i = 0; i < rec.items.length; i++) {
+        var f = rec.items[i], tracks = gcutKindTracks(seq, f.kind), back = false;
+        if (f.trackIndex >= tracks.numTracks) return false;
+        var items = gcutItems(tracks[f.trackIndex]);
+        for (var j = 0; j < items.length; j++) {
+            if (gcutNode(items[j]) === f.node && gcutT(items[j].start) === f.startT && gcutT(items[j].end) === f.endT) back = true;
+        }
+        if (!back) return false;
+        var whole = plan[i].length === 1 && plan[i][0].atT === f.startT && plan[i][0].durT === f.endT - f.startT;
+        if (!whole && gcutOursNow(seq, { items: [f], cutsT: rec.cutsT, others: rec.others }, clock).length) return false;
+    }
+    return true;
+}
+
+/**
+ * Undo a cut_ranges, as Restore undoes an Apply: only if every planned piece is still exactly where
+ * the cut laid it and nothing new is in the way; then every recorded item goes back to its own
+ * original place, checked, with the others left as they were. Already undone (gcutCutGone): says so.
+ * A refusal changes nothing; a re-lay that fails puts the cut version back.
+ */
+function gcutUndoCuts(seq, record, clock) {
+    var rec = gcutRehydrate(record), marks = [], k;
+    if (gcutCutGone(seq, rec, clock)) return { ok: true, alreadyUndone: true };
+    var plan = gcutPlan(rec.items, rec.cutsT), want = 0;
+    for (k = 0; k < plan.length; k++) want += plan[k].length;
+    var ours = gcutOursNow(seq, rec, clock);
+    if (ours.length !== want) {
+        throw new Error("Some of the cut pieces were moved, trimmed or removed since (" + ours.length + " of " + want +
+            " are where the cut left them), so the cut changed since. Nothing was undone; use Premiere's Undo instead.");
+    }
+    var span = gcutSpan(rec.items), others = gcutOthers(seq, ours, span.fromT, span.toT);
+    var blocked = gcutInTheWay(seq, rec, others, clock);
+    if (blocked) throw new Error(blocked);
+    try {
+        for (k = 0; k < rec.items.length; k++) {
+            var seen = false;
+            for (var m = 0; m < marks.length; m++) if (marks[m].node === rec.items[k].node) seen = true;
+            if (!seen) marks.push({ pi: rec.items[k].pi, node: rec.items[k].node, inS: rec.items[k].pi.getInPoint().seconds, outS: rec.items[k].pi.getOutPoint().seconds });
+        }
+        if (!gcutRelayAll(seq, rec, clock, others)) {
+            var cutBack = gcutRelay(seq, rec.items, gcutPlan(rec.items, rec.cutsT), clock, others);
+            throw new Error(cutBack ? "The original clips didn't go back as expected, so the cut version was put back as it was. Nothing was undone; try again, or use Premiere's Undo."
+                : "The original clips didn't go back as expected, and the cut version couldn't be put back either. Use Premiere's Undo.");
+        }
+        var hit = gcutSnapshotIntact(seq, others, clock);
+        if (hit) throw new Error("Undoing the cut changed something on " + hit + ". Use Premiere's Undo.");
+        return { ok: true };
+    } finally {
+        // Always leave the bin items' own in/out marks as they were.
+        for (k = 0; k < marks.length; k++) {
+            try { gcutSetRange(marks[k].pi, marks[k].inS, marks[k].outS, clock.frameS / 2); } catch (ignored) { /* best effort */ }
+        }
+    }
+}
+
 /**
  * args: { record } — the `undo` record an act tool returned, as it returned it (pure data, so it
  * survives a panel reload). Returns { ok: true }, or { ok: true, alreadyUndone: true } when nothing of
@@ -218,6 +387,7 @@ function gcutToolUndo(argsJson) {
             throw new Error("A different sequence is open than the one this change was made on. Open that sequence first.");
         }
         if (record.kind === "markers") return gcutOk(gcutUndoMarkers(seq, record, clock));
+        if (record.kind === "cuts") return gcutOk(gcutUndoCuts(seq, record, clock));
         throw new Error("Genius Cut can't undo a change of kind " + record.kind + ".");
     } catch (e) {
         return gcutFail(e);

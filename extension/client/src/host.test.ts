@@ -1933,6 +1933,28 @@ describe("measured in Premiere 26.5.2: classify by EXACT frame rate, audio follo
       const got = (s.host.ctx as any).gcutResolveIds(s.seq, r.clips.map((c: any) => c.id));
       got.forEach((x: any, i: number) => expect(x.item).toBe(tracks(s)[i].items[0]));
     });
+
+    const allIds = (s: Scene) => s.host.call("gcutToolGetSequence", {}).clips.map((c: any) => c.id);
+    const asRanges = (c: number[][]) => c.map(([fromS, toS]) => ({ fromS, toS }));
+    it.each(cases.slice(0, 3))("cut_ranges %j on the loose Restream clips lays exactly what Apply lays; undo puts every clip back exactly", (...c) => {
+      const s = restreamScene();
+      const r = s.host.call("gcutToolCutRanges", { sequenceId: "seq-1", clipIds: allIds(s), ranges: asRanges(c) });
+      expect(r).toMatchObject({ ok: true, clipCount: 4 });
+      expectLayout(s, toF(c));
+      expect(s.host.call("gcutToolUndo", { record: JSON.parse(JSON.stringify(r.undo)) })).toEqual({ ok: true });
+      expectOriginal(s);
+    });
+
+    it("cut_ranges then undo four times over: no clip drifts in its source", () => {
+      const s = restreamScene(), orig = tracks(s).map((t) => t.clips[0].trueIn.seconds), c = cases[0];
+      for (let cycle = 0; cycle < 4; cycle++) {
+        const r = s.host.call("gcutToolCutRanges", { sequenceId: "seq-1", clipIds: allIds(s), ranges: asRanges(c) });
+        expectLayout(s, toF(c));
+        expect(s.host.call("gcutToolUndo", { record: JSON.parse(JSON.stringify(r.undo)) }), `cycle ${cycle}`).toEqual({ ok: true });
+        expectOriginal(s);
+        tracks(s).forEach((t, k) => expect(t.clips[0].trueIn.seconds, `cycle ${cycle} track ${k}`).toBeCloseTo(orig[k], 9));
+      }
+    });
   });
 });
 
@@ -2311,5 +2333,169 @@ describe("gcutToolAddMarkers and its undo", () => {
     expect(s.seq.markers.numMarkers).toBe(2);
     expect(() => undo(s, { kind: "teleport", sequenceId: "seq-2" })).toThrow(/can't undo/);
     expect(() => undo(s, null)).toThrow(/nothing to undo/);
+  });
+});
+
+const cutTool = (s: { host: ReturnType<typeof load> }, clipIds: string[], ranges: unknown, sequenceId = "seq-1") =>
+  s.host.call("gcutToolCutRanges", { sequenceId, clipIds, ranges });
+const undoTool = (s: { host: ReturnType<typeof load> }, record: unknown) => s.host.call("gcutToolUndo", { record });
+/** A record as the bridge keeps it: JSON only, no live objects. */
+const asStored = (record: unknown) => JSON.parse(JSON.stringify(record));
+const allTracks = (seq: Seq) => [...Array.from({ length: seq.videoTracks.numTracks }, (_, t) => span(seq.videoTracks[t])),
+  ...Array.from({ length: seq.audioTracks.numTracks }, (_, t) => span(seq.audioTracks[t]))];
+const RANGES = [{ fromS: 102, toS: 103 }, { fromS: 107, toS: 108 }];
+
+describe("gcutToolCutRanges: timeline ranges cut from chosen clips with Apply's engine, and its undo", () => {
+  const bins = (s: ReturnType<typeof georgScene>) => [s.a, s.b, s.scr, s.mic].map((pi) => [pi.inS, pi.outS]);
+  function marked() {
+    const s = georgScene();
+    for (const pi of [s.a, s.b, s.scr, s.mic]) { pi.inS = 2; pi.outS = 58; }
+    return s;
+  }
+
+  it("cuts exactly as Apply does on Georg's sequence (fitting sources), leaves the bins' marks, and undo puts every clip back exactly", () => {
+    const s = marked(), original = allTracks(s.seq);
+    const r = cutTool(s, getSeq(s).selection, RANGES);
+    expect(r).toMatchObject({ ok: true, cutCount: 2, clipCount: 4, crossfades: 2 });
+    expect(r.removedS).toBeCloseTo(2, 9);
+    expect(span(s.seq.videoTracks[0])).toEqual([[100, 102, 10], [102, 106, 13], [106, 108, 18]]);
+    expect(span(s.seq.videoTracks[1])).toEqual([[100.24, 102, 30], [102, 106, 32.76], [106, 107.84, 37.76]]);
+    expect(span(s.seq.videoTracks[2])).toEqual([[100.28, 102, 5], [102, 106, 7.72], [106, 108, 12.72]]);
+    expect(span(s.seq.audioTracks[0])).toEqual([[99, 102, 50], [102, 106, 54], [106, 109, 59]]);
+    expect(span(s.seq.videoTracks[3])).toEqual([[112, 115, 0]]);
+    expect(bins(s)).toEqual([[2, 58], [2, 58], [2, 58], [2, 58]]);
+    // Never the Apply/Restore stash.
+    expect(Object.keys((s.host.ctx as any).$.global.gcutStash)).toEqual([]);
+    expect(undoTool(s, asStored(r.undo))).toEqual({ ok: true });
+    expect(allTracks(s.seq)).toEqual(original);
+    expect(bins(s)).toEqual([[2, 58], [2, 58], [2, 58], [2, 58]]);
+  });
+
+  it("the undo record is pure data: the cut's place, its cuts, each item as Apply records it, and the others as gcutOthers gives them", () => {
+    const s = georgScene();
+    s.seq.videoTracks[1].add(s.b, 99.5, 29.26, 30); // a razored head of Camera B, not chosen
+    const r = cutTool(s, getSeq(s).selection, RANGES);
+    expect(asStored(r.undo)).toEqual(r.undo);
+    expect(r.undo).toMatchObject({ kind: "cuts", sequenceId: "seq-1", startT: 99 * TICKS, endT: 111 * TICKS, rebuiltEndT: 109 * TICKS,
+      cutsT: [{ startT: 102 * TICKS, endT: 103 * TICKS }, { startT: 107 * TICKS, endT: 108 * TICKS }] });
+    expect(Object.keys(r.undo.items[0]).sort()).toEqual(
+      ["av", "endT", "inS", "kind", "label", "loose", "mediaFrameS", "node", "outS", "srcFrameS", "startT", "trackIndex"]);
+    expect(r.undo.items.map((i: any) => [i.label, i.node, i.startT / TICKS, i.endT / TICKS, i.inS])).toEqual(
+      [["V1", "node-a", 100, 110, 10], ["V2", "node-b", 100.24, 109.84, 30], ["V3", "node-r", 100.28, 110, 5], ["A1", "node-m", 99, 111, 50]]);
+    expect(r.undo.others).toEqual([{ label: "V2", t: 1, start: Math.round(99.5 * TICKS), end: Math.round(100.24 * TICKS), inS: 29.26, node: "node-b" }]);
+  });
+
+  it("undo after a panel reload, from the stored record only: a same-source clip among the others survives", () => {
+    const s = georgScene();
+    s.seq.videoTracks[1].add(s.b, 99.5, 29.26, 30);
+    const original = allTracks(s.seq);
+    const record = asStored(cutTool(s, getSeq(s).selection, RANGES).undo);
+    expect(span(s.seq.videoTracks[1])).toEqual([[99.5, 100.24, 29.26], [100.24, 102, 30], [102, 106, 32.76], [106, 107.84, 37.76]]);
+    const reloaded = { host: load(s.seq) }; // a fresh ExtendScript engine: no stash, no live objects
+    expect(undoTool(reloaded, record)).toEqual({ ok: true });
+    expect(allTracks(s.seq)).toEqual(original);
+  });
+
+  it("cuts only the chosen clips: clips on tracks it wasn't given stay as they are", () => {
+    const s = georgScene();
+    const ids = getSeq(s).clips.filter((c: any) => c.track === "V1" || c.track === "A1").map((c: any) => c.id);
+    const r = cutTool(s, ids, [{ fromS: 104, toS: 105 }]);
+    expect(r).toMatchObject({ ok: true, clipCount: 2 });
+    expect(span(s.seq.videoTracks[0])).toEqual([[100, 104, 10], [104, 109, 15]]);
+    expect(span(s.seq.videoTracks[1])).toEqual([[100.24, 109.84, 30]]);
+    expect(span(s.seq.videoTracks[2])).toEqual([[100.28, 110, 5]]);
+    expect(span(s.seq.audioTracks[0])).toEqual([[99, 104, 50], [104, 110, 56]]);
+    expect(undoTool(s, asStored(r.undo))).toEqual({ ok: true });
+    expect(span(s.seq.videoTracks[0])).toEqual([[100, 110, 10]]);
+    expect(span(s.seq.audioTracks[0])).toEqual([[99, 111, 50]]);
+  });
+
+  describe("refuses, changing nothing", () => {
+    type Case = { s: any; ids: string[]; ranges?: unknown; seqId?: string; msg: string | RegExp };
+    it.each<[string, () => Case]>([
+      ["linked audio it wasn't given (V1 without its own sound on A1)", () => {
+        const s = scene();
+        return { s, ids: [getSeq(s).clips[0].id], msg: "Placing V1 also drops its own sound onto A1, which would cover interview_take3.mp4. Move that clip off A1's time." };
+      }],
+      ["a slide over a clip it wasn't given", () => {
+        const s = georgScene();
+        s.seq.videoTracks[2].add(new ProjectItem("bumper.mov", "node-u", 30, "seconds", false), 99, 0, 1.28); // ends at 100.28
+        return { s, ids: getSeq(s).selection, ranges: [{ fromS: 100.04, toS: 100.2 }], msg: /Moving V3's clip left would cover bumper.mov on V3/ };
+      }],
+      ["a locked track", () => { const s = georgScene(); s.seq.videoTracks[2].locked = true; return { s, ids: getSeq(s).selection, msg: /V3 is locked/ }; }],
+      ["a clip not at 100% speed", () => { const s = georgScene(); s.v2.speed = 2; return { s, ids: getSeq(s).selection, msg: /V2 isn't at 100% speed/ }; }],
+      ["unchosen audio under the chosen video, saying to read the timeline again (not to Analyse)", () => {
+        const s = scene();
+        s.seq.audioTracks[1].add(wav("music.wav", "node-9", 300), 90, 0, 40);
+        return { s, ids: getSeq(s).selection, msg: "A2 (music.wav) sits under the selected video clips, and rebuilding them could overwrite it. " +
+          "Select it too, or move it off the clips' time, then read the timeline again." };
+      }],
+      ["a different sequence", () => { const s = georgScene(); return { s, ids: getSeq(s).selection, seqId: "seq-2", msg: /different sequence/ }; }],
+      ["a stale id", () => { const s = georgScene(); const ids = getSeq(s).selection; s.v2.start = Time.s(100.2); return { s, ids, msg: STALE }; }],
+      ["ranges outside the chosen clips", () => { const s = georgScene(); return { s, ids: getSeq(s).selection, ranges: [{ fromS: 120, toS: 121 }], msg: /nothing to cut/ }; }],
+      ["no ranges", () => { const s = georgScene(); return { s, ids: getSeq(s).selection, ranges: [], msg: /nothing to cut/ }; }],
+      ["a range without times", () => { const s = georgScene(); return { s, ids: getSeq(s).selection, ranges: [{ fromS: 102 }], msg: /Range 1/ }; }],
+    ])("%s", (_, make) => {
+      const { s, ids, ranges, seqId, msg } = make();
+      const before = allTracks(s.seq), pis = s.seq.bin.map((pi: ProjectItem) => [pi.inS, pi.outS]);
+      expect(() => cutTool(s, ids, ranges ?? RANGES, seqId)).toThrow(msg);
+      expect(allTracks(s.seq)).toEqual(before);
+      expect(s.seq.bin.map((pi: ProjectItem) => [pi.inS, pi.outS])).toEqual(pis);
+    });
+  });
+
+  it("a piece landing wrong rolls every clip back, and says so", () => {
+    const s = georgScene(), original = allTracks(s.seq);
+    s.seq.dropSpanIndex = 4;
+    expect(() => cutTool(s, getSeq(s).selection, RANGES)).toThrow(/didn't land where or as expected\. Every clip was put back\./);
+    expect(allTracks(s.seq)).toEqual(original);
+  });
+
+  describe("undo", () => {
+    function cutGeorg() {
+      const s = georgScene();
+      const original = allTracks(s.seq), saved = [...s.seq.videoTracks, ...s.seq.audioTracks].map((t: Track) => [...t.items]);
+      const record = asStored(cutTool(s, getSeq(s).selection, RANGES).undo);
+      return { s, original, saved, record, cut: allTracks(s.seq) };
+    }
+
+    it("refuses, changing nothing, when a cut piece was moved since", () => {
+      const { s, record, cut } = cutGeorg();
+      s.seq.videoTracks[0].clips[1].move(Time.s(0.2));
+      const now = allTracks(s.seq);
+      expect(now).not.toEqual(cut);
+      expect(() => undoTool(s, record)).toThrow(/changed since.*Nothing was undone/);
+      expect(allTracks(s.seq)).toEqual(now);
+    });
+
+    it("refuses, changing nothing, when something was placed in the gap since (an extra piece of a cut source)", () => {
+      const { s, record } = cutGeorg();
+      s.seq.videoTracks[0].add(s.a, 108.2, 40, 40.8);
+      const now = allTracks(s.seq);
+      expect(() => undoTool(s, record)).toThrow(/gap on V1/);
+      expect(allTracks(s.seq)).toEqual(now);
+    });
+
+    it("when the original arrangement is back (Premiere's Undo), says it is already undone and changes nothing", () => {
+      const { s, record, original, saved } = cutGeorg();
+      [...s.seq.videoTracks, ...s.seq.audioTracks].forEach((t: Track, k: number) => { t.items = saved[k]; });
+      expect(allTracks(s.seq)).toEqual(original);
+      expect(undoTool(s, record)).toEqual({ ok: true, alreadyUndone: true });
+      expect(allTracks(s.seq)).toEqual(original);
+    });
+
+    it("refuses when a source is no longer in the project, changing nothing", () => {
+      const { s, record, cut } = cutGeorg();
+      s.seq.bin = s.seq.bin.filter((pi) => pi !== s.b);
+      expect(() => undoTool(s, record)).toThrow(/V2's source isn't in the project/);
+      expect(allTracks(s.seq)).toEqual(cut);
+    });
+
+    it("refuses on a different sequence", () => {
+      const { s, record, cut } = cutGeorg();
+      s.seq.sequenceID = "seq-2";
+      expect(() => undoTool(s, record)).toThrow(/different sequence/);
+      expect(allTracks(s.seq)).toEqual(cut);
+    });
   });
 });

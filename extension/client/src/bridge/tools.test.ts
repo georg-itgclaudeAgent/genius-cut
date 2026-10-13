@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { createTools, type ToolDeps } from "./tools";
+import { createTurns, type TurnStore } from "./turns";
 import type { TranscriptJob, TranscriptRequest } from "../api/types";
 
 const TICKS = 254016000000;
@@ -14,15 +15,22 @@ const LISTING = {
   ],
 };
 
+const memoryStore = (): TurnStore => { let text: string | null = null; return { read: () => text, write: (t) => { text = t; } }; };
+
 function fakes(job: Partial<TranscriptJob> = {}) {
   const host: [string, unknown][] = [], posted: TranscriptRequest[] = [], polled: [string, number][] = [];
   let next: TranscriptJob = { id: "j1", status: "running", progress: 0.25, ...job };
+  let undoReply: () => unknown = () => ({ ok: true });
+  let active = "seq-1";
+  const turns = createTurns(memoryStore());
   const deps: ToolDeps = {
+    turns,
     callHost: async (fn, args) => {
       host.push([fn, args]);
-      if (fn === "gcutToolGetSequence") return LISTING;
+      if (fn === "gcutToolGetSequence") return { ...LISTING, sequenceId: active };
+      if (fn === "gcutToolUndo") return undoReply();
       if (fn === "gcutToolAddMarkers") return { ok: true, created: ["g1"], undo: { kind: "markers", sequenceId: "seq-1", markers: [] } };
-      if (fn === "gcutToolCutRanges") return { ok: true, cutCount: 1, clipCount: 2, removedS: 1, crossfades: 1, undo: { kind: "cuts" } };
+      if (fn === "gcutToolCutRanges") return { ok: true, cutCount: 1, clipCount: 2, removedS: 1, crossfades: 1, undo: { kind: "cuts", sequenceId: "seq-1" } };
       throw new Error(`unexpected ${fn}`);
     },
     backend: {
@@ -30,19 +38,20 @@ function fakes(job: Partial<TranscriptJob> = {}) {
       transcriptJob: async (jobId, waitS) => { polled.push([jobId, waitS]); return next; },
     },
   };
-  return { deps, host, posted, polled, setJob: (j: Partial<TranscriptJob>) => { next = { ...next, ...j }; } };
+  return { deps, host, posted, polled, turns, setJob: (j: Partial<TranscriptJob>) => { next = { ...next, ...j }; },
+    onUndo: (f: () => unknown) => { undoReply = f; }, setActive: (id: string) => { active = id; } };
 }
 
 describe("the bridge's tool table", () => {
   it("has the Phase 1 tools, read and act kinds", () => {
     const t = createTools(fakes().deps);
     expect(Object.fromEntries(Object.entries(t).map(([k, v]) => [k, v.kind]))).toMatchObject({
-      get_sequence: "read", get_transcript: "read", wait_transcript: "read", add_markers: "act", cut_ranges: "act" });
+      get_sequence: "read", get_transcript: "read", wait_transcript: "read", add_markers: "act", cut_ranges: "act", undo_last_turn: "act" });
   });
 
   it("get_sequence is the host's listing, with Claude's arguments", async () => {
     const f = fakes();
-    expect(await createTools(f.deps).get_sequence.run({ fromS: 10, toS: 20 })).toBe(LISTING);
+    expect(await createTools(f.deps).get_sequence.run({ fromS: 10, toS: 20 })).toEqual(LISTING);
     expect(f.host).toEqual([["gcutToolGetSequence", { fromS: 10, toS: 20 }]]);
   });
 
@@ -105,6 +114,63 @@ describe("the bridge's tool table", () => {
       const f = fakes();
       await expect(createTools(f.deps).wait_transcript.run({ id: "other" })).rejects.toThrow(/call get_transcript again/);
       expect(f.polled).toEqual([]);
+    });
+  });
+
+  describe("undo_last_turn", () => {
+    const MARGS = { sequenceId: "seq-1", markers: [{ atS: 101, name: "Intro" }, { atS: 105, name: "Pricing" }] };
+    const CARGS = { sequenceId: "seq-1", clipIds: [V1, A1], ranges: [{ fromS: 102, toS: 103 }] };
+    const undoCalls = (f: ReturnType<typeof fakes>) => f.host.filter(([fn]) => fn === "gcutToolUndo").map(([, a]) => a);
+
+    it("each successful act call is a turn: undo reverses the newest first, then the one before, with the host's own records", async () => {
+      const f = fakes(), t = createTools(f.deps);
+      await t.add_markers.run(MARGS);
+      await t.cut_ranges.run(CARGS);
+      expect(await t.undo_last_turn.run({})).toEqual({ ok: true, undone: "Cut 1 range from 2 clips (1 s removed)" });
+      expect(await t.undo_last_turn.run({})).toEqual({ ok: true, undone: "Added 2 markers: Intro, Pricing" });
+      expect(undoCalls(f)).toEqual([{ record: { kind: "cuts", sequenceId: "seq-1" } }, { record: { kind: "markers", sequenceId: "seq-1", markers: [] } }]);
+      await expect(t.undo_last_turn.run({})).rejects.toThrow(/Nothing to undo/);
+    });
+
+    it("a refusal keeps the turn, and the reply says what is in the way", async () => {
+      const f = fakes(), t = createTools(f.deps);
+      await t.add_markers.run(MARGS);
+      f.onUndo(() => { throw new Error("These markers were changed by hand since: Intro was changed. Nothing was undone."); });
+      await expect(t.undo_last_turn.run({})).rejects.toThrow("These markers were changed by hand since: Intro was changed. Nothing was undone.");
+      expect(f.turns.latest("seq-1")!.summary).toBe("Added 2 markers: Intro, Pricing");
+      f.onUndo(() => ({ ok: true }));
+      expect(await t.undo_last_turn.run({})).toMatchObject({ ok: true });
+      expect(f.turns.latest("seq-1")).toBeUndefined();
+    });
+
+    it("when the host finds the turn already undone (Premiere's Undo took it back), pops it and says so", async () => {
+      const f = fakes(), t = createTools(f.deps);
+      await t.add_markers.run(MARGS);
+      await t.cut_ranges.run(CARGS);
+      f.onUndo(() => ({ ok: true, alreadyUndone: true }));
+      expect(await t.undo_last_turn.run({})).toEqual({ ok: true, alreadyUndone: true, undone: "Cut 1 range from 2 clips (1 s removed)",
+        message: "Already undone: nothing of it was left on the timeline." });
+      expect(f.turns.latest("seq-1")!.summary).toBe("Added 2 markers: Intro, Pricing");
+    });
+
+    it("undoes the active sequence's turns only", async () => {
+      const f = fakes(), t = createTools(f.deps);
+      await t.add_markers.run(MARGS);
+      f.setActive("seq-2");
+      await expect(t.undo_last_turn.run({})).rejects.toThrow(/Nothing to undo/);
+      expect(undoCalls(f)).toEqual([]);
+      f.setActive("seq-1");
+      expect(await t.undo_last_turn.run({})).toMatchObject({ ok: true });
+    });
+
+    it("a failed act call is no turn", async () => {
+      const f = fakes(), t = createTools(f.deps);
+      const failing: ToolDeps = { ...f.deps, callHost: async (fn, a) => {
+        if (fn === "gcutToolAddMarkers") throw new Error("Marker 1 needs a name.");
+        return f.deps.callHost(fn, a);
+      } };
+      await expect(createTools(failing).add_markers.run(MARGS)).rejects.toThrow("Marker 1 needs a name.");
+      await expect(t.undo_last_turn.run({})).rejects.toThrow(/Nothing to undo/);
     });
   });
 });

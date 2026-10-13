@@ -15,6 +15,7 @@
 import type { Mode } from "../lib/mode";
 import { hostCaller } from "../api/host";
 import { createTools, type ToolDeps, type ToolTable } from "./tools";
+import { createTurns, fileTurnStore } from "./turns";
 
 const MARK_HEADER = "X-Genius-Cut";
 const MARK = "gcut-assistant-bridge";
@@ -131,15 +132,16 @@ export function bridgeWanted(flag: string | undefined, mode: Mode): boolean {
   return flag === "1" && mode === "live";
 }
 
-/** Load host/assistant.jsx into Premiere, then start the bridge. null when this build or mode doesn't get the assistant. */
+/** Load host/assistant.jsx into Premiere, load the undo stack (turns.json), then start the bridge. null when this build or mode doesn't get the assistant. */
 export async function startAssistant(d: AssistantDeps): Promise<Bridge | null> {
   if (!bridgeWanted(d.flag, d.mode)) return null;
   const file = `${d.extensionRoot().replace(/\\/g, "/")}/host/assistant.jsx`;
   const out = await d.evalScript(
     `(function () { try { $.evalFile(new File(${JSON.stringify(file)})); return typeof gcutToolGetSequence === "function" ? "ok" : "Error: gcutToolGetSequence is missing"; } catch (e) { return "Error: " + e; } })()`);
   if (out !== "ok") throw new Error(`The assistant's Premiere script didn't load (${file}): ${String(out).replace(/^Error:\s*/, "")}`);
-  const callHost = hostCaller(d.evalScript);
-  const tools = createTools({ callHost: (fn, args) => callHost(fn, args), backend: d.backend });
-  return startBridge({ http: d.node("http"), fs: d.node("fs"), path: d.node("path"), dir: d.dataDir(), pid: d.node("process").pid,
+  const callHost = hostCaller(d.evalScript), fs = d.node("fs"), path = d.node("path"), dir = d.dataDir();
+  const turns = createTurns(fileTurnStore(fs, path, path.join(dir, "turns.json")));
+  const tools = createTools({ callHost: (fn, args) => callHost(fn, args), backend: d.backend, turns });
+  return startBridge({ http: d.node("http"), fs, path, dir, pid: d.node("process").pid,
     panelVersion: d.panelVersion, token: d.node("crypto").randomBytes(32).toString("hex"), tools, busy: d.busy });
 }

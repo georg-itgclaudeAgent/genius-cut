@@ -6,6 +6,7 @@
 import type { Snapshot, SnapshotItem, TranscriptJob, TranscriptRequest } from "../api/types";
 import { round3 } from "../lib/review";
 import { trimRequestFor } from "../lib/snapshot";
+import type { Turns } from "./turns";
 
 export interface Tool {
   /** act tools change the timeline: refused while the Cut tab is busy. */
@@ -21,6 +22,8 @@ export interface ToolDeps {
     transcript(req: TranscriptRequest): Promise<TranscriptJob>;
     transcriptJob(id: string, waitS: number): Promise<TranscriptJob>;
   };
+  /** The undo stack: every successful act call is pushed as one turn. */
+  turns: Turns;
 }
 
 const TICKS = 254016000000;
@@ -44,13 +47,26 @@ function onSequence(job: TranscriptJob, startS: number) {
   return out;
 }
 
-/** An act tool's reply without its undo record (the bridge keeps that). */
-function withoutUndo(r: any) {
-  const { undo: _undo, ...rest } = r;
-  return rest;
+const plural = (n: number, one: string) => `${n} ${one}${n === 1 ? "" : "s"}`;
+
+function markersSummary(args: any): string {
+  const names = (Array.isArray(args?.markers) ? args.markers : []).map((m: any) => String(m?.name ?? ""));
+  return `Added ${plural(names.length, "marker")}: ${names.join(", ")}`;
+}
+
+function cutSummary(r: any): string {
+  return `Cut ${plural(r.cutCount, "range")} from ${plural(r.clipCount, "clip")} (${round3(r.removedS)} s removed)`;
 }
 
 export function createTools(deps: ToolDeps): ToolTable {
+  /** Run an act tool on the host; on success push it as a turn and reply without the undo record (the stack keeps that). */
+  async function act(tool: string, fn: string, args: any, summary: (args: any, r: any) => string) {
+    const r = await deps.callHost(fn, args ?? {});
+    const { undo, ...reply } = r;
+    deps.turns.push({ sequenceId: String(undo.sequenceId), tool, args: args ?? {}, summary: summary(args, r), undo });
+    return reply;
+  }
+
   /** Where each job this panel started begins on the sequence: its words come back range-relative. */
   const jobStarts = new Map<string, number>();
 
@@ -92,7 +108,23 @@ export function createTools(deps: ToolDeps): ToolTable {
       },
     },
 
-    add_markers: { kind: "act", run: async (args) => withoutUndo(await deps.callHost("gcutToolAddMarkers", args ?? {})) },
-    cut_ranges: { kind: "act", run: async (args) => withoutUndo(await deps.callHost("gcutToolCutRanges", args ?? {})) },
+    add_markers: { kind: "act", run: (args) => act("add_markers", "gcutToolAddMarkers", args, markersSummary) },
+    cut_ranges: { kind: "act", run: (args) => act("cut_ranges", "gcutToolCutRanges", args, (_a, r) => cutSummary(r)) },
+
+    undo_last_turn: {
+      kind: "act",
+      async run() {
+        // The active sequence's id (a listing of nothing: the stretch 0–0 holds no clip).
+        const { sequenceId } = await deps.callHost("gcutToolGetSequence", { fromS: 0, toS: 0 });
+        const turn = deps.turns.latest(String(sequenceId));
+        if (!turn) throw new Error("Nothing to undo on this sequence: no assistant change made on it is left to undo.");
+        // A refusal throws the host's reason (what is in the way) and the turn stays.
+        const r = await deps.callHost("gcutToolUndo", { record: turn.undo });
+        deps.turns.pop(turn.sequenceId, turn.id);
+        return r && r.alreadyUndone
+          ? { ok: true, alreadyUndone: true, undone: turn.summary, message: "Already undone: nothing of it was left on the timeline." }
+          : { ok: true, undone: turn.summary };
+      },
+    },
   };
 }

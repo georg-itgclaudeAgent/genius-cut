@@ -1,6 +1,6 @@
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { createRequire } from "module";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { startAssistant, startBridge, type Bridge } from "./server";
@@ -152,5 +152,24 @@ describe("startAssistant: only in a flagged build, live in Premiere", () => {
     const x = deps("1", "live", "Error: syntax error");
     await expect(startAssistant(x.d)).rejects.toThrow(/syntax error/);
     expect(existsSync(join(x.dir, "bridge.json"))).toBe(false);
+  });
+
+  it("loads turns.json on start: undo_last_turn reverses a turn made before the panel reloaded", async () => {
+    const x = deps("1", "live");
+    const record = { kind: "markers", sequenceId: "seq-1", markers: [{ id: "g1" }] };
+    mkdirSync(x.dir, { recursive: true });
+    writeFileSync(join(x.dir, "turns.json"), JSON.stringify({ "seq-1": [{ id: "t1", at: "2026-10-14T08:00:00.000Z", sequenceId: "seq-1",
+      tool: "add_markers", args: {}, summary: "Added 1 marker: Intro", undo: record }] }));
+    x.evalScript.mockImplementation(async (s: string) =>
+      s.includes("$.evalFile") ? "ok" : s.includes("gcutToolUndo(") ? JSON.stringify({ ok: true }) : JSON.stringify({ sequenceId: "seq-1", clips: [] }));
+    const b = (await startAssistant(x.d))!;
+    bridges.push(b);
+    const { token } = JSON.parse(readFileSync(join(x.dir, "bridge.json"), "utf8"));
+    const r = await fetch(`http://127.0.0.1:${b.port}/tool`, { method: "POST", headers: { Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ name: "undo_last_turn", args: {}, client: "terminal" }) });
+    expect(await r.json()).toEqual({ ok: true, result: { ok: true, undone: "Added 1 marker: Intro" } });
+    const undoScript = x.evalScript.mock.calls.map((c) => c[0]).find((c) => c.includes("gcutToolUndo("))!;
+    expect(undoScript).toContain(JSON.stringify(JSON.stringify({ record })));
+    expect(JSON.parse(readFileSync(join(x.dir, "turns.json"), "utf8"))["seq-1"]).toEqual([]);
   });
 });

@@ -19,6 +19,8 @@ const TICKS = 254016000000;
 const FPS = 25;
 const TPF = TICKS / FPS;
 const HOST_SRC = readFileSync(resolve(__dirname, "../../host/index.jsx"), "utf8");
+// The assistant's toolbox: the flagged panel loads it after index.jsx ($.evalFile), into the same globals.
+const ASSIST_SRC = readFileSync(resolve(__dirname, "../../host/assistant.jsx"), "utf8");
 
 class Time {
   t = 0;
@@ -80,6 +82,8 @@ class TrackItem {
   trueIn: Time;
   private _end: Time;
   selected = false; speed = 1; reversed = 0;
+  /** TrackItem.disabled: the clip is switched off in the timeline. */
+  disabled = false;
   /** Transitions added through QE at this clip's start; they go when the clip goes (measured). */
   transitions: { applyToStart: boolean; duration: string; offset: string; alignment: number }[] = [];
   linked: TrackItem[] = [];
@@ -134,7 +138,10 @@ class TrackItem {
 class Track {
   items: TrackItem[] = [];
   locked = false;
+  muted = false;
   constructor(public seq: Seq, public kind: "video" | "audio", public index: number) {}
+  get name() { return (this.kind === "video" ? "Video " : "Audio ") + (this.index + 1); }
+  isMuted() { return this.muted; }
   get clips() {
     const arr: any = [...this.items].sort((a, b) => a.start.t - b.start.t);
     arr.numItems = arr.length;
@@ -142,6 +149,7 @@ class Track {
   }
   isLocked() { return this.locked; }
   add(pi: ProjectItem, startS: number, inS: number, outS: number) {
+    if (!this.seq.bin.includes(pi)) this.seq.bin.push(pi);
     return this.place(pi, Math.round(startS * TICKS), inS, Math.round((outS - inS) * TICKS));
   }
   /** Lay an item at [startT, startT+durT), overwriting (trimming/splitting/removing) whatever is there. */
@@ -171,8 +179,36 @@ class Track {
   }
 }
 
+/** A sequence marker as measured in Premiere 26.5.2 (2026-10-14): a guid per marker, start/end as Time, `end`
+ *  set in seconds (a range marker), name, comments, a colour index. */
+let markerCount = 0;
+class Marker {
+  guid = `guid-${++markerCount}`;
+  start: Time; private _end: Time;
+  name = ""; comments = ""; type = "Comment";
+  private colour = 0;
+  constructor(sec: number) { this.start = Time.s(sec); this._end = Time.s(sec); }
+  get end() { return this._end; }
+  set end(v: any) { this._end = typeof v === "number" ? Time.s(v) : Time.k(Number(v.ticks)); }
+  setColorByIndex(i: number) { this.colour = i; }
+  getColorByIndex() { return this.colour; }
+}
+class Markers {
+  list: Marker[] = [];
+  get numMarkers() { return this.list.length; }
+  private sorted() { return [...this.list].sort((a, b) => a.start.t - b.start.t); }
+  createMarker(sec: number) { const m = new Marker(sec); this.list.push(m); return m; }
+  getFirstMarker() { return this.sorted()[0]; }
+  getNextMarker(m: Marker) { const all = this.sorted(); return all[all.indexOf(m) + 1]; }
+  deleteMarker(m: Marker) { this.list = this.list.filter((x) => x !== m); }
+}
+
 class Seq {
   videoTracks: any; audioTracks: any;
+  name = "Main edit";
+  markers = new Markers();
+  /** The project items on this sequence, as the project panel holds them (app.project.rootItem, see load). */
+  bin: ProjectItem[] = [];
   timebase = String(TPF);
   sequenceID = "seq-1";
   audioTrackFor = (videoIndex: number) => videoIndex;
@@ -255,11 +291,17 @@ class FakeQE {
 
 function load(seq: Seq, { qe = true } = {}) {
   const fakeQe = new FakeQE(seq);
-  const sandbox: any = { app: { project: { activeSequence: seq } }, Time, $: { global: {} } };
+  const coll = (xs: any[]) => Object.assign([...xs], { numItems: xs.length });
+  // app.project.rootItem: the root, a "Footage" bin inside it, the sequence's project items in that.
+  const project = { activeSequence: seq, get rootItem() {
+    return { nodeId: "root", name: "", children: coll([{ nodeId: "bin-1", name: "Footage", children: coll(seq.bin) }]) };
+  } };
+  const sandbox: any = { app: { project }, Time, $: { global: {} } };
   if (qe) sandbox.app.enableQE = () => { sandbox.qe = fakeQe; };
   const ctx = vm.createContext(sandbox);
   vm.runInContext("delete this.JSON;", ctx); // ExtendScript has no JSON
   vm.runInContext(HOST_SRC, ctx);
+  vm.runInContext(ASSIST_SRC, ctx);
   const call = (fn: string, arg: unknown) => {
     const out: string = (ctx as any)[fn](JSON.stringify(arg));
     if (out.startsWith("Error:")) throw new Error(out.slice(6).trim());
@@ -1878,6 +1920,20 @@ describe("measured in Premiere 26.5.2: classify by EXACT frame rate, audio follo
         expect(seq.videoTracks[0].clips.map((i: TrackItem) => [i.start.t / tpf, i.end.t / tpf])).toEqual([[2997, 3297]]);
       });
   });
+
+  describe("the assistant's toolbox on Georg's 30 fps sequence", () => {
+    it("gcutToolGetSequence lists the Restream clips with ids that resolve to them", () => {
+      const s = restreamScene();
+      const r = s.host.call("gcutToolGetSequence", {});
+      expect(r).toMatchObject({ fps: 30, durationS: 121 });
+      expect(r.clips.map((c: any) => [c.id, c.startS, c.endS])).toEqual([
+        [`V1@0#node-r`, 0, 120], [`V2@${15 * TPF30}#node-b`, 0.5, 119], [`V3@${30 * TPF30}#node-a`, 1, 121], [`A1@0#node-r`, 0, 120]]);
+      // In points as Premiere 26.5.2 reports them: floored to the sequence's frames.
+      expect(r.clips[0].inS).toBeCloseTo(seqGrid(RS_IN), 9);
+      const got = (s.host.ctx as any).gcutResolveIds(s.seq, r.clips.map((c: any) => c.id));
+      got.forEach((x: any, i: number) => expect(x.item).toBe(tracks(s)[i].items[0]));
+    });
+  });
 });
 
 describe("measured in Premiere 26.5.2: a file's picture and sound land together, whichever kind of track it's placed on", () => {
@@ -2059,5 +2115,102 @@ describe("clean cuts: a 2-frame Constant Power crossfade at every internal cut o
       } };
     };
     expect(applyCuts(s)).toMatchObject({ ok: true, crossfades: 1, warning: "Couldn't add 1 crossfade; the cuts are in place." });
+  });
+});
+
+// ── the assistant's toolbox (extension/host/assistant.jsx) ──────────────────────────
+
+const getSeq = (s: { host: ReturnType<typeof load> }, args: unknown = {}) => s.host.call("gcutToolGetSequence", args);
+/** A clip id as get_sequence gives it: <V|A><track>@<startTicks>#<nodeId>. */
+const idOf = (label: string, startS: number, node: string) => `${label}@${Math.round(startS * TICKS)}#${node}`;
+const STALE = "The timeline changed since you read it; call get_sequence again.";
+
+describe("gcutToolGetSequence: the active sequence for Claude", () => {
+  it("lists the tracks, every clip with its id, times, source, selection and state, on Georg's sequence", () => {
+    const s = georgScene();
+    s.v2.disabled = true;
+    s.seq.audioTracks[1].muted = true;
+    const r = getSeq(s);
+    expect(r).toMatchObject({ sequenceId: "seq-1", name: "Main edit", fps: 25, durationS: 115, markers: [] });
+    expect(r.tracks).toEqual([
+      { kind: "video", index: 1, name: "Video 1", muted: false }, { kind: "video", index: 2, name: "Video 2", muted: false },
+      { kind: "video", index: 3, name: "Video 3", muted: false }, { kind: "video", index: 4, name: "Video 4", muted: false },
+      { kind: "audio", index: 1, name: "Audio 1", muted: false }, { kind: "audio", index: 2, name: "Audio 2", muted: true },
+      { kind: "audio", index: 3, name: "Audio 3", muted: false }]);
+    expect(r.clips).toEqual([
+      { id: idOf("V1", 100, "node-a"), track: "V1", name: "Camera A.mov", startS: 100, endS: 110, inS: 10, source: "D:/Footage/Camera A.mov", selected: true, enabled: true },
+      { id: idOf("V2", 100.24, "node-b"), track: "V2", name: "Camera B.mov", startS: 100.24, endS: 109.84, inS: 30, source: "D:/Footage/Camera B.mov", selected: true, enabled: false },
+      { id: idOf("V3", 100.28, "node-r"), track: "V3", name: "Restream.mov", startS: 100.28, endS: 110, inS: 5, source: "D:/Footage/Restream.mov", selected: true, enabled: true },
+      { id: idOf("V4", 112, "node-t"), track: "V4", name: "Title", startS: 112, endS: 115, inS: 0, source: "D:/Footage/Title", selected: false, enabled: true },
+      { id: idOf("A1", 99, "node-m"), track: "A1", name: "mic.wav", startS: 99, endS: 111, inS: 50, source: "D:/Footage/mic.wav", selected: true, enabled: true }]);
+    expect(r.selection).toEqual([idOf("V1", 100, "node-a"), idOf("V2", 100.24, "node-b"), idOf("V3", 100.28, "node-r"), idOf("A1", 99, "node-m")]);
+  });
+
+  it("lists sequence markers with their guid as id, range, name, comments and colour", () => {
+    const s = georgScene();
+    const m = s.seq.markers.createMarker(105);
+    m.name = "Pricing"; m.comments = "talks about plans"; m.end = 107; m.setColorByIndex(3);
+    s.seq.markers.createMarker(101).name = "Intro";
+    expect(getSeq(s).markers).toEqual([
+      { id: s.seq.markers.list[1].guid, startS: 101, endS: 101, name: "Intro", comments: "", colour: 0 },
+      { id: m.guid, startS: 105, endS: 107, name: "Pricing", comments: "talks about plans", colour: 3 }]);
+  });
+
+  it("with {fromS, toS}, lists only the clips and markers overlapping that stretch", () => {
+    const s = georgScene();
+    s.seq.markers.createMarker(50).name = "early";
+    s.seq.markers.createMarker(113).name = "late";
+    const r = getSeq(s, { fromS: 111, toS: 120 });
+    expect(r.clips.map((c: any) => c.track)).toEqual(["V4"]);
+    expect(r.markers.map((x: any) => x.name)).toEqual(["late"]);
+    expect(r.durationS).toBe(115);
+    expect(getSeq(s, { fromS: 0, toS: 99.5 }).clips.map((c: any) => c.track)).toEqual(["A1"]);
+  });
+
+  it("an empty sequence has no clips and lasts 0 s", () => {
+    const seq = new Seq(1, 1);
+    expect(getSeq({ host: load(seq) })).toMatchObject({ durationS: 0, clips: [], markers: [], selection: [] });
+  });
+
+  it("fails without an active sequence", () => {
+    const s = georgScene();
+    (s.host.ctx as any).app.project.activeSequence = null;
+    expect(() => getSeq(s)).toThrow(/No active sequence/);
+  });
+});
+
+describe("gcutResolveIds: clip ids back to the clips on the timeline", () => {
+  const resolve = (s: ReturnType<typeof georgScene>, ids: string[]) => (s.host.ctx as any).gcutResolveIds(s.seq, ids);
+
+  it("every id get_sequence gives finds exactly its own clip", () => {
+    const s = georgScene();
+    const ids = getSeq(s).clips.map((c: any) => c.id);
+    const got = resolve(s, ids);
+    expect(got.map((x: any) => [x.kind, x.trackIndex])).toEqual([["video", 0], ["video", 1], ["video", 2], ["video", 3], ["audio", 0]]);
+    got.forEach((x: any, i: number) => expect(x.item).toBe([s.v1, s.v2, s.v3, s.seq.videoTracks[3].items[0], s.a1][i]));
+  });
+
+  it("an id named twice is resolved once", () => {
+    const s = georgScene();
+    expect(resolve(s, [idOf("V1", 100, "node-a"), idOf("V1", 100, "node-a")])).toHaveLength(1);
+  });
+
+  it.each([
+    ["the clip moved", (s: ReturnType<typeof georgScene>) => { s.v2.start = Time.s(101); }],
+    ["another source sits there now", (s: ReturnType<typeof georgScene>) => { s.v2.projectItem = s.a; }],
+    ["the clip is gone", (s: ReturnType<typeof georgScene>) => { s.seq.videoTracks[1].items = []; }],
+  ])("refuses a stale id when %s", (_, change) => {
+    const s = georgScene();
+    const id = getSeq(s).clips[1].id;
+    change(s);
+    expect(() => resolve(s, [id])).toThrow(STALE);
+  });
+
+  it.each(["V9@2540160000000#node-a", "nonsense", "A0@0#node-m"])("refuses an id that names nothing (%s)", (id) => {
+    expect(() => resolve(georgScene(), [id])).toThrow(STALE);
+  });
+
+  it("refuses an empty list", () => {
+    expect(() => resolve(georgScene(), [])).toThrow(/at least one clip/);
   });
 });

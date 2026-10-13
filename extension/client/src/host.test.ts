@@ -2214,3 +2214,102 @@ describe("gcutResolveIds: clip ids back to the clips on the timeline", () => {
     expect(() => resolve(georgScene(), [])).toThrow(/at least one clip/);
   });
 });
+
+describe("gcutToolAddMarkers and its undo", () => {
+  const add = (s: ReturnType<typeof georgScene>, markers: unknown, sequenceId = "seq-1") => s.host.call("gcutToolAddMarkers", { sequenceId, markers });
+  const undo = (s: { host: ReturnType<typeof load> }, record: unknown) => s.host.call("gcutToolUndo", { record });
+  const all = (s: ReturnType<typeof georgScene>) => getSeq(s).markers.map((m: any) => [m.startS, m.endS, m.name, m.comments, m.colour]);
+  const TWO = [{ atS: 105, endS: 107, name: "Pricing", comments: "plans and prices", colour: 3 }, { atS: 101, name: "Intro" }];
+
+  it("adds point and range markers with name, comments and colour, and returns their ids and a pure-data undo record", () => {
+    const s = georgScene();
+    const r = add(s, TWO);
+    expect(r.ok).toBe(true);
+    expect(all(s)).toEqual([[101, 101, "Intro", "", 0], [105, 107, "Pricing", "plans and prices", 3]]);
+    const [pricing, intro] = [s.seq.markers.list[0], s.seq.markers.list[1]];
+    expect(r.created).toEqual([pricing.guid, intro.guid]);
+    expect(r.undo).toEqual({ kind: "markers", sequenceId: "seq-1", markers: [
+      { id: pricing.guid, startS: 105, endS: 107, name: "Pricing", comments: "plans and prices", colour: 3 },
+      { id: intro.guid, startS: 101, endS: 101, name: "Intro", comments: "", colour: 0 }] });
+  });
+
+  it("undo removes exactly the markers it added, from the record alone (after a panel reload), and leaves the others", () => {
+    const s = georgScene();
+    s.seq.markers.createMarker(50).name = "Georg's own";
+    const record = JSON.parse(JSON.stringify(add(s, TWO).undo));
+    const reloaded = { host: load(s.seq) };
+    expect(undo(reloaded, record)).toEqual({ ok: true });
+    expect(all(s)).toEqual([[50, 50, "Georg's own", "", 0]]);
+  });
+
+  it.each([
+    ["a time before the sequence", [{ atS: -1, name: "x" }], /Marker 1/],
+    ["a time past the sequence's end (115 s)", [{ atS: 100, name: "ok" }, { atS: 116, name: "x" }], /Marker 2/],
+    ["a range ending before it starts", [{ atS: 105, endS: 104, name: "x" }], /Marker 1/],
+    ["a range ending past the sequence", [{ atS: 105, endS: 120, name: "x" }], /Marker 1/],
+    ["no name", [{ atS: 105 }], /Marker 1 needs a name/],
+    ["a colour Premiere doesn't have", [{ atS: 105, name: "x", colour: 8 }], /colour/],
+    ["no markers at all", [], /at least one marker/],
+  ])("refuses %s, adding nothing", (_, markers, msg) => {
+    const s = georgScene();
+    expect(() => add(s, markers)).toThrow(msg);
+    expect(s.seq.markers.numMarkers).toBe(0);
+  });
+
+  it("refuses when a different sequence is open, adding nothing", () => {
+    const s = georgScene();
+    expect(() => add(s, TWO, "seq-2")).toThrow(/different sequence/);
+    expect(s.seq.markers.numMarkers).toBe(0);
+  });
+
+  it("a failure part-way removes the markers it already added, then fails", () => {
+    const s = georgScene();
+    s.seq.markers.createMarker(50).name = "Georg's own";
+    const real = s.seq.markers.createMarker.bind(s.seq.markers);
+    let n = 0;
+    s.seq.markers.createMarker = (sec: number) => { if (++n === 2) throw new Error("Premiere refused"); return real(sec); };
+    expect(() => add(s, TWO)).toThrow(/Premiere refused/);
+    expect(all(s)).toEqual([[50, 50, "Georg's own", "", 0]]);
+  });
+
+  it.each([
+    ["renamed", (m: Marker) => { m.name = "Prices"; }],
+    ["moved", (m: Marker) => { m.start = Time.s(106); }],
+    ["given a different range", (m: Marker) => { m.end = 108; }],
+    ["recoloured", (m: Marker) => { m.setColorByIndex(1); }],
+    ["given other comments", (m: Marker) => { m.comments = "edited"; }],
+  ])("undo refuses, deleting nothing, when one was %s by hand", (_, change) => {
+    const s = georgScene();
+    const record = add(s, TWO).undo;
+    change(s.seq.markers.list[0]);
+    const before = all(s);
+    expect(() => undo(s, record)).toThrow(/changed by hand.*Pricing/);
+    expect(all(s)).toEqual(before);
+    expect(s.seq.markers.numMarkers).toBe(2);
+  });
+
+  it("undo refuses, deleting nothing, when only some were deleted by hand", () => {
+    const s = georgScene();
+    const record = add(s, TWO).undo;
+    s.seq.markers.deleteMarker(s.seq.markers.list[1]);
+    expect(() => undo(s, record)).toThrow(/changed by hand.*Intro/);
+    expect(all(s)).toEqual([[105, 107, "Pricing", "plans and prices", 3]]);
+  });
+
+  it("when every one was already deleted by hand, undo says it is already undone", () => {
+    const s = georgScene();
+    const record = add(s, TWO).undo;
+    for (const m of [...s.seq.markers.list]) s.seq.markers.deleteMarker(m);
+    expect(undo(s, record)).toEqual({ ok: true, alreadyUndone: true });
+  });
+
+  it("undo refuses on a different sequence, and a record it doesn't know", () => {
+    const s = georgScene();
+    const record = add(s, TWO).undo;
+    s.seq.sequenceID = "seq-2";
+    expect(() => undo(s, record)).toThrow(/different sequence/);
+    expect(s.seq.markers.numMarkers).toBe(2);
+    expect(() => undo(s, { kind: "teleport", sequenceId: "seq-2" })).toThrow(/can't undo/);
+    expect(() => undo(s, null)).toThrow(/nothing to undo/);
+  });
+});

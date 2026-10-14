@@ -88,10 +88,36 @@ export function undoProblems(turn: Turn, listing: any): string[] {
   return problems;
 }
 
+/** A cut record's span [startT, endT] (the host's own units), or null when it doesn't say. */
+function cutSpan(u: any): [number, number] | null {
+  return Number.isFinite(u?.startT) && Number.isFinite(u?.endT) ? [u.startT, u.endT] : null;
+}
+
+/**
+ * True when a later action of the turn is a cut over this cut's span: that cut re-cut or covered what
+ * this one's undo checks, so the host can only judge it once the later one is undone (undoProblems
+ * checks its clips from the panel meanwhile). A record that doesn't give its span counts as overlapped.
+ */
+function overlappedLater(turn: Turn, i: number): boolean {
+  const u: any = turn.actions[i].undo;
+  if (u?.kind !== "cuts") return false;
+  const mine = cutSpan(u);
+  for (let j = i + 1; j < turn.actions.length; j++) {
+    const v: any = turn.actions[j].undo;
+    if (v?.kind !== "cuts") continue;
+    const theirs = cutSpan(v);
+    if (!mine || !theirs || (theirs[0] < mine[1] && mine[0] < theirs[1])) return true;
+  }
+  return false;
+}
+
 /**
  * Undo one turn (a single act call, or a whole Go), newest action first. The whole turn is checked
- * first (undoProblems): if anything is in the way nothing is undone. A refusal only the host can see
- * stops there; what was undone is dropped from the turn, the rest stays, and the error says so.
+ * before anything is reversed: the panel's own read of the timeline (undoProblems), then the host's
+ * check-only undo of every record, newest first (gcutToolUndo with check: true runs every refusal and
+ * changes nothing); any refusal undoes nothing and is the reply. A cut a later cut of the turn overlaps
+ * can't be host-checked until that one is undone, so a refusal only the host can see there still stops
+ * part-way: what was undone is dropped from the turn, the rest stays, and the error says so.
  * `id`: undo that turn, refused unless it is still the newest on its sequence; none: the newest on
  * the active sequence.
  */
@@ -107,6 +133,9 @@ export async function undoTurn(deps: Pick<ToolDeps, "callHost" | "turns">, seque
   const problems = undoProblems(turn, listing);
   if (problems.length) throw new Error(`Nothing was undone: ${problems.join("; ")}. Use Premiere's Undo instead.`);
   const total = turn.actions.length, summary = turn.summary, done: string[] = [];
+  for (let i = total - 1; i >= 0; i--) {
+    if (!overlappedLater(turn, i)) await deps.callHost("gcutToolUndo", { record: turn.actions[i].undo, check: true });
+  }
   let already = 0;
   for (let i = total - 1; i >= 0; i--) {
     const a = turn.actions[i];

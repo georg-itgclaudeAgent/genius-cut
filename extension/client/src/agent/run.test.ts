@@ -126,7 +126,7 @@ describe("Go: the approved run", () => {
 
     const undone = await w.agent.undo((out as any).undo);
     expect(undone).toBe("Undone: Added 1 marker: Intro; Cut 1 range from 1 clip (1 s removed)");
-    expect(hostCalls(w, "gcutToolUndo").map((a: any) => a.record.kind)).toEqual(["cuts", "markers"]);
+    expect(hostCalls(w, "gcutToolUndo").map((a: any) => [a.record.kind, a.check === true])).toEqual([["cuts", true], ["markers", true], ["cuts", false], ["markers", false]]);
     expect(w.turns.latest("seq-1")).toBeUndefined();
   });
 

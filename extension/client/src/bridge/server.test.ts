@@ -178,7 +178,7 @@ describe("startAssistant: only in a flagged build, live in Premiere", () => {
     const r = await fetch(`http://127.0.0.1:${b.port}/tool`, { method: "POST", headers: { Authorization: `Bearer ${token}` },
       body: JSON.stringify({ name: "undo_last_turn", args: {}, client: "terminal" }) });
     expect(await r.json()).toEqual({ ok: true, result: { ok: true, undone: "Added 1 marker: Intro" } });
-    expect(host.find(([fn]) => fn === "gcutToolUndo")![1]).toEqual({ record });
+    expect(host.filter(([fn]) => fn === "gcutToolUndo").map(([, a]) => a)).toEqual([{ record, check: true }, { record }]);
     expect(JSON.parse(readFileSync(join(x.dir, "turns.json"), "utf8"))["seq-1"]).toEqual([]);
   });
 

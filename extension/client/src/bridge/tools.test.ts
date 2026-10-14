@@ -134,7 +134,8 @@ describe("the bridge's tool table", () => {
 
   describe("grouped undo (one Go = one turn)", () => {
     const MARGS = { sequenceId: "seq-1", markers: [{ atS: 101, name: "Intro" }] };
-    const undoCalls = (f: ReturnType<typeof fakes>) => f.host.filter(([fn]) => fn === "gcutToolUndo").map(([, a]: any) => a.record.kind);
+    const undoCalls = (f: ReturnType<typeof fakes>) => f.host.filter(([fn, a]: any) => fn === "gcutToolUndo" && !a.check).map(([, a]: any) => a.record.kind);
+    const checkCalls = (f: ReturnType<typeof fakes>) => f.host.filter(([fn, a]: any) => fn === "gcutToolUndo" && a.check).map(([, a]: any) => a.record);
     const MARKER = { id: "g1", startS: 101, endS: 101, name: "Intro", comments: "", colour: 0 };
     const markerUndo = { kind: "markers", sequenceId: "seq-1", markers: [MARKER] };
     function grouped(f: ReturnType<typeof fakes>) {
@@ -181,7 +182,7 @@ describe("the bridge's tool table", () => {
       const clip = (cid: string) => ({ ...LISTING.clips[0], id: cid });
       f.setListing({ ...LISTING, clips: [clip(P1), clip(P3)] });
       expect(await tools.undo_last_turn.run({})).toMatchObject({ ok: true });
-      expect(f.host.filter(([fn]) => fn === "gcutToolUndo")).toHaveLength(2);
+      expect(undoCalls(f)).toHaveLength(2);
 
       // Again, with P1 moved by hand since: refused, nothing undone.
       f.host.length = 0;
@@ -191,7 +192,52 @@ describe("the bridge's tool table", () => {
       f.turns.end();
       f.setListing({ ...LISTING, clips: [clip(P2)] });
       await expect(tools.undo_last_turn.run({})).rejects.toThrow(/^Nothing was undone: Cut 1 range from 1 clip \(1 s removed\): its clips were moved, trimmed or removed since/);
-      expect(f.host.filter(([fn]) => fn === "gcutToolUndo")).toEqual([]);
+      expect(undoCalls(f)).toEqual([]);
+    });
+
+    it("asks the host to check every record of the group, newest first, before reversing anything", async () => {
+      const f = fakes(), t = grouped(f);
+      f.setListing({ ...LISTING, markers: [MARKER] });
+      f.turns.begin();
+      await t.add_markers.run(MARGS);
+      await t.cut_ranges.run({ sequenceId: "seq-1", clipIds: [V1], ranges: [{ fromS: 102, toS: 103 }] });
+      f.turns.end();
+      await t.undo_last_turn.run({});
+      const undos = f.host.filter(([fn]) => fn === "gcutToolUndo").map(([, a]: any) => [a.record.kind, a.check === true]);
+      expect(undos).toEqual([["cuts", true], ["markers", true], ["cuts", false], ["markers", false]]);
+    });
+
+    it("all or nothing: a host refusal on the oldest record leaves the newest untouched", async () => {
+      const f = fakes(), t = grouped(f);
+      f.setListing({ ...LISTING, markers: [MARKER] });
+      f.turns.begin();
+      await t.add_markers.run(MARGS);
+      await t.cut_ranges.run({ sequenceId: "seq-1", clipIds: [V1], ranges: [{ fromS: 102, toS: 103 }] });
+      f.turns.end();
+      const refusal = "These markers were changed by hand since: Intro was changed. Nothing was undone.";
+      f.onUndo(() => { const last: any = f.host[f.host.length - 1][1]; if (last.record.kind === "markers") throw new Error(refusal); return last.check ? { ok: true, wouldUndo: true } : { ok: true }; });
+      await expect(t.undo_last_turn.run({})).rejects.toThrow(refusal);
+      expect(checkCalls(f).map((r: any) => r.kind)).toEqual(["cuts", "markers"]);
+      expect(undoCalls(f)).toEqual([]);
+      expect(f.turns.latest("seq-1")!.actions).toHaveLength(2);
+    });
+
+    it("doesn't host-check a cut whose span a later cut of the group overlaps (that cut changed what it checks); undoes it after", async () => {
+      const f = fakes();
+      const tools = createTools(f.deps);
+      const cut = (startT: number, endT: number) => ({ ok: true, cutCount: 1, clipCount: 1, removedS: 1, crossfades: 0,
+        undo: { kind: "cuts", sequenceId: "seq-1", startT, endT } });
+      f.turns.begin();
+      f.setCut(cut(100, 200));
+      await tools.cut_ranges.run({ sequenceId: "seq-1", clipIds: [V1], ranges: [{ fromS: 102, toS: 103 }] });
+      f.setCut(cut(150, 180)); // inside the first cut's span
+      await tools.cut_ranges.run({ sequenceId: "seq-1", clipIds: [V1], ranges: [{ fromS: 105, toS: 106 }] });
+      f.setCut(cut(300, 400)); // clear of both
+      await tools.cut_ranges.run({ sequenceId: "seq-1", clipIds: [V1], ranges: [{ fromS: 305, toS: 306 }] });
+      f.turns.end();
+      expect(await tools.undo_last_turn.run({})).toMatchObject({ ok: true });
+      expect(checkCalls(f).map((r: any) => r.startT)).toEqual([300, 150]);
+      expect(f.host.filter(([fn, a]: any) => fn === "gcutToolUndo" && !a.check).map(([, a]: any) => a.record.startT)).toEqual([300, 150, 100]);
     });
 
     it("a refusal the pre-check couldn't see stops the undo: what was undone is dropped, the rest stays, and the reply says so", async () => {
@@ -201,7 +247,7 @@ describe("the bridge's tool table", () => {
       await t.add_markers.run(MARGS);
       await t.cut_ranges.run({ sequenceId: "seq-1", clipIds: [V1], ranges: [{ fromS: 102, toS: 103 }] });
       f.turns.end();
-      f.onUndo(() => { if (undoCalls(f).length === 2) throw new Error("These markers were changed by hand since: Intro was changed. Nothing was undone."); return { ok: true }; });
+      f.onUndo(() => { if (undoCalls(f).length === 2 && !(f.host[f.host.length - 1][1] as any).check) throw new Error("These markers were changed by hand since: Intro was changed. Nothing was undone."); return { ok: true }; });
       await expect(t.undo_last_turn.run({})).rejects.toThrow(
         "Undid 1 of 2 changes (Cut 1 range from 2 clips (1 s removed)); then stopped: These markers were changed by hand since: Intro was changed. Nothing was undone.");
       expect(f.turns.latest("seq-1")!.summary).toBe("Added 1 marker: Intro");
@@ -222,7 +268,7 @@ describe("the bridge's tool table", () => {
   describe("undo_last_turn", () => {
     const MARGS = { sequenceId: "seq-1", markers: [{ atS: 101, name: "Intro" }, { atS: 105, name: "Pricing" }] };
     const CARGS = { sequenceId: "seq-1", clipIds: [V1, A1], ranges: [{ fromS: 102, toS: 103 }] };
-    const undoCalls = (f: ReturnType<typeof fakes>) => f.host.filter(([fn]) => fn === "gcutToolUndo").map(([, a]) => a);
+    const undoCalls = (f: ReturnType<typeof fakes>) => f.host.filter(([fn, a]: any) => fn === "gcutToolUndo" && !a.check).map(([, a]) => a);
 
     it("each successful act call is a turn: undo reverses the newest first, then the one before, with the host's own records", async () => {
       const f = fakes(), t = createTools(f.deps);

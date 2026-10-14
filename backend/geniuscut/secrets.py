@@ -1,15 +1,19 @@
 """API keys, kept out of the repo and off disk.
 
 Mirrors the agent-georg umbrella's `lib/gcp_secrets.py` pattern, which this standalone
-repo cannot import: an env var if set, else GCP Secret Manager (project `agent-georg`)
-through the gcloud CLI.
-- Anthropic: `ANTHROPIC_API_KEY`, else secret `ANTHROPIC_API_KEY`.
-- Gemini: `GENIUSCUT_GEMINI_API_KEY`, else secret `GOOGLE_API_KEY` (key "gemini-hook-app").
+repo cannot import: an env var if set, else GCP Secret Manager through the gcloud CLI.
+- Anthropic: `ANTHROPIC_API_KEY`, else the secret named in this editor's settings
+  (`settings.json` `anthropic_key`: their OWN Google Cloud project, secret and version).
+  No project configured means setup isn't finished.
+- Gemini: `GENIUSCUT_GEMINI_API_KEY`, else secret `GOOGLE_API_KEY` in project `agent-georg`
+  (key "gemini-hook-app").
 
-The Gemini key read from Secret Manager is also cached on this PC, encrypted for the Windows
-user with DPAPI (`<data dir>/gemini_key.dpapi`), and used when gcloud can't sign in: the laptop's
-gcloud login expires every day or two (Checkpoint B, 2026-10-08). Secret Manager stays the
-source of truth: whenever it answers, its value replaces the cache.
+A key read from Secret Manager is also cached on this PC, encrypted for the Windows user with
+DPAPI (`<data dir>/gemini_key.dpapi`, `anthropic_key.dpapi`), and used when gcloud can't sign
+in: the laptop's gcloud login expires every day or two (Checkpoint B, 2026-10-08). The
+Anthropic cache is tied to the project/secret/version it came from, so changing the setting
+never reuses an old key. Secret Manager stays the source of truth: whenever it answers, its
+value replaces the cache.
 """
 
 import ctypes
@@ -18,10 +22,10 @@ import shutil
 import subprocess
 from typing import Callable
 
-from geniuscut import config
+from geniuscut import config, settings
 
 GSM_PROJECT = "agent-georg"
-GSM_SECRET = "ANTHROPIC_API_KEY"
+ANTHROPIC_ENV = "ANTHROPIC_API_KEY"
 GEMINI_ENV = "GENIUSCUT_GEMINI_API_KEY"
 GEMINI_GSM_SECRET = "GOOGLE_API_KEY"
 
@@ -60,40 +64,51 @@ def _cache_path(name: str):
     return config.data_dir() / f"{name}.dpapi"
 
 
-def _save_cached(name: str, key: str) -> None:
+def _save_cached(name: str, key: str, tag: str = "") -> None:
+    """`tag` names where the key came from; a later load with another tag ignores it."""
     try:
         path = _cache_path(name)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(protect(key.encode("utf-8")))
+        path.write_bytes(protect((f"{tag}\0{key}" if tag else key).encode("utf-8")))
     except Exception:  # noqa: BLE001 — the cache is a convenience; Secret Manager still works
         pass
 
 
-def _load_cached(name: str) -> str | None:
+def _load_cached(name: str, tag: str = "") -> str | None:
     try:
-        return unprotect(_cache_path(name).read_bytes()).decode("utf-8").strip() or None
+        text = unprotect(_cache_path(name).read_bytes()).decode("utf-8")
     except Exception:  # noqa: BLE001 — missing, corrupt or another user's: not usable
         return None
+    if tag:
+        stored, sep, text = text.partition("\0")
+        if not sep or stored != tag:
+            return None
+    return text.strip() or None
+
+
+def _gsm(secret: str, project: str, version: str, run: Callable, gcloud: str | None) -> tuple[str | None, str]:
+    """(key, None-or-why-not) from Secret Manager; the key never goes into the reason."""
+    gcloud = gcloud or shutil.which("gcloud") or shutil.which("gcloud.cmd")
+    if not gcloud:
+        return None, "gcloud is not installed"
+    result = run(
+        [gcloud, "secrets", "versions", "access", version, f"--secret={secret}", f"--project={project}"],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        return result.stdout.strip(), ""
+    return None, (result.stderr or "no output").strip()
 
 
 def _key(env: str, secret: str, label: str, run: Callable, gcloud: str | None, cache: str | None = None) -> str:
     key = os.environ.get(env, "").strip()
     if key:
         return key
-    gcloud = gcloud or shutil.which("gcloud") or shutil.which("gcloud.cmd")
-    detail = "gcloud is not installed"
-    if gcloud:
-        result = run(
-            [gcloud, "secrets", "versions", "access", "latest",
-             f"--secret={secret}", f"--project={GSM_PROJECT}"],
-            capture_output=True, text=True,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            key = result.stdout.strip()
-            if cache:
-                _save_cached(cache, key)
-            return key
-        detail = (result.stderr or "no output").strip()
+    key, detail = _gsm(secret, GSM_PROJECT, "latest", run, gcloud)
+    if key:
+        if cache:
+            _save_cached(cache, key)
+        return key
     cached = _load_cached(cache) if cache else None
     if cached:
         return cached
@@ -104,8 +119,34 @@ def _key(env: str, secret: str, label: str, run: Callable, gcloud: str | None, c
     )
 
 
-def anthropic_api_key(run: Callable = subprocess.run, gcloud: str | None = None) -> str:
-    return _key("ANTHROPIC_API_KEY", GSM_SECRET, "Anthropic", run, gcloud)
+def anthropic_api_key(run: Callable = subprocess.run, gcloud: str | None = None,
+                      source: "settings.KeySource | None" = None, *, fresh_only: bool = False) -> str:
+    """The Anthropic key: env, else the editor's own Secret Manager (from settings, or `source`),
+    else the cached copy of that same secret. `fresh_only` skips env and cache (the setup test)."""
+    if not fresh_only:
+        key = os.environ.get(ANTHROPIC_ENV, "").strip()
+        if key:
+            return key
+    src = source or settings.load().anthropic_key
+    project = src.project.strip()
+    if not project:
+        raise MissingKeyError(
+            "No Anthropic API key is set up. Finish Genius Cut setup: enter the Google Cloud project "
+            "whose Secret Manager holds your Anthropic API key."
+        )
+    tag = f"{project}/{src.secret}/{src.version}"
+    key, detail = _gsm(src.secret, project, src.version, run, gcloud)
+    if key:
+        _save_cached("anthropic_key", key, tag)
+        return key
+    cached = None if fresh_only else _load_cached("anthropic_key", tag)
+    if cached:
+        return cached
+    raise MissingKeyError(
+        f"Couldn't read the Anthropic API key (secret {src.secret}, version {src.version}) from "
+        f"project {project}. Sign in with `gcloud auth login` as an account that can read it, "
+        f"or check the project in Genius Cut setup. ({detail})"
+    )
 
 
 def gemini_api_key(run: Callable = subprocess.run, gcloud: str | None = None) -> str:

@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from geniuscut import claude, cuts, secrets
+from geniuscut import claude, cuts, secrets, settings
 from geniuscut.library import FewShot
 from geniuscut.models import Word
 
@@ -118,6 +118,7 @@ def test_key_comes_from_the_environment_first(monkeypatch):
 
 def test_key_falls_back_to_secret_manager(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    settings.save(settings.Settings(anthropic_key={"project": "editor-proj"}))
     calls = []
 
     def run(cmd, **kwargs):
@@ -125,11 +126,12 @@ def test_key_falls_back_to_secret_manager(monkeypatch):
         return subprocess.CompletedProcess(cmd, 0, stdout="sk-gsm\n", stderr="")
 
     assert secrets.anthropic_api_key(run=run, gcloud="gcloud") == "sk-gsm"
-    assert "--project=agent-georg" in calls[0] and "--secret=ANTHROPIC_API_KEY" in calls[0]
+    assert "--project=editor-proj" in calls[0] and "--secret=ANTHROPIC_API_KEY" in calls[0]
 
 
 def test_missing_key_says_how_to_fix_it(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    settings.save(settings.Settings(anthropic_key={"project": "editor-proj"}))
 
     def run(cmd, **kwargs):
         return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="PERMISSION_DENIED")

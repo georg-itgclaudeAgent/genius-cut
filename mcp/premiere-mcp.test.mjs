@@ -120,6 +120,9 @@ test("tools/list offers exactly the Phase 1 tools with schemas written for Claud
   assert.match(byName.get_sequence.description, /seconds/);
   assert.match(byName.cut_ranges.description, /get_sequence/);
   assert.match(byName.cut_ranges.description, /undo_last_turn/);
+  // It doesn't ripple: the chosen clips close up among themselves, and a gap is left after them.
+  assert.match(byName.cut_ranges.description, /leaves a gap of removedS at the end of the chosen clips; later clips don't move\./);
+  assert.doesNotMatch(byName.cut_ranges.description, /ripple|close the gaps/i);
   assert.equal(byName.get_sequence.annotations.readOnlyHint, true);
   assert.equal(byName.cut_ranges.annotations.readOnlyHint, false);
 }));

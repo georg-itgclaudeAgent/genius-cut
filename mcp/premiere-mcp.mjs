@@ -127,8 +127,9 @@ const TOOLS = [
   {
     name: "cut_ranges",
     description:
-      "Cut stretches of time out of chosen clips and close the gaps (ripple), using Genius Cut's Apply engine: " +
-      "every chosen track is cut in sync, the result is verified, and it is all or nothing. clipIds are ids from " +
+      "Cut stretches of time out of chosen clips, using Genius Cut's Apply engine: every chosen track is cut in sync, " +
+      "the kept pieces close up among themselves, the result is verified, and it is all or nothing. It " +
+      "leaves a gap of removedS at the end of the chosen clips; later clips don't move. clipIds are ids from " +
       "get_sequence (include the linked audio clips you want cut too; unchosen clips that would be overwritten make " +
       "the call refuse). ranges are [{fromS, toS}] in seconds on the sequence timeline, clipped to the chosen clips' " +
       "span. Cutting rebuilds the chosen clips from their source: effects on them (get_sequence lists them) are removed, " +

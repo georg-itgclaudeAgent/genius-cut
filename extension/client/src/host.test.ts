@@ -3195,3 +3195,223 @@ describe("gcutToolDeleteClips: remove chosen clips (no ripple), and its undo", (
     });
   });
 });
+
+describe("gcutToolMoveClips: move chosen clips along their tracks, and its undo", () => {
+  const move = (s: any, clipIds: string[], byS: unknown) => act(s, "gcutToolMoveClips", { clipIds, byS });
+
+  it("moves each chosen clip by byS (to the frame) with trackItem.move; a linked partner that isn't chosen stays (measured)", () => {
+    const s = scene();
+    const r = move(s, idsOn(s, "V1"), 2.01);
+    expect(r).toMatchObject({ ok: true, movedCount: 1 });
+    expect(layout(s.seq.videoTracks[0])).toEqual([[102, 112]]);
+    expect(layout(s.seq.audioTracks[0])).toEqual([[100, 110]]);
+    expect(span(s.seq.videoTracks[0])[0][2]).toBe(10); // moved, not re-laid
+    expect(r.idMap).toEqual({ [idOf("V1", 100, "node-1")]: [idOf("V1", 102, "node-1")] });
+  });
+
+  it("a linked pair given together moves together; undo moves both back exactly, from the stored record", () => {
+    const s = scene(), original = exact(s.seq);
+    const r = move(s, idsOn(s, "V1", "A1"), -3);
+    expect(layout(s.seq.videoTracks[0])).toEqual([[97, 107]]);
+    expect(layout(s.seq.audioTracks[0])).toEqual([[97, 107]]);
+    expect(Object.keys(r.idMap)).toHaveLength(2);
+    expect(asStored(r.undo)).toEqual(r.undo);
+    expect(r.undo).toMatchObject({ kind: "moves", sequenceId: "seq-1" });
+    expect(undoTool({ host: load(s.seq) }, asStored(r.undo))).toEqual({ ok: true });
+    expect(exact(s.seq)).toEqual(original);
+  });
+
+  it("a partner Premiere moves along although it wasn't chosen puts everything back, and says so", () => {
+    const s = scene(), original = exact(s.seq);
+    s.seq.moveLinked = true;
+    expect(() => move(s, idsOn(s, "V1"), 2)).toThrow("A clip on A1 didn't move as expected, so every clip was put back. Nothing was changed.");
+    expect(exact(s.seq)).toEqual(original);
+  });
+
+  it.each([
+    ["landing on another clip", (s: any) => { s.seq.videoTracks[0].add(new ProjectItem("Logo", "node-o", 30, "seconds", false), 111, 0, 1); }, 2,
+      "Moving the clips by 2 s would land interview_take3.mp4 on Logo on V1. Nothing was moved."],
+    ["a move before the sequence's start", (_: any) => {}, -101, "Moving V1's clip by -101 s would put it before the sequence's start. Nothing was moved."],
+    ["a move of less than a frame", (_: any) => {}, 0.01, "byS rounds to less than a frame, so nothing would move."],
+    ["no byS", (_: any) => {}, undefined, "byS must be a time in seconds (negative moves left)."],
+    ["a locked track", (s: any) => { s.seq.videoTracks[0].locked = true; }, 2, "V1 is locked. Unlock it to move clips."],
+  ])("refuses %s, changing nothing", (_, change, byS, msg) => {
+    const s = scene(), ids = idsOn(s, "V1");
+    change(s);
+    const before = exact(s.seq);
+    expect(() => move(s, ids, byS)).toThrow(msg);
+    expect(exact(s.seq)).toEqual(before);
+  });
+
+  it("chosen clips may move into each other's old places on the same track", () => {
+    const s = gapScene(), original = exact(s.seq);
+    const r = move(s, idsOn(s, "V1"), -3);
+    expect(layout(s.seq.videoTracks[0])).toEqual([[97, 102], [105, 109], [112, 115]]);
+    expect(undoTool(s, asStored(r.undo))).toEqual({ ok: true });
+    expect(exact(s.seq)).toEqual(original);
+  });
+
+  describe("undo", () => {
+    function moved() {
+      const s = scene(), original = exact(s.seq);
+      const record = asStored(move(s, idsOn(s, "V1", "A1"), 2).undo);
+      return { s, original, record };
+    }
+    it("refuses, changing nothing, when a moved clip was moved again by hand", () => {
+      const { s, record } = moved();
+      s.v.move(Time.s(1));
+      const now = exact(s.seq);
+      expect(() => undoTool(s, record)).toThrow("Some of the moved clips were moved, trimmed or removed by hand since (1 of 2 are where the move left them). Nothing was undone; use Premiere's Undo instead.");
+      expect(exact(s.seq)).toEqual(now);
+    });
+    it("refuses, changing nothing, when something was placed where a clip would move back to", () => {
+      const { s, record } = moved();
+      s.seq.audioTracks[0].add(wav("sfx.wav", "node-x", 30), 100, 0, 1);
+      const now = exact(s.seq);
+      expect(() => undoTool(s, record)).toThrow("Moving the clips back would land interview_take3.mp4 on sfx.wav on A1. Nothing was undone; use Premiere's Undo instead.");
+      expect(exact(s.seq)).toEqual(now);
+    });
+    it("when both are back (Premiere's Undo), says it is already undone", () => {
+      const { s, record, original } = moved();
+      s.v.move(Time.s(-2)); s.a.move(Time.s(-2));
+      expect(undoTool(s, record)).toEqual({ ok: true, alreadyUndone: true });
+      expect(exact(s.seq)).toEqual(original);
+    });
+    it.each([
+      ["untouched", (_: any) => {}],
+      ["one moved again", ({ s }: any) => { s.v.move(Time.s(1)); }],
+      ["something in the way", ({ s }: any) => { s.seq.audioTracks[0].add(wav("sfx.wav", "node-x", 30), 100, 0, 1); }],
+      ["both back", ({ s }: any) => { s.v.move(Time.s(-2)); s.a.move(Time.s(-2)); }],
+    ])("check: true matches the real undo (%s)", (name, change) => {
+      const c = moved();
+      change(c);
+      checkMatchesUndo(c.s, c.record, name === "untouched", c.original);
+    });
+  });
+});
+
+describe("gcutToolSwitchAngle: show one angle for a stretch by switching the others' pieces off, and its undo", () => {
+  const sw = (s: any, clipIds: string[], fromS: unknown, toS: unknown, showTrack: unknown) =>
+    act(s, "gcutToolSwitchAngle", { clipIds, fromS, toS, showTrack });
+  const offs = (t: Track) => t.clips.map((i: TrackItem) => i.disabled);
+  const angles = () => multiScene({ music: false });
+
+  it("splits each chosen angle at fromS and toS (razor, per track) and switches every piece in the stretch off but showTrack's", () => {
+    const s = angles();
+    const r = sw(s, idsOn(s, "V1", "V2", "V3"), 103, 106, 2);
+    expect(r).toMatchObject({ ok: true, shown: "V2", hidden: ["V1", "V3"], splitCount: 6 });
+    for (const t of [0, 1, 2]) expect(layout(s.seq.videoTracks[t])).toEqual([[100, 103], [103, 106], [106, 110]]);
+    expect(offs(s.seq.videoTracks[0])).toEqual([false, true, false]);
+    expect(offs(s.seq.videoTracks[1])).toEqual([false, false, false]);
+    expect(offs(s.seq.videoTracks[2])).toEqual([false, true, false]);
+    expect(layout(s.seq.audioTracks[0])).toEqual([[100, 110]]); // the wide camera's own sound isn't split
+    expect(span(s.seq.videoTracks[1]).map((p: number[]) => p[2])).toEqual([12, 15, 18]);
+    expect(r.idMap).toEqual({
+      [idOf("V1", 100, "node-w")]: [idOf("V1", 100, "node-w"), idOf("V1", 103, "node-w"), idOf("V1", 106, "node-w")],
+      [idOf("V2", 100, "node-c")]: [idOf("V2", 100, "node-c"), idOf("V2", 103, "node-c"), idOf("V2", 106, "node-c")],
+      [idOf("V3", 100, "node-s")]: [idOf("V3", 100, "node-s"), idOf("V3", 103, "node-s"), idOf("V3", 106, "node-s")],
+    });
+  });
+
+  it("undo puts every angle back whole, on as it was, from the stored record", () => {
+    const s = angles(), original = exact(s.seq);
+    const r = sw(s, idsOn(s, "V1", "V2", "V3"), 103, 106, 2);
+    expect(asStored(r.undo)).toEqual(r.undo);
+    expect(r.undo).toMatchObject({ kind: "angle", sequenceId: "seq-1" });
+    expect(undoTool({ host: load(s.seq) }, asStored(r.undo))).toEqual({ ok: true });
+    expect(exact(s.seq)).toEqual(original);
+  });
+
+  it("a stretch reaching a clip's edge splits only where it must; an angle that was off is switched on, and undo switches it off again", () => {
+    const s = angles();
+    s.v3.disabled = true;
+    const original = exact(s.seq);
+    const r = sw(s, idsOn(s, "V1", "V3"), 100, 104, 3);
+    expect(r).toMatchObject({ ok: true, shown: "V3", hidden: ["V1"], splitCount: 2 });
+    expect(layout(s.seq.videoTracks[0])).toEqual([[100, 104], [104, 110]]);
+    expect(offs(s.seq.videoTracks[0])).toEqual([true, false]);
+    expect(offs(s.seq.videoTracks[2])).toEqual([false, true]);
+    expect(layout(s.seq.videoTracks[1])).toEqual([[100, 110]]);
+    expect(r.idMap[idOf("V2", 100, "node-c")]).toBeUndefined();
+    expect(undoTool(s, asStored(r.undo))).toEqual({ ok: true });
+    expect(exact(s.seq)).toEqual(original);
+  });
+
+  it("a chosen clip outside the stretch is left as it is", () => {
+    const s = angles();
+    const later = s.seq.videoTracks[0].add(s.wide, 120, 40, 45);
+    const r = sw(s, idsOn(s, "V1", "V2"), 103, 106, 2);
+    expect(r).toMatchObject({ ok: true, splitCount: 4 });
+    expect(later.disabled).toBe(false);
+    expect(layout(s.seq.videoTracks[0]).at(-1)).toEqual([120, 125]);
+  });
+
+  it.each([
+    ["an audio clip", (s: any) => idsOn(s, "V1", "A1"), 103, 106, 1, "A1's clip is audio: switch_angle works on the chosen video clips. Nothing was changed."],
+    ["a show track with no chosen clip over the whole stretch", (s: any) => idsOn(s, "V1", "V2"), 103, 112, 2,
+      "None of the chosen clips on V2 covers 103–112 s, so V2 can't be shown there. Nothing was changed."],
+    ["a show track that isn't chosen", (s: any) => idsOn(s, "V1", "V2"), 103, 106, 3,
+      "None of the chosen clips on V3 covers 103–106 s, so V3 can't be shown there. Nothing was changed."],
+    ["a stretch that ends before it starts", (s: any) => idsOn(s, "V1", "V2"), 106, 103, 2, "toS must be after fromS (at least a frame)."],
+    ["no times", (s: any) => idsOn(s, "V1", "V2"), undefined, 106, 2, "fromS and toS must be times in seconds on the sequence."],
+    ["a show track that isn't a track number", (s: any) => idsOn(s, "V1", "V2"), 103, 106, "V2", "showTrack must be a video track number (1 for V1)."],
+  ])("refuses %s, changing nothing", (_, ids, fromS, toS, show, msg) => {
+    const s = angles(), before = exact(s.seq);
+    expect(() => sw(s, ids(s), fromS, toS, show)).toThrow(msg);
+    expect(exact(s.seq)).toEqual(before);
+    expect(s.host.qe.razors).toEqual([]);
+  });
+
+  it("refuses a locked track, changing nothing", () => {
+    const s = angles(), before = exact(s.seq);
+    s.seq.videoTracks[2].locked = true;
+    expect(() => sw(s, idsOn(s, "V1", "V2", "V3"), 103, 106, 2)).toThrow("V3 is locked. Unlock it to switch angles.");
+    expect(exact(s.seq)).toEqual(before);
+  });
+
+  it("when Premiere doesn't split a clip, joins back what it split and fails, changing nothing", () => {
+    const s = angles(), original = exact(s.seq);
+    const qe = s.host.qe as any, real = qe.razor.bind(qe);
+    qe.razor = (t: Track, tc: string) => (t.index === 2 ? true : real(t, tc));
+    expect(() => sw(s, idsOn(s, "V1", "V2", "V3"), 103, 106, 2)).toThrow("Premiere didn't split V3's clip at 1:43.0. Nothing was changed.");
+    expect(exact(s.seq)).toEqual(original);
+  });
+
+  describe("undo", () => {
+    function switched() {
+      const s = angles(), original = exact(s.seq);
+      const record = asStored(sw(s, idsOn(s, "V1", "V2", "V3"), 103, 106, 2).undo);
+      return { s, original, record };
+    }
+    it("refuses, changing nothing, when a switched-off piece was switched on by hand", () => {
+      const { s, record } = switched();
+      s.seq.videoTracks[2].clips[1].disabled = false;
+      const now = exact(s.seq);
+      expect(() => undoTool(s, record)).toThrow("V3's piece was switched on by hand since. Nothing was undone; use Premiere's Undo instead.");
+      expect(exact(s.seq)).toEqual(now);
+    });
+    it("refuses, changing nothing, when a piece was trimmed since", () => {
+      const { s, record } = switched();
+      s.seq.videoTracks[1].clips[2].setEnd(Math.round(109 * TICKS));
+      const now = exact(s.seq);
+      expect(() => undoTool(s, record)).toThrow("V2's pieces were moved, trimmed, removed or slip-edited since. Nothing was undone; use Premiere's Undo instead.");
+      expect(exact(s.seq)).toEqual(now);
+    });
+    it("a second undo says already undone", () => {
+      const { s, record, original } = switched();
+      expect(undoTool(s, record)).toEqual({ ok: true });
+      expect(undoTool(s, record)).toEqual({ ok: true, alreadyUndone: true });
+      expect(exact(s.seq)).toEqual(original);
+    });
+    it.each([
+      ["untouched", (_: any) => {}],
+      ["a piece switched on", ({ s }: any) => { s.seq.videoTracks[2].clips[1].disabled = false; }],
+      ["a piece trimmed", ({ s }: any) => { s.seq.videoTracks[1].clips[2].setEnd(Math.round(109 * TICKS)); }],
+      ["already undone", ({ s, record }: any) => { undoTool(s, record); }],
+    ])("check: true matches the real undo (%s)", (name, change) => {
+      const c = switched();
+      change(c);
+      checkMatchesUndo(c.s, c.record, name === "untouched", c.original);
+    });
+  });
+});

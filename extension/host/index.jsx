@@ -2398,6 +2398,129 @@ function gcutUndoDelete(seq, record, clock, check) {
     }
 }
 
+// ── move_clips ────────────────────────────────────────────────────────────────────────
+
+/**
+ * args: { sequenceId, clipIds, byS } — move each chosen clip along its own track by byS seconds (to the
+ * nearest frame; negative moves left) with trackItem.move. A linked partner that isn't chosen stays where it
+ * is (measured); one Premiere moves along anyway puts everything back. Refuses, moving nothing: a move of
+ * less than a frame, one before the sequence's start, a locked track, and landing on any clip that isn't
+ * moving with it. Returns { ok, movedCount, idMap (every moved clip), undo: { kind: "moves", sequenceId, moves } }.
+ */
+function gcutToolMoveClips(argsJson) {
+    try {
+        var args = gcutParse(argsJson) || {}, k;
+        var seq = gcutSequence(), clock = gcutClock(seq);
+        gcutSameSequence(seq, args.sequenceId);
+        if (!gcutIsTime(args.byS)) throw new Error("byS must be a time in seconds (negative moves left).");
+        var byT = gcutFrameT(args.byS, clock);
+        if (!byT) throw new Error("byS rounds to less than a frame, so nothing would move.");
+        var chosen = gcutResolveIds(seq, args.clipIds), movers = [];
+        gcutRefuseLocked(seq, chosen, "move clips");
+        for (k = 0; k < chosen.length; k++) {
+            var m = gcutMover(chosen[k].kind, chosen[k].trackIndex, chosen[k].item, gcutT(chosen[k].item.start) + byT);
+            if (m.target < 0) {
+                throw new Error("Moving " + m.label + "'s clip by " + gcutSecText(args.byS) + " s would put it before the sequence's start. Nothing was moved.");
+            }
+            movers.push(m);
+        }
+        var hit = gcutMoveCollision(seq, movers, clock);
+        if (hit) {
+            throw new Error("Moving the clips by " + gcutSecText(byT / GCUT_TICKS) + " s would land " + hit.mover.name + " on " + hit.hit.name +
+                " on " + hit.mover.label + ". Nothing was moved.");
+        }
+        gcutRunMoves(seq, clock, movers, "Nothing was changed.");
+        return gcutOk({ ok: true, movedCount: movers.length, idMap: gcutMoveIdMap(seq, movers),
+                        undo: { kind: "moves", sequenceId: gcutSeqId(seq), moves: gcutMoveRecord(movers) } });
+    } catch (e) {
+        return gcutFail(e);
+    }
+}
+
+// ── switch_angle ──────────────────────────────────────────────────────────────────────
+
+/**
+ * args: { sequenceId, clipIds (the chosen video clips: the angles), fromS, toS, showTrack (1-based video
+ * track) } — for the stretch fromS–toS (to the nearest frames), show showTrack's angle: every chosen clip
+ * overlapping the stretch is split at fromS and toS where they fall inside it (QE razor, per track), then its
+ * piece inside the stretch is switched off (TrackItem.disabled), except showTrack's, which is switched on.
+ * Chosen clips outside the stretch are left as they are; audio isn't touched. Refuses, changing nothing: an
+ * audio clip, a showTrack with no chosen clip covering the whole stretch, a locked track. Returns { ok,
+ * shown: "V<n>", hidden: [track labels], splitCount, idMap (every split clip: [its pieces' ids, in order]),
+ * undo: { kind: "angle", sequenceId, clips (as split_at's), states: [{kind, trackIndex, label, node, startT,
+ * endT, before, after}] } }.
+ */
+function gcutToolSwitchAngle(argsJson) {
+    try {
+        var args = gcutParse(argsJson) || {}, k;
+        var seq = gcutSequence(), clock = gcutClock(seq);
+        gcutSameSequence(seq, args.sequenceId);
+        if (!gcutIsTime(args.fromS) || !gcutIsTime(args.toS)) throw new Error("fromS and toS must be times in seconds on the sequence.");
+        var fromT = gcutFrameT(args.fromS, clock), toT = gcutFrameT(args.toS, clock);
+        if (toT <= fromT) throw new Error("toS must be after fromS (at least a frame).");
+        var n = args.showTrack;
+        if (typeof n !== "number" || n < 1 || Math.floor(n) !== n) throw new Error("showTrack must be a video track number (1 for V1).");
+        var chosen = gcutResolveIds(seq, args.clipIds), inRange = [], show = null;
+        for (k = 0; k < chosen.length; k++) {
+            if (chosen[k].kind !== "video") {
+                throw new Error(gcutLabel(chosen[k].kind, chosen[k].trackIndex) + "'s clip is audio: switch_angle works on the chosen video clips. Nothing was changed.");
+            }
+        }
+        for (k = 0; k < chosen.length; k++) {
+            var s = gcutT(chosen[k].item.start), e = gcutT(chosen[k].item.end);
+            if (!gcutOverlaps(s, e, fromT, toT, clock)) continue;
+            inRange.push(chosen[k]);
+            if (chosen[k].trackIndex === n - 1 && s <= fromT + clock.half && e >= toT - clock.half) show = chosen[k];
+        }
+        if (!show) {
+            throw new Error("None of the chosen clips on V" + n + " covers " + gcutSecText(args.fromS) + "–" + gcutSecText(args.toS) + " s, so V" + n +
+                " can't be shown there. Nothing was changed.");
+        }
+        gcutRefuseLocked(seq, inRange, "switch angles");
+        var clips = [], hidden = [], splits = 0;
+        for (k = 0; k < inRange.length; k++) {
+            var c = gcutSplitClip(inRange[k], clock);
+            c.wantT = [];
+            if (c.startT + clock.half < fromT) c.wantT.push(fromT);
+            if (toT < c.endT - clock.half) c.wantT.push(toT);
+            c.oldId = gcutClipId("video", c.trackIndex, inRange[k].item);
+            splits += c.wantT.length;
+            if (c.wantT.length) gcutQeTrack("video", c.trackIndex);
+            clips.push(c);
+            if (c.trackIndex !== n - 1 && ("," + hidden.join(",") + ",").indexOf("," + c.label + ",") < 0) hidden.push(c.label);
+        }
+        gcutSplitAll(seq, clips, clock);
+        var states = [], live = [];
+        for (k = 0; k < clips.length; k++) {
+            var st = { kind: "video", trackIndex: clips[k].trackIndex, label: clips[k].label, node: clips[k].node,
+                       startT: Math.max(clips[k].startT, fromT), endT: Math.min(clips[k].endT, toT) };
+            var it = gcutFindRef(seq, st);
+            st.after = clips[k].trackIndex === n - 1;
+            st.before = it ? gcutEnabled(it) : st.after;
+            states.push(st); live.push(it);
+        }
+        var failed = null;
+        for (k = 0; k < live.length; k++) {
+            if (live[k]) { try { live[k].disabled = !states[k].after; } catch (ignored) { /* checked below */ } }
+            if (!failed && (!live[k] || gcutEnabled(live[k]) !== states[k].after)) failed = states[k].label;
+        }
+        if (failed) {
+            var stuck = [];
+            for (k = 0; k < live.length; k++) { if (live[k]) { try { live[k].disabled = !states[k].before; } catch (ignored2) { /* best effort */ } } }
+            for (k = clips.length - 1; k >= 0; k--) {
+                if (!clips[k].atT.length) continue;
+                try { gcutJoin(seq, clips[k], clock); } catch (e2) { stuck.push(clips[k].label); }
+            }
+            throw new Error("Premiere didn't switch " + failed + "'s piece " + (failed === "V" + n ? "on" : "off") + "." +
+                (stuck.length ? " " + stuck.join(", ") + " couldn't be joined back: use Premiere's Undo." : " Nothing was changed."));
+        }
+        return gcutOk({ ok: true, shown: "V" + n, hidden: hidden, splitCount: splits, idMap: gcutSplitIdMap(seq, clips, clock),
+                        undo: { kind: "angle", sequenceId: gcutSeqId(seq), clips: gcutSplitStored(clips), states: states } });
+    } catch (e) {
+        return gcutFail(e);
+    }
+}
+
 /**
  * args: { record, check? } — the `undo` record an act tool returned, as it returned it (pure data, so it
  * survives a panel reload). Returns { ok: true }, or { ok: true, alreadyUndone: true } when nothing of

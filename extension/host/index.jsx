@@ -14,8 +14,9 @@
  * moments: each recorded clip loses exactly the parts of the cut ranges that fall on it, and every
  * kept piece slides left by one shared mapping, t -> t - removedBefore(t), so the hand-made
  * offsets between the clips survive. Following plan decision D2 each clip is removed and its kept
- * pieces re-laid from its own source with overwriteClip, on its own track (no razor: Premiere
- * 2026 silently no-ops the QE razor). Consequences:
+ * pieces re-laid from its own source with overwriteClip, on its own track (no razor: an early probe
+ * saw Premiere 2026 no-op the QE razor; measured 2026-10-14 it splits with an "HH:MM:SS:FF" timecode,
+ * which split_at uses, checking every split). Consequences:
  *   - The rebuild lays fresh clips from the source, so effects, grades, keyframes and audio
  *     gain on the originals are NOT carried over. gcutSnapshotSelection names the effects on
  *     each clip so the panel can warn before Apply.
@@ -1599,16 +1600,21 @@ function gcutRehydrate(record) {
     if (!gcutIsArray(record.items) || !record.items.length || !gcutIsArray(record.cutsT) || !gcutIsArray(record.others)) {
         throw new Error("This undo record is incomplete, so nothing was undone.");
     }
+    return { sequenceId: record.sequenceId, startT: record.startT, endT: record.endT, cutsT: record.cutsT,
+             rebuiltEndT: record.rebuiltEndT, items: gcutRehydrateItems(record.items, "the cut"), others: record.others };
+}
+
+/** Recorded items (gcutCutRecord's fields) with their live project items; refuses one whose source left the project. */
+function gcutRehydrateItems(list, what) {
     var items = [], pis = {}, i, x;
-    for (i = 0; i < record.items.length; i++) {
-        x = record.items[i];
+    for (i = 0; i < list.length; i++) {
+        x = list[i];
         var pi = pis.hasOwnProperty("n" + x.node) ? pis["n" + x.node] : (pis["n" + x.node] = gcutProjectItemByNode(x.node));
-        if (!pi) throw new Error(x.label + "'s source isn't in the project any more, so the cut can't be undone. Use Premiere's Undo instead.");
+        if (!pi) throw new Error(x.label + "'s source isn't in the project any more, so " + what + " can't be undone. Use Premiere's Undo instead.");
         items.push({ kind: x.kind, trackIndex: x.trackIndex, label: x.label, pi: pi, node: x.node, startT: x.startT, endT: x.endT,
                      inS: x.inS, outS: x.outS, srcFrameS: x.srcFrameS, loose: x.loose, mediaFrameS: x.mediaFrameS, av: x.av });
     }
-    return { sequenceId: record.sequenceId, startT: record.startT, endT: record.endT, cutsT: record.cutsT,
-             rebuiltEndT: record.rebuiltEndT, items: items, others: record.others };
+    return items;
 }
 
 /**
@@ -1789,6 +1795,609 @@ function gcutUndoCuts(seq, record, clock, check) {
     }
 }
 
+// ── piece 4: more act tools, each with an exact undo ─────────────────────────────────
+
+/*
+ * Measured in Premiere 26.5.2 (2026-10-14, docs/assistant-measurements-2.md) and relied on:
+ *   - qeTrack.razor("HH:MM:SS:FF") splits the clip under that frame on that one track (a linked partner
+ *     on another track is not split);
+ *   - TrackItem.disabled reads and sets a clip's on/off;
+ *   - trackItem.move(offset) moves that item only (its linked partner stays);
+ *   - remove(false, false) deletes without shifting anything; a ripple remove respects other tracks, so
+ *     close_gaps moves the clips itself.
+ * Every act tool returns { ok, ..., idMap, undo }: idMap { oldId: [newIds] } for every clip whose id
+ * changed (moved or split; {} when none did), undo a pure-data record gcutToolUndo takes back.
+ */
+
+var GCUT_BY_HAND = "Nothing was undone; use Premiere's Undo instead.";
+
+/** Seconds as a short number for messages (at most 3 decimals). */
+function gcutSecText(s) { return String(Math.round(s * 1000) / 1000); }
+
+/** Seconds on the sequence to the nearest whole frame, in ticks. */
+function gcutFrameT(s, clock) { return Math.round(s * GCUT_TICKS / clock.tpf) * clock.tpf; }
+
+/** Ticks as "HH:MM:SS:FF" on the sequence's frames (non-drop, at the nominal rate): the form QE's razor takes (measured). */
+function gcutTimecode(ticks, clock) {
+    var nominal = Math.round(clock.fps), frames = Math.round(ticks / clock.tpf);
+    var secs = Math.floor(frames / nominal), ff = frames - secs * nominal;
+    function two(n) { return (n < 10 ? "0" : "") + n; }
+    return two(Math.floor(secs / 3600)) + ":" + two(Math.floor(secs / 60) % 60) + ":" + two(secs % 60) + ":" + two(ff);
+}
+
+/** A clip by place, as a record names it: { kind, trackIndex, label, node, startT, endT }. */
+function gcutRef(kind, trackIndex, it) {
+    return { kind: kind, trackIndex: trackIndex, label: gcutLabel(kind, trackIndex), node: String(gcutNode(it) || ""),
+             startT: gcutT(it.start), endT: gcutT(it.end) };
+}
+
+/** The clip a ref names, exactly (track, start, end and source), or null. */
+function gcutFindRef(seq, ref) {
+    var tracks = gcutKindTracks(seq, ref.kind);
+    if (ref.trackIndex < 0 || ref.trackIndex >= tracks.numTracks) return null;
+    var items = gcutItems(tracks[ref.trackIndex]);
+    for (var i = 0; i < items.length; i++) {
+        var it = items[i];
+        if (gcutT(it.start) === ref.startT && gcutT(it.end) === ref.endT && String(gcutNode(it) || "") === ref.node) return it;
+    }
+    return null;
+}
+
+/** Refuse if any of these ({kind, trackIndex}) sits on a locked track. */
+function gcutRefuseLocked(seq, list, verb) {
+    for (var i = 0; i < list.length; i++) {
+        var track = gcutKindTracks(seq, list[i].kind)[list[i].trackIndex];
+        if (track && typeof track.isLocked === "function" && track.isLocked()) {
+            throw new Error(gcutLabel(list[i].kind, list[i].trackIndex) + " is locked. Unlock it to " + verb + ".");
+        }
+    }
+}
+
+function gcutEnabled(it) { return it.disabled !== true; }
+
+/**
+ * Undo a change of one setting per clip (on/off, volume, speed): record.items [{...ref, before, after}].
+ * Every clip must still be exactly where it was, its setting reading `after` (or `before` where the
+ * change left it so); all reading `before`: already undone; any other value, or some set back and some
+ * not: changed by hand, refused. read(it) gives the setting, write(it, v) sets it, same(a, b) compares.
+ */
+function gcutUndoSettings(seq, record, check, what, read, write, same) {
+    var list = record.items, live = [], changed = [], back = [], i;
+    if (!gcutIsArray(list) || !list.length) throw new Error("This undo record is incomplete.");
+    for (i = 0; i < list.length; i++) {
+        var x = list[i], it = gcutFindRef(seq, x);
+        if (!it) { changed.push(x.label + "'s clip was moved, trimmed or removed"); continue; }
+        var v = read(it), isBefore = same(v, x.before), isAfter = same(v, x.after);
+        if (isAfter && !isBefore) live.push({ it: it, x: x });
+        else if (isBefore && !isAfter) back.push(x.label + "'s " + what + " was set back");
+        else if (!isBefore) changed.push(x.label + "'s " + what + " was changed");
+    }
+    if (!changed.length && !live.length) return { ok: true, alreadyUndone: true };
+    if (changed.length || back.length) throw new Error("These clips were changed by hand since: " + changed.concat(back).join("; ") + ". " + GCUT_BY_HAND);
+    if (check) return { ok: true, wouldUndo: true };
+    for (i = 0; i < live.length; i++) write(live[i].it, live[i].x.before);
+    for (i = 0; i < live.length; i++) {
+        if (!same(read(live[i].it), live[i].x.before)) throw new Error("Premiere didn't take back " + live[i].x.label + "'s " + what + ". Use Premiere's Undo.");
+    }
+    return { ok: true };
+}
+
+// ── set_clip_enabled ──────────────────────────────────────────────────────────────────
+
+/**
+ * args: { sequenceId, clipIds, enabled } — switch the chosen clips on (true) or off (false), as the
+ * timeline's Enable does. Returns { ok, changed (how many weren't that way already), idMap: {},
+ * undo: { kind: "enabled", sequenceId, items: [{kind, trackIndex, label, node, startT, endT, before, after}] } }.
+ */
+function gcutToolSetClipEnabled(argsJson) {
+    try {
+        var args = gcutParse(argsJson) || {}, k;
+        var seq = gcutSequence();
+        gcutSameSequence(seq, args.sequenceId);
+        if (typeof args.enabled !== "boolean") throw new Error("enabled must be true or false.");
+        var chosen = gcutResolveIds(seq, args.clipIds), items = [], changed = 0;
+        gcutRefuseLocked(seq, chosen, "switch clips off or on");
+        for (k = 0; k < chosen.length; k++) {
+            var x = gcutRef(chosen[k].kind, chosen[k].trackIndex, chosen[k].item);
+            x.before = gcutEnabled(chosen[k].item); x.after = args.enabled;
+            if (x.before !== x.after) changed++;
+            items.push(x);
+        }
+        for (k = 0; k < chosen.length; k++) chosen[k].item.disabled = !args.enabled;
+        for (k = 0; k < chosen.length; k++) {
+            if (gcutEnabled(chosen[k].item) !== args.enabled) {
+                for (var j = 0; j < chosen.length; j++) { try { chosen[j].item.disabled = !items[j].before; } catch (ignored) { /* best effort */ } }
+                throw new Error("Premiere didn't switch " + items[k].label + "'s clip " + (args.enabled ? "on" : "off") + ". Nothing was changed.");
+            }
+        }
+        return gcutOk({ ok: true, changed: changed, idMap: {}, undo: { kind: "enabled", sequenceId: gcutSeqId(seq), items: items } });
+    } catch (e) {
+        return gcutFail(e);
+    }
+}
+
+// ── moves: close_gaps and move_clips, and their undo ─────────────────────────────────
+
+/**
+ * Movers: [{item, kind, trackIndex, label, name, node, startT, endT, target}]. The first clip of a mover's
+ * track (one that isn't itself moving) the mover's target would overlap, as { mover, hit (the item) }, or
+ * null; two movers landing on each other count too.
+ */
+function gcutMoveCollision(seq, movers, clock) {
+    for (var m = 0; m < movers.length; m++) {
+        var a = movers[m], dur = a.endT - a.startT, items = gcutItems(gcutKindTracks(seq, a.kind)[a.trackIndex]);
+        for (var i = 0; i < items.length; i++) {
+            var it = items[i], s = gcutT(it.start), e = gcutT(it.end), moving = null;
+            for (var k = 0; k < movers.length; k++) {
+                if (movers[k].kind === a.kind && movers[k].trackIndex === a.trackIndex && movers[k].startT === s) moving = movers[k];
+            }
+            if (moving === a) continue;
+            if (moving) { s = moving.target; e = moving.target + (moving.endT - moving.startT); }
+            if (gcutOverlaps(a.target, a.target + dur, s, e, clock)) return { mover: a, hit: it };
+        }
+    }
+    return null;
+}
+
+/** Move each mover to its target (by target - where it is now: one Premiere already moved along as a linked partner isn't moved twice). Left moves go earliest first, right moves latest first. The first mover not at its target after, or null. */
+function gcutMoveEach(movers, clock) {
+    var order = movers.slice(0), i;
+    order.sort(function (a, b) { return (a.target < a.startT) ? a.startT - b.startT : b.startT - a.startT; });
+    for (i = 0; i < order.length; i++) {
+        var now = gcutT(order[i].item.start);
+        if (!gcutNear(now, order[i].target, clock.half)) order[i].item.move(gcutTimeFromTicks(order[i].target - now));
+    }
+    for (i = 0; i < order.length; i++) if (!gcutNear(gcutT(order[i].item.start), order[i].target, clock.half)) return order[i];
+    return null;
+}
+
+/**
+ * Move every mover, all or nothing: everything else on the timeline must stay where it was. On any failure
+ * every mover goes back to where it started, and the error says whether that worked.
+ */
+function gcutRunMoves(seq, clock, movers, nothingWas) {
+    var all = [], k;
+    for (k = 0; k < movers.length; k++) all.push({ kind: movers[k].kind, trackIndex: movers[k].trackIndex, startT: movers[k].startT });
+    var others = gcutOthers(seq, all, -Infinity, Infinity), bad = null, label = null;
+    try { bad = gcutMoveEach(movers, clock); } catch (e) { bad = movers[0]; }
+    if (bad) label = bad.label;
+    else { label = gcutSnapshotIntact(seq, others, clock); }
+    if (!label) return;
+    var back = [];
+    for (k = 0; k < movers.length; k++) {
+        back.push({ item: movers[k].item, startT: gcutT(movers[k].item.start), target: movers[k].startT, label: movers[k].label });
+    }
+    var stuck = null;
+    try { stuck = gcutMoveEach(back, clock) || gcutSnapshotIntact(seq, others, clock); } catch (e2) { stuck = true; }
+    throw new Error("A clip on " + label + " didn't move as expected, " + (stuck ? "and not every clip could be put back. Use Premiere's Undo."
+        : "so every clip was put back. " + nothingWas));
+}
+
+/** The record of done movers: [{kind, trackIndex, label, name, node, fromT, toT, durT}]. */
+function gcutMoveRecord(movers) {
+    var out = [];
+    for (var k = 0; k < movers.length; k++) {
+        var m = movers[k];
+        out.push({ kind: m.kind, trackIndex: m.trackIndex, label: m.label, name: m.name, node: m.node, fromT: m.startT, toT: m.target, durT: m.endT - m.startT });
+    }
+    return out;
+}
+
+/** { oldId: [newId] } for every done mover, the new id read from the timeline. */
+function gcutMoveIdMap(seq, movers) {
+    var map = {};
+    for (var k = 0; k < movers.length; k++) {
+        var m = movers[k], it = gcutFindRef(seq, { kind: m.kind, trackIndex: m.trackIndex, node: m.node, startT: m.target, endT: m.target + m.endT - m.startT });
+        if (it) map[m.oldId] = [gcutClipId(m.kind, m.trackIndex, it)];
+    }
+    return map;
+}
+
+function gcutMover(kind, trackIndex, it, target) {
+    var s = gcutT(it.start);
+    return { item: it, kind: kind, trackIndex: trackIndex, label: gcutLabel(kind, trackIndex), name: String(it.name), node: String(gcutNode(it) || ""),
+             startT: s, endT: gcutT(it.end), target: target, oldId: gcutClipId(kind, trackIndex, it) };
+}
+
+/**
+ * args: { sequenceId, clipIds } — close the gaps between the chosen clips: the stretches inside their span
+ * that none of them covers. Every clip on EVERY track starting after a gap moves left by the gaps before it
+ * (trackItem.move; Premiere's ripple delete respects other tracks, measured, so it isn't used), keeping
+ * everything after in step. Refuses, moving nothing: no gap; a clip on any track sitting in a gap (it would
+ * need cutting); a locked track with a clip to move; a move that would overlap a clip. Returns { ok,
+ * gapCount, closedS, movedCount, idMap (every moved clip), undo: { kind: "moves", sequenceId, moves } }.
+ */
+function gcutToolCloseGaps(argsJson) {
+    try {
+        var args = gcutParse(argsJson) || {}, k, t, i;
+        var seq = gcutSequence(), clock = gcutClock(seq);
+        gcutSameSequence(seq, args.sequenceId);
+        var chosen = gcutResolveIds(seq, args.clipIds), ivs = [], gaps = [], closedT = 0;
+        for (k = 0; k < chosen.length; k++) ivs.push({ s: gcutT(chosen[k].item.start), e: gcutT(chosen[k].item.end) });
+        ivs.sort(function (a, b) { return a.s - b.s; });
+        var cursor = ivs[0].e;
+        for (k = 1; k < ivs.length; k++) {
+            if (ivs[k].s > cursor + clock.half) { gaps.push({ startT: cursor, endT: ivs[k].s }); closedT += ivs[k].s - cursor; }
+            cursor = Math.max(cursor, ivs[k].e);
+        }
+        if (!gaps.length) throw new Error("There's no gap between the chosen clips, so nothing was moved.");
+        var tracks = gcutTracks(seq), movers = [];
+        for (t = 0; t < tracks.length; t++) {
+            var items = gcutItems(tracks[t].track), kind = tracks[t].audio ? "audio" : "video";
+            for (i = 0; i < items.length; i++) {
+                var s = gcutT(items[i].start), e = gcutT(items[i].end);
+                for (k = 0; k < gaps.length; k++) {
+                    if (gcutOverlaps(s, e, gaps[k].startT, gaps[k].endT, clock)) {
+                        throw new Error(items[i].name + " on " + tracks[t].label + " sits in the gap at " + gcutClockText(gaps[k].startT) +
+                            ", so closing it would need that clip cut or moved. Nothing was moved.");
+                    }
+                }
+                var shift = gcutRemovedBefore(gaps, s);
+                if (shift > clock.half) movers.push(gcutMover(kind, tracks[t].index, items[i], s - shift));
+            }
+        }
+        gcutRefuseLocked(seq, movers, "close the gaps");
+        var hit = gcutMoveCollision(seq, movers, clock);
+        if (hit) throw new Error("Closing the gaps would land " + hit.mover.name + " on " + hit.hit.name + " on " + hit.mover.label + ", so nothing was moved.");
+        gcutRunMoves(seq, clock, movers, "Nothing was changed.");
+        return gcutOk({ ok: true, gapCount: gaps.length, closedS: closedT / GCUT_TICKS, movedCount: movers.length,
+                        idMap: gcutMoveIdMap(seq, movers), undo: { kind: "moves", sequenceId: gcutSeqId(seq), moves: gcutMoveRecord(movers) } });
+    } catch (e) {
+        return gcutFail(e);
+    }
+}
+
+/**
+ * Undo a "moves" record (close_gaps, move_clips): every moved clip must still be exactly where the move
+ * left it (none of them: already undone, when all are back where they were); moving back must not land on
+ * anything nor touch a locked track. Then each goes back, all or nothing.
+ */
+function gcutUndoMoves(seq, record, clock, check) {
+    var moves = record.moves, movers = [], atOld = 0, k;
+    if (!gcutIsArray(moves) || !moves.length) throw new Error("This undo record is incomplete.");
+    for (k = 0; k < moves.length; k++) {
+        var m = moves[k], ref = { kind: m.kind, trackIndex: m.trackIndex, node: m.node, startT: m.toT, endT: m.toT + m.durT };
+        var it = gcutFindRef(seq, ref);
+        if (it) {
+            movers.push({ item: it, kind: m.kind, trackIndex: m.trackIndex, label: m.label, name: m.name, node: m.node,
+                          startT: m.toT, endT: m.toT + m.durT, target: m.fromT });
+        } else {
+            ref.startT = m.fromT; ref.endT = m.fromT + m.durT;
+            if (gcutFindRef(seq, ref)) atOld++;
+        }
+    }
+    if (atOld === moves.length) return { ok: true, alreadyUndone: true };
+    if (movers.length !== moves.length) {
+        throw new Error("Some of the moved clips were moved, trimmed or removed by hand since (" + movers.length + " of " + moves.length +
+            " are where the move left them). " + GCUT_BY_HAND);
+    }
+    gcutRefuseLocked(seq, movers, "undo");
+    var hit = gcutMoveCollision(seq, movers, clock);
+    if (hit) throw new Error("Moving the clips back would land " + hit.mover.name + " on " + hit.hit.name + " on " + hit.mover.label + ". " + GCUT_BY_HAND);
+    if (check) return { ok: true, wouldUndo: true };
+    gcutRunMoves(seq, clock, movers, "Nothing was undone.");
+    return { ok: true };
+}
+
+// ── split_at, and the splits switch_angle makes ──────────────────────────────────────
+
+/** The QE track of this kind and index (app.enableQE, measured); refuses when QE isn't there. */
+function gcutQeTrack(kind, trackIndex) {
+    var qt = null;
+    try {
+        app.enableQE();
+        var qseq = qe.project.getActiveSequence();
+        qt = kind === "audio" ? qseq.getAudioTrackAt(trackIndex) : qseq.getVideoTrackAt(trackIndex);
+    } catch (e) { qt = null; }
+    if (!qt) throw new Error("Premiere's QE interface isn't available, so clips can't be split here. Nothing was changed; split them by hand.");
+    return qt;
+}
+
+/**
+ * A split record's clip: { kind, trackIndex, label, node, startT, endT, inS (gcutClipInS), enabled, atT: [split
+ * times inside it, in order] }. Its pieces, as refs with the in point each must have: [{ref, inS}].
+ */
+function gcutSplitPieces(c) {
+    var cuts = [c.startT].concat(c.atT).concat([c.endT]), out = [];
+    for (var k = 0; k + 1 < cuts.length; k++) {
+        out.push({ ref: { kind: c.kind, trackIndex: c.trackIndex, label: c.label, node: c.node, startT: cuts[k], endT: cuts[k + 1] },
+                   inS: c.inS + (cuts[k] - c.startT) / GCUT_TICKS });
+    }
+    return out;
+}
+
+/** The live pieces of split clip c, in order, if every one is exactly where the split left it (place, length, source and in point); else null. */
+function gcutLivePieces(seq, c, clock) {
+    var pieces = gcutSplitPieces(c), live = [];
+    for (var k = 0; k < pieces.length; k++) {
+        var it = gcutFindRef(seq, pieces[k].ref);
+        if (!it || !gcutNear(gcutClipInS(c.kind, it, clock), pieces[k].inS, clock.frameS / 2)) return null;
+        live.push(it);
+    }
+    return live;
+}
+
+/** True if split clip c is whole again: one clip at its place, from its in point, on or off as it was. */
+function gcutWholeAgain(seq, c, clock) {
+    var it = gcutFindRef(seq, c);
+    return !!it && gcutNear(gcutClipInS(c.kind, it, clock), c.inS, clock.frameS / 2) && gcutEnabled(it) === c.enabled;
+}
+
+/** Join split clip c's pieces back into one: the later pieces go, the first one's end is set back (TrackItem.end, measured). Throws if it isn't whole after. */
+function gcutJoin(seq, c, clock) {
+    var live = gcutLivePieces(seq, c, clock);
+    if (live) {
+        for (var k = live.length - 1; k >= 1; k--) live[k].remove(false, false);
+        try { live[0].end = gcutTimeFromTicks(c.endT); } catch (e) { /* checked below */ }
+        var it = gcutFindRef(seq, c);
+        if (it) it.disabled = !c.enabled;
+    }
+    if (!gcutWholeAgain(seq, c, clock)) throw new Error("Couldn't join " + c.label + "'s pieces back. Use Premiere's Undo.");
+}
+
+/** Razor split clip c (a record clip, not yet split at atT) at atT on its own track, and check both pieces are there. */
+function gcutRazor(seq, c, atT, clock) {
+    gcutQeTrack(c.kind, c.trackIndex).razor(gcutTimecode(atT, clock));
+    var left = { kind: c.kind, trackIndex: c.trackIndex, node: c.node, startT: c.startT, endT: atT };
+    var right = { kind: c.kind, trackIndex: c.trackIndex, node: c.node, startT: atT, endT: c.endT };
+    if (!gcutFindRef(seq, left) || !gcutFindRef(seq, right)) throw new Error("Premiere didn't split " + c.label + "'s clip at " + gcutClockText(atT) + ".");
+}
+
+/** A split record clip for chosen clip x ({kind, trackIndex, item}), with no splits yet. */
+function gcutSplitClip(x, clock) {
+    var c = gcutRef(x.kind, x.trackIndex, x.item);
+    c.inS = gcutClipInS(x.kind, x.item, clock); c.enabled = gcutEnabled(x.item); c.atT = [];
+    return c;
+}
+
+/**
+ * Split each record clip at its times (c.wantT, in order), clip after clip. Returns the clips, each with
+ * atT as done. If a razor fails, every clip split so far is joined back and the error says so.
+ */
+function gcutSplitAll(seq, clips, clock) {
+    var done = [], k, p;
+    try {
+        for (k = 0; k < clips.length; k++) {
+            var c = clips[k];
+            for (p = 0; p < c.wantT.length; p++) {
+                var piece = { kind: c.kind, trackIndex: c.trackIndex, label: c.label, node: c.node,
+                              startT: p ? c.wantT[p - 1] : c.startT, endT: c.endT };
+                if (done[done.length - 1] !== c) done.push(c);
+                gcutRazor(seq, piece, c.wantT[p], clock);
+                c.atT.push(c.wantT[p]);
+            }
+        }
+    } catch (e) {
+        var stuck = [];
+        for (k = done.length - 1; k >= 0; k--) {
+            if (!done[k].atT.length) continue;
+            try { gcutJoin(seq, done[k], clock); } catch (e2) { stuck.push(done[k].label); }
+        }
+        throw new Error(e.message + (stuck.length ? " " + stuck.join(", ") + " couldn't be joined back: use Premiere's Undo." : " Nothing was changed."));
+    }
+    return clips;
+}
+
+/** { oldId: [ids of its pieces, in order] } for every record clip that was split. */
+function gcutSplitIdMap(seq, clips, clock) {
+    var map = {};
+    for (var k = 0; k < clips.length; k++) {
+        var c = clips[k];
+        if (!c.atT.length) continue;
+        var live = gcutLivePieces(seq, c, clock), ids = [];
+        if (live) for (var p = 0; p < live.length; p++) ids.push(gcutClipId(c.kind, c.trackIndex, live[p]));
+        map[c.oldId] = ids;
+    }
+    return map;
+}
+
+/** A split record clip as stored: pure data, without the run-time fields. */
+function gcutSplitStored(clips) {
+    var out = [];
+    for (var k = 0; k < clips.length; k++) {
+        var c = clips[k];
+        out.push({ kind: c.kind, trackIndex: c.trackIndex, label: c.label, node: c.node, startT: c.startT, endT: c.endT,
+                   inS: c.inS, enabled: c.enabled, atT: c.atT.slice(0) });
+    }
+    return out;
+}
+
+/**
+ * args: { sequenceId, clipIds, atS } — split each chosen clip at atS (to the nearest frame) with QE's razor on
+ * its own track (a linked partner that isn't chosen stays whole, measured). Refuses, changing nothing, a
+ * time that isn't inside every chosen clip and a locked track. Returns { ok, splitCount, idMap ({ oldId:
+ * [oldId, idOfTheSecondPiece] }), undo: { kind: "split", sequenceId, clips: [{kind, trackIndex, label, node,
+ * startT, endT, inS, enabled, atT: [t]}] } }.
+ */
+function gcutToolSplitAt(argsJson) {
+    try {
+        var args = gcutParse(argsJson) || {}, k;
+        var seq = gcutSequence(), clock = gcutClock(seq);
+        gcutSameSequence(seq, args.sequenceId);
+        if (!gcutIsTime(args.atS)) throw new Error("atS must be a time in seconds on the sequence.");
+        var chosen = gcutResolveIds(seq, args.clipIds), atT = gcutFrameT(args.atS, clock), clips = [];
+        gcutRefuseLocked(seq, chosen, "split");
+        for (k = 0; k < chosen.length; k++) {
+            var c = gcutSplitClip(chosen[k], clock);
+            if (!(c.startT + clock.half < atT && atT < c.endT - clock.half)) {
+                throw new Error(c.label + "'s clip (" + gcutSecText(c.startT / GCUT_TICKS) + "–" + gcutSecText(c.endT / GCUT_TICKS) + " s) doesn't run across " +
+                    gcutSecText(args.atS) + " s, so it can't be split there. Nothing was changed.");
+            }
+            c.wantT = [atT]; c.oldId = gcutClipId(chosen[k].kind, chosen[k].trackIndex, chosen[k].item);
+            clips.push(c);
+        }
+        for (k = 0; k < clips.length; k++) gcutQeTrack(clips[k].kind, clips[k].trackIndex);
+        gcutSplitAll(seq, clips, clock);
+        return gcutOk({ ok: true, splitCount: clips.length, idMap: gcutSplitIdMap(seq, clips, clock),
+                        undo: { kind: "split", sequenceId: gcutSeqId(seq), clips: gcutSplitStored(clips) } });
+    } catch (e) {
+        return gcutFail(e);
+    }
+}
+
+/**
+ * Undo a "split" (split_at) or "angle" (switch_angle) record: { clips (gcutSplitStored), states?: [{...ref,
+ * before, after}] (on/off set on pieces) }. Already undone when every clip is whole again, on or off as it
+ * was. Otherwise every piece must be exactly where the split left it, and every state still `after`;
+ * then the states go back and the pieces are joined.
+ */
+function gcutUndoSplits(seq, record, clock, check) {
+    var clips = record.clips, states = gcutIsArray(record.states) ? record.states : [], k, whole = 0;
+    if (!gcutIsArray(clips) || !clips.length) throw new Error("This undo record is incomplete.");
+    for (k = 0; k < clips.length; k++) if (gcutWholeAgain(seq, clips[k], clock)) whole++;
+    if (whole === clips.length) return { ok: true, alreadyUndone: true };
+    for (k = 0; k < clips.length; k++) {
+        if (!gcutLivePieces(seq, clips[k], clock)) throw new Error(clips[k].label + "'s pieces were moved, trimmed, removed or slip-edited since. " + GCUT_BY_HAND);
+    }
+    var live = [];
+    for (k = 0; k < states.length; k++) {
+        var it = gcutFindRef(seq, states[k]);
+        if (!it) throw new Error(states[k].label + "'s pieces were moved, trimmed, removed or slip-edited since. " + GCUT_BY_HAND);
+        if (gcutEnabled(it) !== states[k].after) {
+            throw new Error(states[k].label + "'s piece was switched " + (states[k].after ? "off" : "on") + " by hand since. " + GCUT_BY_HAND);
+        }
+        live.push(it);
+    }
+    gcutRefuseLocked(seq, clips, "undo");
+    if (check) return { ok: true, wouldUndo: true };
+    for (k = 0; k < live.length; k++) live[k].disabled = !states[k].before;
+    for (k = clips.length - 1; k >= 0; k--) if (clips[k].atT.length) gcutJoin(seq, clips[k], clock);
+    return { ok: true };
+}
+
+// ── delete_clips ──────────────────────────────────────────────────────────────────────
+
+/**
+ * What would be in the way of laying these recorded items back from their source (overwriteClip drops a
+ * video file's picture and sound together, measured): a clip that isn't one of them on the track a video
+ * item's sound lands on (A of its number), or that audio from a video file's picture lands on (V of its
+ * number). Returns { label, there, name, sound } or null.
+ */
+function gcutRelayBlocker(seq, items, clock) {
+    for (var f = 0; f < items.length; f++) {
+        var x = items[f], other = x.kind === "audio" ? "video" : "audio";
+        if (x.kind === "audio" && !x.av) continue;
+        var tracks = gcutKindTracks(seq, other);
+        if (x.trackIndex >= tracks.numTracks) continue;
+        var list = gcutItems(tracks[x.trackIndex]);
+        for (var i = 0; i < list.length; i++) {
+            var s = gcutT(list[i].start);
+            if (!gcutOverlaps(s, gcutT(list[i].end), x.startT, x.endT, clock) || gcutRecorded(items, other, x.trackIndex, s)) continue;
+            return { label: x.label, there: gcutLabel(other, x.trackIndex), name: String(list[i].name), sound: x.kind === "video" };
+        }
+    }
+    return null;
+}
+
+/**
+ * args: { sequenceId, clipIds } — delete the chosen clips with remove(false, false): nothing slides, and a
+ * linked partner that isn't chosen stays (measured). Refuses, changing nothing, a locked track and a clip
+ * that isn't at 100% speed (its undo couldn't lay it back as it was). Returns { ok, deleted: [ids], warning?,
+ * idMap: {}, undo: { kind: "delete", sequenceId, items } }. The undo lays the clips back from their source,
+ * as a cut's undo does: `warning` names effects that wouldn't come back, and a clip whose sound (or picture)
+ * would land on a clip that stays, whose delete only Premiere's Undo can take back.
+ */
+function gcutToolDeleteClips(argsJson) {
+    try {
+        var args = gcutParse(argsJson) || {}, k;
+        var seq = gcutSequence(), clock = gcutClock(seq);
+        gcutSameSequence(seq, args.sequenceId);
+        var chosen = gcutResolveIds(seq, args.clipIds), spec = { items: [] }, ids = [];
+        gcutRefuseLocked(seq, chosen, "delete");
+        for (k = 0; k < chosen.length; k++) {
+            var label = gcutLabel(chosen[k].kind, chosen[k].trackIndex);
+            if (!chosen[k].item.projectItem) throw new Error(label + "'s clip has no source media, so deleting it couldn't be undone. Delete it by hand.");
+            if (Math.abs(gcutSpeed(chosen[k].item) - 1) > 1e-6) throw new Error(label + " isn't at 100% speed, so deleting it couldn't be undone exactly. Delete it by hand.");
+            spec.items.push({ kind: chosen[k].kind, trackIndex: chosen[k].trackIndex, startTicks: chosen[k].item.start.ticks, endTicks: chosen[k].item.end.ticks });
+            ids.push(gcutClipId(chosen[k].kind, chosen[k].trackIndex, chosen[k].item));
+        }
+        var found = gcutRefind(seq, spec, clock), notes = [], lost = [];
+        for (k = 0; k < chosen.length; k++) {
+            var fx = gcutClipEffects(chosen[k].kind, chosen[k].item);
+            if (fx.length) lost.push(found[k].label + " (" + chosen[k].item.name + "): " + fx.join(", "));
+        }
+        if (lost.length) notes.push("An undo lays deleted clips back from their source, so these effects wouldn't come back: " + lost.join("; ") + ".");
+        var blocker = gcutRelayBlocker(seq, found, clock);
+        if (blocker) {
+            notes.push("Undoing this delete will need Premiere's Undo: laying " + blocker.label + "'s clip back from its source would also lay its " +
+                (blocker.sound ? "sound" : "picture") + " on " + blocker.there + ", over " + blocker.name + " there.");
+        }
+        var items = gcutCutRecord({ items: found, cutsT: [], others: [] }).items;
+        for (k = 0; k < items.length; k++) { items[k].enabled = gcutEnabled(found[k].item); items[k].name = String(found[k].item.name); }
+        var span = gcutSpan(found), others = gcutOthers(seq, found, span.fromT, span.toT);
+        for (k = 0; k < found.length; k++) found[k].item.remove(false, false);
+        for (k = 0; k < items.length; k++) {
+            if (gcutFindRef(seq, items[k])) throw new Error(items[k].label + "'s clip didn't come off the timeline. Use Premiere's Undo to put back anything that did.");
+        }
+        var hit = gcutSnapshotIntact(seq, others, clock);
+        if (hit) throw new Error("Deleting also changed something on " + hit + ". Use Premiere's Undo.");
+        return gcutOk({ ok: true, deleted: ids, warning: notes.length ? notes.join(" ") : undefined, idMap: {},
+                        undo: { kind: "delete", sequenceId: gcutSeqId(seq), items: items } });
+    } catch (e) {
+        return gcutFail(e);
+    }
+}
+
+/**
+ * Undo a delete: lay every deleted clip back at its own place from its own source (Restore's machinery),
+ * on or off as it was. Already undone when every one is back; refused, changing nothing, when only some
+ * are, when anything now sits where one was (or where its sound or picture would land), or when a source
+ * left the project. A lay that fails takes off what it laid.
+ */
+function gcutUndoDelete(seq, record, clock, check) {
+    var list = record.items, back = 0, k;
+    if (!gcutIsArray(list) || !list.length) throw new Error("This undo record is incomplete.");
+    for (k = 0; k < list.length; k++) if (gcutFindRef(seq, list[k])) back++;
+    if (back === list.length) return { ok: true, alreadyUndone: true };
+    if (back) throw new Error("Some of the deleted clips were put back by hand since (" + back + " of " + list.length + "). " + GCUT_BY_HAND);
+    for (k = 0; k < list.length; k++) {
+        var x = list[k], tracks = gcutKindTracks(seq, x.kind);
+        if (x.trackIndex >= tracks.numTracks) throw new Error(x.label + " no longer exists. " + GCUT_BY_HAND);
+        var on = gcutItems(tracks[x.trackIndex]);
+        for (var i = 0; i < on.length; i++) {
+            if (gcutOverlaps(gcutT(on[i].start), gcutT(on[i].end), x.startT, x.endT, clock)) {
+                throw new Error("Something was placed on " + x.label + " where a deleted clip was since. " + GCUT_BY_HAND);
+            }
+        }
+    }
+    var blocker = gcutRelayBlocker(seq, list, clock);
+    if (blocker) {
+        throw new Error("Laying " + blocker.label + "'s clip back would also lay its " + (blocker.sound ? "sound" : "picture") + " on " + blocker.there +
+            ", over " + blocker.name + " there. " + GCUT_BY_HAND);
+    }
+    var items = gcutRehydrateItems(list, "the delete"), marks = [];
+    gcutRefuseLocked(seq, items, "undo");
+    if (check) return { ok: true, wouldUndo: true };
+    var span = gcutSpan(items), others = gcutOthers(seq, [], span.fromT, span.toT);
+    try {
+        for (k = 0; k < items.length; k++) {
+            var seen = false;
+            for (var m = 0; m < marks.length; m++) if (marks[m].node === items[k].node) seen = true;
+            if (!seen) marks.push({ pi: items[k].pi, node: items[k].node, inS: items[k].pi.getInPoint().seconds, outS: items[k].pi.getOutPoint().seconds });
+        }
+        if (!gcutRelayAll(seq, { items: items }, clock, others)) {
+            try { gcutRemoveRange(seq, gcutNodes(items), span.fromT, span.toT, clock, others); } catch (ignored) { /* checked below */ }
+            var clean = true;
+            for (k = 0; k < list.length; k++) if (gcutFindRef(seq, list[k])) clean = false;
+            throw new Error(clean && !gcutSnapshotIntact(seq, others, clock)
+                ? "The deleted clips didn't go back as expected, so they were taken off again. Nothing was undone; try again, or use Premiere's Undo."
+                : "The deleted clips didn't go back as expected, and what was laid couldn't all be taken off. Use Premiere's Undo.");
+        }
+        var hit = gcutSnapshotIntact(seq, others, clock);
+        if (hit) throw new Error("Undoing the delete changed something on " + hit + ". Use Premiere's Undo.");
+        for (k = 0; k < list.length; k++) {
+            var it = gcutFindRef(seq, list[k]);
+            if (it && list[k].enabled === false) it.disabled = true;
+        }
+        return { ok: true };
+    } finally {
+        // Always leave the bin items' own in/out marks as they were.
+        for (k = 0; k < marks.length; k++) {
+            try { gcutSetRange(marks[k].pi, marks[k].inS, marks[k].outS, clock.frameS / 2); } catch (ignored2) { /* best effort */ }
+        }
+    }
+}
+
 /**
  * args: { record, check? } — the `undo` record an act tool returned, as it returned it (pure data, so it
  * survives a panel reload). Returns { ok: true }, or { ok: true, alreadyUndone: true } when nothing of
@@ -1807,6 +2416,13 @@ function gcutToolUndo(argsJson) {
         var check = args.check === true;
         if (record.kind === "markers") return gcutOk(gcutUndoMarkers(seq, record, clock, check));
         if (record.kind === "cuts") return gcutOk(gcutUndoCuts(seq, record, clock, check));
+        if (record.kind === "delete") return gcutOk(gcutUndoDelete(seq, record, clock, check));
+        if (record.kind === "moves") return gcutOk(gcutUndoMoves(seq, record, clock, check));
+        if (record.kind === "split" || record.kind === "angle") return gcutOk(gcutUndoSplits(seq, record, clock, check));
+        if (record.kind === "enabled") {
+            return gcutOk(gcutUndoSettings(seq, record, check, "on/off", gcutEnabled,
+                function (it, v) { it.disabled = !v; }, function (a, b) { return a === b; }));
+        }
         throw new Error("Genius Cut can't undo a change of kind " + record.kind + ".");
     } catch (e) {
         return gcutFail(e);

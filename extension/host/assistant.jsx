@@ -368,8 +368,30 @@ function gcutCutGone(seq, rec, clock) {
 }
 
 /**
+ * The label of a track holding a cut piece that sits where planned but was slip-edited since (its
+ * in point fails gcutInPointOk against the planned srcIn), or null. gcutOursNow matches pieces by
+ * place and length only.
+ */
+function gcutSlipped(seq, rec, plan, clock) {
+    var nV = seq.videoTracks.numTracks;
+    for (var i = 0; i < rec.items.length; i++) {
+        var f = rec.items[i], t = (f.kind === "audio" ? nV : 0) + f.trackIndex;
+        var items = gcutItems(gcutKindTracks(seq, f.kind)[f.trackIndex]);
+        for (var j = 0; j < items.length; j++) {
+            var it = items[j], s = gcutT(it.start), d = gcutT(it.end) - s;
+            if (gcutNode(it) !== f.node || gcutKept(rec.others, t, s, f.node)) continue;
+            for (var p = 0; p < plan[i].length; p++) {
+                if (gcutNear(s, plan[i][p].atT, clock.half) && gcutNear(d, plan[i][p].durT, clock.half) &&
+                    !gcutInPointOk(it.inPoint.seconds, plan[i][p].srcIn, f, clock)) return f.label;
+            }
+        }
+    }
+    return null;
+}
+
+/**
  * Undo a cut_ranges, as Restore undoes an Apply: only if every planned piece is still exactly where
- * the cut laid it and nothing new is in the way; then every recorded item goes back to its own
+ * the cut laid it (place, length and in point) and nothing new is in the way; then every recorded item goes back to its own
  * original place, checked, with the others left as they were. Already undone (gcutCutGone): says so.
  * A refusal changes nothing; a re-lay that fails puts the cut version back.
  */
@@ -382,6 +404,11 @@ function gcutUndoCuts(seq, record, clock) {
     if (ours.length !== want) {
         throw new Error("Some of the cut pieces were moved, trimmed or removed since (" + ours.length + " of " + want +
             " are where the cut left them), so the cut changed since. Nothing was undone; use Premiere's Undo instead.");
+    }
+    var slipped = gcutSlipped(seq, rec, plan, clock);
+    if (slipped) {
+        throw new Error("A cut piece on " + slipped + " was slip-edited since (its source in point changed), so the cut changed since. " +
+            "Nothing was undone; use Premiere's Undo instead.");
     }
     var span = gcutSpan(rec.items), others = gcutOthers(seq, ours, span.fromT, span.toT);
     var blocked = gcutInTheWay(seq, rec, others, clock);

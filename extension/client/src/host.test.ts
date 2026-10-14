@@ -2525,6 +2525,16 @@ describe("gcutToolCutRanges: timeline ranges cut from chosen clips with Apply's 
       expect(allTracks(s.seq)).toEqual(now);
     });
 
+    it("refuses, changing nothing, when a cut piece was slip-edited since (same place and length, another in point)", () => {
+      const { s, record } = cutGeorg();
+      const piece = s.seq.videoTracks[0].clips[1];
+      piece.trueIn = Time.s(piece.trueIn.seconds + 0.4);
+      const now = allTracks(s.seq);
+      expect(() => undoTool(s, record)).toThrow("A cut piece on V1 was slip-edited since (its source in point changed), so the cut changed since. " +
+        "Nothing was undone; use Premiere's Undo instead.");
+      expect(allTracks(s.seq)).toEqual(now);
+    });
+
     it("refuses, changing nothing, when something was placed in the gap since (an extra piece of a cut source)", () => {
       const { s, record } = cutGeorg();
       s.seq.videoTracks[0].add(s.a, 108.2, 40, 40.8);

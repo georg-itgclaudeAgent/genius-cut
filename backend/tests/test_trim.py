@@ -233,3 +233,38 @@ def test_an_impossible_frame_length_is_a_422(tmp_path, bad):
     c, auth = api(tmp_path, FakeTranscriber())
     r = c.post("/trim", json={**REQ.model_dump(), "frame_s": bad}, headers=auth)
     assert r.status_code == 422
+
+
+def test_a_rejected_anthropic_key_in_analyse_says_so_plainly(tmp_path):
+    from geniuscut import cuts
+    from tests.test_agent import KEY_REJECTED, RejectingClient
+
+    token = get_or_create_token(tmp_path)
+    app = create_app(token=token, stt_device=lambda: "cuda", transcriber=lambda: FakeTranscriber(),
+                     library_dir=tmp_path / "library", extract=fake_extract,
+                     propose=lambda w, f, i: cuts.propose_cuts(w, f, i, client=RejectingClient()))
+    r = TestClient(app, base_url="http://127.0.0.1:8791").post("/trim", json=REQ.model_dump(),
+                                                             headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 502
+    assert r.json()["detail"] == KEY_REJECTED
+
+
+def test_trim_spend_rows_carry_the_agent_runs_id_when_given(tmp_path):
+    import json as _json
+    from geniuscut import spend
+
+    def priced(words, fewshot, instruction):
+        spend.record("claude-opus-5-5", 1000, 100)
+        return CUTS
+
+    token = get_or_create_token(tmp_path)
+    app = create_app(token=token, stt_device=lambda: "cuda", transcriber=lambda: FakeTranscriber(),
+                     library_dir=tmp_path / "library", extract=fake_extract, propose=priced)
+    c, auth = TestClient(app, base_url="http://127.0.0.1:8791"), {"Authorization": f"Bearer {token}"}
+    run_id = "0123456789abcdef0123456789abcdef"
+    assert c.post("/trim", json={**REQ.model_dump(), "run_id": run_id}, headers=auth).status_code == 200
+    assert c.post("/trim", json=REQ.model_dump(), headers=auth).status_code == 200
+    rows = [_json.loads(x) for x in spend.ledger_path().read_text(encoding="utf-8").splitlines()]
+    assert rows[0]["run"] == run_id and rows[0]["kind"] == "trim"
+    assert rows[1]["run"] != run_id
+    assert c.post("/trim", json={**REQ.model_dump(), "run_id": "not a run id!"}, headers=auth).status_code == 422

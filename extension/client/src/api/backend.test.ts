@@ -29,6 +29,16 @@ describe("backend client", () => {
     expect(f.seen[0].headers["Content-Type"]).toBe("application/json");
   });
 
+  it("passes the agent run's id with a handed-over trim, so its spend is that run's (one run in Usage)", async () => {
+    const f = fake(200, { words: [], cuts: [], kept_spans_source: [], kept_spans: [], stt_device: "cuda", cut_fraction: 0, warning: null });
+    const api = createBackend({ transport: f.transport, token: () => "tok" });
+    const req = { duration_s: 5, range_start_seq_s: 0, audio: [{ media_path: "C:/a.mp4", in_s: 0, offset_s: 0, duration_s: 5 }], prompt: "" };
+    await api.trim(req, "run-7");
+    await api.trim(req);
+    expect(JSON.parse(f.seen[0].body!)).toMatchObject({ ...req, run_id: "run-7" });
+    expect(JSON.parse(f.seen[1].body!)).not.toHaveProperty("run_id");
+  });
+
   it("turns the backend's error detail into a readable message with the status", async () => {
     const api = createBackend({
       transport: fake(502, { detail: "Anthropic API error 400: Your credit balance is too low." }).transport,

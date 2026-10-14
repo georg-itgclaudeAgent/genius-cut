@@ -88,6 +88,9 @@ class TrimRequest(AudioRange):
                                description="Silences at least this long become pause cuts")
     frame_s: float | None = Field(default=None, gt=0, le=1, allow_inf_nan=False,
                                   description="The sequence's frame length: cut edges go on its frames (None: as found)")
+    run_id: str | None = Field(default=None, pattern=r"^[0-9A-Za-z_-]{1,64}$",
+                               description="The agent run that handed this trim over (propose_filler_cuts): its "
+                                           "spend rows carry that run's id, so /usage shows one run")
 
     @model_validator(mode="before")
     @classmethod

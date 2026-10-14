@@ -199,7 +199,7 @@ describe("terminal trim handoff", () => {
   it("propose_filler_cuts ends the run: no results posted; the trim gets Claude's instructions and the selection recorded at send", async () => {
     const w = world({ start: calls(call("propose_filler_cuts", { instructions: "remove ums; keep breaths" })) });
     const out = await w.agent.send("trim the ums");
-    expect(out).toEqual({ k: "trim", instructions: "remove ums; keep breaths", snapshot: SNAP, snapshotError: null, cost: COST });
+    expect(out).toEqual({ k: "trim", instructions: "remove ums; keep breaths", snapshot: SNAP, snapshotError: null, cost: COST, runId: "r1" });
     expect(w.snaps()).toBe(1);
     expect(w.posted.map((p) => p.kind)).toEqual(["start"]);
     expect(w.agent.isOpen()).toBe(false);

@@ -39,6 +39,16 @@ class ClaudeError(LLMError):
     pass
 
 
+KEY_REJECTED = "Your key was rejected — check the secret, or sign in again in Settings."
+
+
+class KeyRejected(ClaudeError):
+    """Anthropic refused the API key (401): the user fixes the secret or signs in again."""
+
+    def __init__(self):
+        super().__init__(KEY_REJECTED)
+
+
 def provider() -> str:
     """Which Claude endpoint: `anthropic` or `vertex`. GENIUSCUT_LLM_PROVIDER wins when it names one."""
     chosen = (os.environ.get("GENIUSCUT_LLM_PROVIDER") or "").strip().lower()
@@ -110,7 +120,7 @@ def _api_errors():
     try:
         yield
     except anthropic.AuthenticationError as e:
-        raise ClaudeError(f"The Anthropic API key was rejected: {_api_message(e)}") from e
+        raise KeyRejected() from e
     except anthropic.RateLimitError as e:
         raise ClaudeError(f"Anthropic is rate-limiting requests; try again shortly. {_api_message(e)}") from e
     except anthropic.APIStatusError as e:

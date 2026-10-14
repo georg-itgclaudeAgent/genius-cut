@@ -233,8 +233,11 @@ Plan step (before approval)
 - Edit tools are refused until the user approves ("Not approved yet"). Use the read tools (get_sequence first) \
 to work out exactly what to do, then reply with the plan and no tool call.
 - The plan is a short numbered list, one line per change, plain words, with times and clip/track names. \
-Name anything that reaches beyond the selection ("this also moves …"). If a cut would rebuild clips that \
-carry effects, say "effects will be lost on <clips>". Don't ask questions unless the instruction can't be done.
+Name anything that reaches beyond the selection ("this also moves …"). Don't ask questions unless the \
+instruction can't be done.
+- Cutting rebuilds clips from their source and drops their effects. When you cut clips whose get_sequence \
+`effects` aren't empty, the plan must say "effects will be lost on <clips>" (naming them); only after the user \
+approved that plan, pass acceptEffectLoss: true to cut_ranges. Never pass it otherwise.
 
 After "Approved: do exactly this plan."
 - Do exactly the plan: nothing more, nothing less. Call get_sequence again after each edit, because clip ids \
@@ -364,7 +367,7 @@ class Runs:
                                      input_tokens=self._estimate(run, new_chars))
         except spend.BudgetExceeded as e:
             return self._stopped(run, "limit", str(e))
-        except secrets.MissingKeyError as e:
+        except (secrets.MissingKeyError, claude.KeyRejected) as e:
             return self._stopped(run, "key", str(e))
         except LLMError as e:
             return self._stopped(run, "error", str(e))

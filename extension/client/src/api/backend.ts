@@ -58,7 +58,9 @@ export function createBackend({ transport, token }: { transport: Transport; toke
   return {
     health: () => call<Health>("GET", "/health", { auth: false, timeoutMs: 2000 }),
     // 2 hours: a 90-minute clip takes ~12 min on the GPU and far longer if it falls back to the CPU.
-    trim: (req: TrimRequest) => call<TrimResponse>("POST", "/trim", { body: req, timeoutMs: 2 * 60 * 60_000 }),
+    // runId: the agent run that handed this trim over (propose_filler_cuts); its spend rows carry that run's id.
+    trim: (req: TrimRequest, runId?: string) =>
+      call<TrimResponse>("POST", "/trim", { body: runId ? { ...req, run_id: runId } : req, timeoutMs: 2 * 60 * 60_000 }),
     library: () => call<Library>("GET", "/library"),
     addExample: (raw_words: Word[], final_text: string, source_clip: string) =>
       call<StyleExample>("POST", "/library/examples", { body: { raw_words, final_text, source_clip } }),

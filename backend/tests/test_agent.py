@@ -354,3 +354,45 @@ def test_the_first_step_is_gated_too(tmp_path):
     c, auth = app(tmp_path, fake)
     body = start(c, auth).json()
     assert body["state"] == "stopped" and body["reason"] == "limit" and fake.calls == []
+
+# ── a rejected key, effect loss ────────────────────────────────────
+
+KEY_REJECTED = "Your key was rejected — check the secret, or sign in again in Settings."
+
+
+def _auth_error():
+    import anthropic
+    import httpx
+    req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    body = {"type": "error", "error": {"type": "authentication_error", "message": "invalid x-api-key"}}
+    return anthropic.AuthenticationError("invalid x-api-key", response=httpx.Response(401, request=req, json=body),
+                                         body=body)
+
+
+class RejectingClient:
+    """client.beta.messages.stream / create raise what the Anthropic SDK raises for a bad key."""
+
+    def __init__(self):
+        def boom(**kw):
+            raise _auth_error()
+        self.beta = SimpleNamespace(messages=SimpleNamespace(stream=boom, create=boom))
+
+
+def test_a_rejected_key_stops_the_run_with_the_plain_message(tmp_path):
+    c, auth = app(tmp_path, RejectingClient())
+    body = start(c, auth).json()
+    assert body["state"] == "stopped" and body["reason"] == "key"
+    assert body["message"] == KEY_REJECTED
+
+
+def test_cut_ranges_offers_accept_effect_loss_as_the_panel_and_mcp_do():
+    cut = next(t for t in agent.TOOLS if t["name"] == "cut_ranges")["input_schema"]
+    assert cut["properties"]["acceptEffectLoss"]["type"] == "boolean"
+    assert "acceptEffectLoss" not in cut["required"]
+
+
+def test_the_system_prompt_ties_effect_loss_to_the_approved_plan():
+    s = " ".join(agent.SYSTEM.split())
+    assert "whose get_sequence `effects` aren't empty" in s
+    assert 'the plan must say "effects will be lost on <clips>"' in s
+    assert "only after the user approved that plan, pass acceptEffectLoss: true to cut_ranges" in s

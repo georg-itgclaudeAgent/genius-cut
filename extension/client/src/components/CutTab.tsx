@@ -94,6 +94,7 @@ export function CutTab({ health, ready, agent, onTrimmed }: {
   // run's cost so far joins the trim's on the review's cost line.
   const trimPrompt = useRef(instruction);
   const runCost = useRef<RunCost | null>(null);
+  const runId = useRef<string | undefined>(undefined);
 
   /** The one button: Claude decides whether this is a filler trim (today's review) or a timeline edit (plan, Go). */
   async function send() {
@@ -115,6 +116,7 @@ export function CutTab({ health, ready, agent, onTrimmed }: {
     if (found.problems.length) return go({ k: "error", message: found.problems.join(" ") });
     trimPrompt.current = out.instructions;
     runCost.current = out.cost;
+    runId.current = out.runId || undefined;
     const choice = audioChoice(found, recalledAudio(found.sequenceId));
     if (choice.kind === "ask") return go({ k: "choosing", snap: found, preselect: choice.preselect });
     await run(found, choice.sources);
@@ -158,7 +160,7 @@ export function CutTab({ health, ready, agent, onTrimmed }: {
     const mine = epoch.current;
     try {
       // The refresh isn't awaited: the review shouldn't wait on /health.
-      const trimmed = await whileBusy(() => afterTrimRefresh(() => runtime.backend.trim(trimRequestFor(found, sources, trimPrompt.current)),
+      const trimmed = await whileBusy(() => afterTrimRefresh(() => runtime.backend.trim(trimRequestFor(found, sources, trimPrompt.current), runId.current),
         async () => { aiWatch.current?.refresh(); }));
       if (epoch.current !== mine) return;
       const res = runCost.current ? { ...trimmed, cost: addCosts(runCost.current, trimmed.cost) } : trimmed;

@@ -36,7 +36,9 @@ export interface UndoTarget { sequenceId: string; turnId: string }
 
 export type Outcome =
   | { k: "plan"; text: string; cost: RunCost | null }
-  | { k: "trim"; instructions: string; snapshot: Snapshot | NotFound | null; snapshotError: string | null; cost: RunCost | null }
+  | { k: "trim"; instructions: string; snapshot: Snapshot | NotFound | null; snapshotError: string | null; cost: RunCost | null;
+      /** The closed run's id: the trim's spend rows carry it, so Usage shows the run and its trim as one. */
+      runId: string }
   | { k: "finished"; state: "done" | "stopped" | "cancelled" | "lost" | "error"; text: string; message: string | null;
       lines: ActionLine[]; cost: RunCost | null; undo: UndoTarget | null };
 
@@ -149,7 +151,7 @@ export function createAgent(deps: AgentDeps) {
         if (trim) {
           // The backend closed the run; nothing is posted back.
           finish("done", reply.text, null);
-          return { k: "trim", instructions: String(trim.input?.instructions ?? ""), snapshot: trimSnap, snapshotError: trimError, cost };
+          return { k: "trim", instructions: String(trim.input?.instructions ?? ""), snapshot: trimSnap, snapshotError: trimError, cost, runId };
         }
         const results: AgentToolResult[] = [];
         for (const c of reply.tool_calls) {

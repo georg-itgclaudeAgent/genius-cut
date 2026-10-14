@@ -86,7 +86,7 @@ def run_trim(
 ) -> TrimResponse:
     duration = req.duration_s
     words, env = transcribe_range(req, transcriber, extract=extract, place=place, mix=mix)
-    with spend.meter(kind="trim") as m:
+    with spend.meter(kind="trim", run=req.run_id) as m:
         cut_spans = propose(words, library.build_fewshot(library_dir), req.prompt)
     cut_spans = refine(cut_spans, words, duration, env=env)
     if req.cut_pauses:

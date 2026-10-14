@@ -3,6 +3,7 @@
 - `anthropic_key`: where the Anthropic API key lives, in the editor's OWN Google Cloud
   project's Secret Manager (`project`, `secret`, `version`). Read by `secrets.py`.
 - `monthly_limit_usd`: 20 (default) or 100, the spend gate's limit (`spend.py`).
+- `setup_complete`: the Setup screen is done; only a passing key test sets it.
 
 Loading never fails: a missing or corrupt file means defaults, and a single bad field
 falls back to its default without losing the others.
@@ -19,9 +20,11 @@ from geniuscut import config
 LIMITS = (20, 100)
 DEFAULT_LIMIT = 20
 
-# gcloud gets these as argv elements; they must not be able to look like a flag.
-_PROJECT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:_-]*$")  # incl. domain-scoped "example.com:proj"
-_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]*$")       # secret IDs and version numbers/aliases
+# gcloud gets these as argv elements, and `gcloud.cmd` passes them through cmd.exe: the spec's
+# patterns (2026-10-14), plus no leading "-" on a secret, so nothing can look like a flag.
+_PROJECT = re.compile(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$")
+_SECRET = re.compile(r"^(?!-)[A-Za-z0-9_-]{1,255}$")
+_VERSION = re.compile(r"^(latest|[0-9]+)$")
 
 
 class KeySource(BaseModel):
@@ -33,16 +36,29 @@ class KeySource(BaseModel):
 class Settings(BaseModel):
     anthropic_key: KeySource = KeySource()
     monthly_limit_usd: Literal[20, 100] = DEFAULT_LIMIT
+    setup_complete: bool = False  # set only by a passing POST /settings/test-key
+
+
+def validate_project(project: str) -> None:
+    if not isinstance(project, str) or not _PROJECT.fullmatch(project):
+        raise ValueError("Enter the Google Cloud project ID that holds your Anthropic key.")
+
+
+def validate_secret(secret: str) -> None:
+    if not isinstance(secret, str) or not _SECRET.fullmatch(secret):
+        raise ValueError("The secret name may only contain letters, digits, '_' and '-'.")
+
+
+def validate_version(version: str) -> None:
+    if not isinstance(version, str) or not _VERSION.fullmatch(version):
+        raise ValueError("The secret version must be 'latest' or a version number.")
 
 
 def validate_key_source(src: KeySource) -> None:
     """Raise ValueError unless `src` names a project, secret and version gcloud can safely take."""
-    if not _PROJECT.match(src.project.strip()):
-        raise ValueError("Enter the Google Cloud project ID that holds your Anthropic key.")
-    if not _NAME.match(src.secret):
-        raise ValueError("The secret name may only contain letters, digits, '_' and '-'.")
-    if not _NAME.match(src.version):
-        raise ValueError("The secret version must be 'latest' or a version number.")
+    validate_project(src.project.strip())
+    validate_secret(src.secret)
+    validate_version(src.version)
 
 
 def validate_for_save(s: Settings) -> None:

@@ -15,6 +15,7 @@ import logging
 import math
 import os
 import threading
+import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -128,14 +129,22 @@ def tagged(kind: str):
         _kind.reset(token)
 
 
+_run: ContextVar[str | None] = ContextVar("geniuscut_spend_run", default=None)
+
+
 @contextmanager
-def meter(kind: str = "other"):
-    m = Meter(kind=kind)
+def meter(kind: str = "other", *, run: str | None = None, m: Meter | None = None):
+    """Collect the calls made inside the block. Their ledger rows share one run id (`run`, else the
+    enclosing block's, else a new one), so the Usage tab shows a multi-call run as one run. Pass an
+    existing Meter as `m` to keep adding to it (an agent run's steps)."""
+    m = m or Meter(kind=kind)
     token = _current.set(m)
+    run_token = _run.set(run or _run.get() or uuid.uuid4().hex)
     try:
         with tagged(kind):
             yield m
     finally:
+        _run.reset(run_token)
         _current.reset(token)
 
 
@@ -161,6 +170,8 @@ def record(model: str, input_tokens: int, output_tokens: int, *, now: datetime |
     row = {"ts": now.astimezone(timezone.utc).isoformat(timespec="seconds"), "model": model,
            "kind": _kind.get(), "input_tokens": input_tokens, "output_tokens": output_tokens,
            "usd": usd}
+    if _run.get():
+        row["run"] = _run.get()
     try:
         path = ledger_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -194,10 +205,16 @@ def month_total(now: datetime | None = None) -> float:
     this_month = (now.year, now.month)
     with _unwritten_lock:
         total = sum(usd for ts, usd in _unwritten if (ts.year, ts.month) == this_month)
+    return total + sum(usd for _row, _ts, usd in _month_rows(now))
+
+
+def _month_rows(now: datetime):
+    """(row, UTC time, usd) for each readable ledger row of `now`'s UTC month, in file order."""
+    this_month = (now.year, now.month)
     try:
         lines = ledger_path().read_bytes().splitlines()
     except FileNotFoundError:
-        return total
+        return
     for line in lines:
         try:
             row = json.loads(line.decode("utf-8"))
@@ -209,8 +226,30 @@ def month_total(now: datetime | None = None) -> float:
                 log.warning("Skipping a corrupt spend ledger line: %s", e)
             continue
         if (ts.year, ts.month) == this_month:
-            total += usd
-    return total
+            yield row, ts, usd
+
+
+def usage(now: datetime | None = None, last: int = 10) -> dict:
+    """The Usage & limit tab: this month's spend, the limit, the reset day and the last runs.
+    Rows sharing a run id are one run (an agent run's steps, a trim's calls); a row with none
+    is a run of its own. Runs are newest first, by their latest row."""
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    runs: dict[str, dict] = {}
+    for i, (row, ts, usd) in enumerate(_month_rows(now)):
+        key = str(row.get("run") or f"row-{i}")
+        r = runs.get(key)
+        if r is None:
+            r = runs[key] = {"at": ts.isoformat(timespec="seconds"), "kind": str(row.get("kind", "other")),
+                             "model": str(row.get("model", "")), "usd": None, "_last": ts}
+        r["model"], r["_last"] = str(row.get("model", r["model"])), max(r["_last"], ts)
+        if row.get("usd") is not None:
+            r["usd"] = round((r["usd"] or 0.0) + usd, 6)
+    ordered = sorted(runs.values(), key=lambda r: r["_last"], reverse=True)
+    year, month = (now.year + 1, 1) if now.month == 12 else (now.year, now.month + 1)
+    return {"month_usd": round(month_total(now), 6), "limit_usd": limit_usd(),
+            "limit_tier": settings.load().monthly_limit_usd, "resets_on": date(year, month, 1).isoformat(),
+            "run_count": len(ordered),
+            "runs": [{k: v for k, v in r.items() if k != "_last"} for r in ordered[:last]]}
 
 
 def limit_usd() -> float:

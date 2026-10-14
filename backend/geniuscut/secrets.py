@@ -18,11 +18,18 @@ value replaces the cache.
 
 import ctypes
 import os
-import shutil
 import subprocess
 from typing import Callable
 
-from geniuscut import config, settings
+from geniuscut import config, settings, setup
+
+# Whether the Anthropic key last handed out was the cached copy (Secret Manager didn't answer,
+# usually an expired gcloud login): /health shows it so Settings can say so.
+_from_cache = False
+
+
+def key_from_cache() -> bool:
+    return _from_cache
 
 GSM_PROJECT = "agent-georg"
 ANTHROPIC_ENV = "ANTHROPIC_API_KEY"
@@ -88,13 +95,18 @@ def _load_cached(name: str, tag: str = "") -> str | None:
 
 def _gsm(secret: str, project: str, version: str, run: Callable, gcloud: str | None) -> tuple[str | None, str]:
     """(key, None-or-why-not) from Secret Manager; the key never goes into the reason."""
-    gcloud = gcloud or shutil.which("gcloud") or shutil.which("gcloud.cmd")
+    gcloud = gcloud or setup.find_gcloud()  # PATH or the standard install paths (fresh installs)
     if not gcloud:
         return None, "gcloud is not installed"
-    result = run(
-        [gcloud, "secrets", "versions", "access", version, f"--secret={secret}", f"--project={project}"],
-        capture_output=True, text=True,
-    )
+    try:
+        result = run(
+            [gcloud, "secrets", "versions", "access", version, f"--secret={secret}", f"--project={project}"],
+            capture_output=True, text=True, timeout=setup.GCLOUD_TIMEOUT_S, **setup.quiet(),
+        )
+    except subprocess.TimeoutExpired:
+        return None, f"gcloud didn't answer within {setup.GCLOUD_TIMEOUT_S} s"
+    except OSError as e:
+        return None, f"gcloud couldn't start: {e}"
     if result.returncode == 0 and result.stdout.strip():
         return result.stdout.strip(), ""
     return None, (result.stderr or "no output").strip()
@@ -123,9 +135,11 @@ def anthropic_api_key(run: Callable = subprocess.run, gcloud: str | None = None,
                       source: "settings.KeySource | None" = None, *, fresh_only: bool = False) -> str:
     """The Anthropic key: env, else the editor's own Secret Manager (from settings, or `source`),
     else the cached copy of that same secret. `fresh_only` skips env and cache (the setup test)."""
+    global _from_cache
     if not fresh_only:
         key = os.environ.get(ANTHROPIC_ENV, "").strip()
         if key:
+            _from_cache = False
             return key
     src = source or settings.load().anthropic_key
     project = src.project.strip()
@@ -134,13 +148,20 @@ def anthropic_api_key(run: Callable = subprocess.run, gcloud: str | None = None,
             "No Anthropic API key is set up. Finish Genius Cut setup: enter the Google Cloud project "
             "whose Secret Manager holds your Anthropic API key."
         )
+    try:  # a hand-edited settings.json must not reach cmd.exe
+        settings.validate_key_source(src)
+    except ValueError as e:
+        raise MissingKeyError(f"{e} Check it in Genius Cut setup.") from e
     tag = f"{project}/{src.secret}/{src.version}"
     key, detail = _gsm(src.secret, project, src.version, run, gcloud)
     if key:
         _save_cached("anthropic_key", key, tag)
+        if not fresh_only:
+            _from_cache = False
         return key
     cached = None if fresh_only else _load_cached("anthropic_key", tag)
     if cached:
+        _from_cache = True
         return cached
     raise MissingKeyError(
         f"Couldn't read the Anthropic API key (secret {src.secret}, version {src.version}) from "

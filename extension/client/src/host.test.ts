@@ -2162,12 +2162,21 @@ describe("gcutToolGetSequence: the active sequence for Claude", () => {
       { kind: "audio", index: 1, name: "Audio 1", muted: false }, { kind: "audio", index: 2, name: "Audio 2", muted: true },
       { kind: "audio", index: 3, name: "Audio 3", muted: false }]);
     expect(r.clips).toEqual([
-      { id: idOf("V1", 100, "node-a"), track: "V1", name: "Camera A.mov", startS: 100, endS: 110, inS: 10, source: "D:/Footage/Camera A.mov", selected: true, enabled: true },
-      { id: idOf("V2", 100.24, "node-b"), track: "V2", name: "Camera B.mov", startS: 100.24, endS: 109.84, inS: 30, source: "D:/Footage/Camera B.mov", selected: true, enabled: false },
-      { id: idOf("V3", 100.28, "node-r"), track: "V3", name: "Restream.mov", startS: 100.28, endS: 110, inS: 5, source: "D:/Footage/Restream.mov", selected: true, enabled: true },
-      { id: idOf("V4", 112, "node-t"), track: "V4", name: "Title", startS: 112, endS: 115, inS: 0, source: "D:/Footage/Title", selected: false, enabled: true },
-      { id: idOf("A1", 99, "node-m"), track: "A1", name: "mic.wav", startS: 99, endS: 111, inS: 50, source: "D:/Footage/mic.wav", selected: true, enabled: true }]);
+      { id: idOf("V1", 100, "node-a"), track: "V1", name: "Camera A.mov", startS: 100, endS: 110, inS: 10, source: "D:/Footage/Camera A.mov", selected: true, enabled: true, effects: [] },
+      { id: idOf("V2", 100.24, "node-b"), track: "V2", name: "Camera B.mov", startS: 100.24, endS: 109.84, inS: 30, source: "D:/Footage/Camera B.mov", selected: true, enabled: false, effects: [] },
+      { id: idOf("V3", 100.28, "node-r"), track: "V3", name: "Restream.mov", startS: 100.28, endS: 110, inS: 5, source: "D:/Footage/Restream.mov", selected: true, enabled: true, effects: [] },
+      { id: idOf("V4", 112, "node-t"), track: "V4", name: "Title", startS: 112, endS: 115, inS: 0, source: "D:/Footage/Title", selected: false, enabled: true, effects: [] },
+      { id: idOf("A1", 99, "node-m"), track: "A1", name: "mic.wav", startS: 99, endS: 111, inS: 50, source: "D:/Footage/mic.wav", selected: true, enabled: true, effects: [] }]);
     expect(r.selection).toEqual([idOf("V1", 100, "node-a"), idOf("V2", 100.24, "node-b"), idOf("V3", 100.28, "node-r"), idOf("A1", 99, "node-m")]);
+  });
+
+  it("names each clip's effects, leaving out the intrinsic ones (Motion, Opacity, Volume...)", () => {
+    const s = georgScene();
+    s.v1.addEffect("Lumetri Color");
+    s.a1.addEffect("DeNoise");
+    s.a1.addEffect("Lumetri Color");
+    const fx = Object.fromEntries(getSeq(s).clips.map((c: any) => [c.track, c.effects]));
+    expect(fx).toEqual({ V1: ["Lumetri Color"], V2: [], V3: [], V4: [], A1: ["DeNoise", "Lumetri Color"] });
   });
 
   it("lists sequence markers with their guid as id, range, name, comments and colour", () => {
@@ -2443,6 +2452,44 @@ describe("gcutToolCutRanges: timeline ranges cut from chosen clips with Apply's 
       expect(() => cutTool(s, ids, ranges ?? RANGES, seqId)).toThrow(msg);
       expect(allTracks(s.seq)).toEqual(before);
       expect(s.seq.bin.map((pi: ProjectItem) => [pi.inS, pi.outS])).toEqual(pis);
+    });
+  });
+
+  describe("effects: the rebuild doesn't keep them, so the user must agree first", () => {
+    function withEffects() {
+      const s = georgScene();
+      s.v2.addEffect("Lumetri Color");
+      s.a1.addEffect("DeNoise");
+      return s;
+    }
+
+    it("refuses, changing nothing, naming each chosen clip and its effects", () => {
+      const s = withEffects(), before = allTracks(s.seq);
+      expect(() => cutTool(s, getSeq(s).selection, RANGES)).toThrow(
+        "Cutting rebuilds the clips from their source, so these effects would be removed: V2 (Camera B.mov): Lumetri Color; " +
+        "A1 (mic.wav): DeNoise. Nothing was changed. Ask the user; only if they agree, call cut_ranges again with acceptEffectLoss: true.");
+      expect(allTracks(s.seq)).toEqual(before);
+    });
+
+    it("ignores effects on clips it wasn't given", () => {
+      const s = withEffects();
+      const ids = getSeq(s).clips.filter((c: any) => c.track === "V1").map((c: any) => c.id);
+      s.seq.audioTracks[0].items = []; // V1 has no sound of its own here; keep A1 out of the way
+      expect(cutTool(s, ids, [{ fromS: 104, toS: 105 }])).toMatchObject({ ok: true, clipCount: 1 });
+    });
+
+    it("with acceptEffectLoss: true, cuts (and undo still puts every clip back)", () => {
+      const s = withEffects(), original = allTracks(s.seq);
+      const r = s.host.call("gcutToolCutRanges", { sequenceId: "seq-1", clipIds: getSeq(s).selection, ranges: RANGES, acceptEffectLoss: true });
+      expect(r).toMatchObject({ ok: true, cutCount: 2, clipCount: 4 });
+      expect(undoTool(s, asStored(r.undo))).toEqual({ ok: true });
+      expect(allTracks(s.seq)).toEqual(original);
+    });
+
+    it("anything but true is no agreement", () => {
+      const s = withEffects();
+      expect(() => s.host.call("gcutToolCutRanges", { sequenceId: "seq-1", clipIds: getSeq(s).selection, ranges: RANGES, acceptEffectLoss: "yes" }))
+        .toThrow(/acceptEffectLoss/);
     });
   });
 

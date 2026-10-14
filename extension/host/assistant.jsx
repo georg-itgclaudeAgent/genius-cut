@@ -73,6 +73,13 @@ function gcutClipInS(kind, it, clock) {
     return reported;
 }
 
+/** The clip's effects, by name, without the intrinsic ones (Motion, Opacity, Volume...): what a cut's rebuild drops. */
+function gcutClipEffects(kind, it) {
+    var fx = [];
+    gcutEffects(it, kind === "audio" ? GCUT_AUDIO_INTRINSIC : GCUT_VIDEO_INTRINSIC, fx);
+    return fx;
+}
+
 /** The sequence's markers, in timeline order. */
 function gcutMarkerList(seq) {
     var out = [], m = seq.markers.getFirstMarker();
@@ -91,7 +98,7 @@ function gcutMarkerRecord(m) {
 /**
  * args: { fromS?, toS? } — limits the clips and markers to those overlapping that stretch.
  * Returns { sequenceId, name, fps, durationS, tracks: [{kind, index, name, muted}], clips: [{id, track,
- * name, startS, endS, inS (a loose clip's true one, gcutClipInS), source, selected, enabled}], markers: [{id, startS, endS, name, comments,
+ * name, startS, endS, inS (a loose clip's true one, gcutClipInS), source, selected, enabled, effects (gcutClipEffects)}], markers: [{id, startS, endS, name, comments,
  * colour}], selection: [clip ids] }. Track index and clip track are 1-based, as Premiere shows them.
  */
 function gcutToolGetSequence(argsJson) {
@@ -112,7 +119,8 @@ function gcutToolGetSequence(argsJson) {
                 if ((fromT !== null && e <= fromT) || (toT !== null && s >= toT)) continue;
                 var id = gcutClipId(kind, tr.index, it), sel = typeof it.isSelected === "function" && !!it.isSelected();
                 out.clips.push({ id: id, track: tr.label, name: String(it.name), startS: s / GCUT_TICKS, endS: e / GCUT_TICKS,
-                                 inS: gcutClipInS(kind, it, clock), source: gcutSource(it), selected: sel, enabled: it.disabled !== true });
+                                 inS: gcutClipInS(kind, it, clock), source: gcutSource(it), selected: sel, enabled: it.disabled !== true,
+                                 effects: gcutClipEffects(kind, it) });
                 if (sel) out.selection.push(id);
             }
         }
@@ -275,11 +283,13 @@ function gcutRehydrate(record) {
 }
 
 /**
- * args: { sequenceId, clipIds, ranges: [{fromS, toS}] } — cut these sequence-time ranges out of the
+ * args: { sequenceId, clipIds, ranges: [{fromS, toS}], acceptEffectLoss? } — cut these sequence-time ranges out of the
  * chosen clips (ids from get_sequence), with Apply's engine and guarantees: the clips are found and
  * checked as Apply finds its recorded ones (locked tracks, speed, loose sources, audio from video
  * files), Apply's pre-checks refuse what the rebuild would overwrite, and the cut is all or nothing.
- * The ranges are clipped to the chosen clips' span [earliest start, latest end]. Returns { ok,
+ * The ranges are clipped to the chosen clips' span [earliest start, latest end]. The rebuild drops the
+ * clips' effects, so, as Apply makes the user acknowledge them, any on a chosen clip refuse the cut
+ * unless acceptEffectLoss is true. Returns { ok,
  * cutCount, clipCount, removedS, crossfades, warning?, undo } (undo: gcutCutRecord). Never touches
  * the Apply/Restore stash.
  */
@@ -310,6 +320,17 @@ function gcutToolCutRanges(argsJson) {
             gcutCovers(seq, found, cutsT, clock);
         } catch (pre) {
             throw gcutToolAdvice(pre);
+        }
+        if (args.acceptEffectLoss !== true) {
+            var lost = [];
+            for (k = 0; k < chosen.length; k++) {
+                var fx = gcutClipEffects(chosen[k].kind, chosen[k].item);
+                if (fx.length) lost.push(gcutLabel(chosen[k].kind, chosen[k].trackIndex) + " (" + chosen[k].item.name + "): " + fx.join(", "));
+            }
+            if (lost.length) {
+                throw new Error("Cutting rebuilds the clips from their source, so these effects would be removed: " + lost.join("; ") +
+                    ". Nothing was changed. Ask the user; only if they agree, call cut_ranges again with acceptEffectLoss: true.");
+            }
         }
         var rebuiltEndT = span.fromT;
         for (k = 0; k < found.length; k++) rebuiltEndT = Math.max(rebuiltEndT, gcutNewEnd(found[k], cutsT));

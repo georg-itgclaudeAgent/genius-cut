@@ -124,6 +124,19 @@ test("tools/list offers exactly the Phase 1 tools with schemas written for Claud
   assert.equal(byName.cut_ranges.annotations.readOnlyHint, false);
 }));
 
+test("cut_ranges warns that effects are lost: acceptEffectLoss only after the user agreed; keyframes and gain are rebuilt", () => withSetup(async ({ mcp }) => {
+  const { tools } = (await mcp.request("tools/list", {})).result;
+  const byName = Object.fromEntries(tools.map((t) => [t.name, t]));
+  const flag = byName.cut_ranges.inputSchema.properties.acceptEffectLoss;
+  assert.equal(flag.type, "boolean");
+  assert.match(flag.description, /only after the user agreed/);
+  assert.ok(!byName.cut_ranges.inputSchema.required.includes("acceptEffectLoss"));
+  assert.match(byName.cut_ranges.description, /acceptEffectLoss/);
+  assert.match(byName.cut_ranges.description, /keyframes/);
+  assert.match(byName.cut_ranges.description, /gain/);
+  assert.match(byName.get_sequence.description, /effects/);
+}));
+
 test("tools/call forwards name, args and client to the bridge with the token, and returns the result", () => withSetup(async ({ bridge, mcp }) => {
   const reply = await mcp.call("add_markers", { sequenceId: "s1", markers: [{ atS: 30005, name: "test" }] });
   assert.equal(bridge.calls.length, 1);

@@ -45,9 +45,9 @@ const TOOLS = [
     name: "get_sequence",
     description:
       "Read the active Premiere sequence: sequenceId, name, fps, durationS, tracks [{kind, index, name, muted}], " +
-      "clips [{id, track, name, startS, endS, inS, source, selected, enabled}], markers [{id, startS, endS, name, " +
+      "clips [{id, track, name, startS, endS, inS, source, selected, enabled, effects}], markers [{id, startS, endS, name, " +
       "comments, colour}] and selection (ids of the selected clips). All times are seconds on the sequence timeline " +
-      "(inS is the clip's in point in its source). Track and clip numbering is 1-based, as Premiere shows it (V1, A2). " +
+      "(inS is the clip's in point in its source; effects names the clip's added effects, which cut_ranges would remove). Track and clip numbering is 1-based, as Premiere shows it (V1, A2). " +
       "Call this first, and again after every edit: clip ids change when clips are cut or moved. " +
       "Optional fromS/toS list only the clips and markers overlapping that stretch.",
     inputSchema: {
@@ -132,7 +132,10 @@ const TOOLS = [
       "every chosen track is cut in sync, the result is verified, and it is all or nothing. clipIds are ids from " +
       "get_sequence (include the linked audio clips you want cut too; unchosen clips that would be overwritten make " +
       "the call refuse). ranges are [{fromS, toS}] in seconds on the sequence timeline, clipped to the chosen clips' " +
-      "span. " + STALE + " Undo with undo_last_turn.",
+      "span. Cutting rebuilds the chosen clips from their source: effects on them (get_sequence lists them) are removed, " +
+      "so the call refuses, naming them, unless acceptEffectLoss is true; tell the user and set it only after they agree. " +
+      "Intrinsic keyframes (Motion, Opacity, Volume) and audio gain are not kept either: they are rebuilt from the source. " +
+      STALE + " Undo with undo_last_turn.",
     inputSchema: {
       type: "object",
       properties: {
@@ -150,6 +153,10 @@ const TOOLS = [
             required: ["fromS", "toS"],
             additionalProperties: false,
           },
+        },
+        acceptEffectLoss: {
+          type: "boolean",
+          description: "Set true only after the user agreed to lose the effects on the chosen clips (the refusal names them).",
         },
       },
       required: ["sequenceId", "clipIds", "ranges"],

@@ -4,7 +4,7 @@
  * sample-data mock.
  */
 import type {
-  GcloudStatus, GcpProject, Health, KeySource, KeyTest, Library, LoginStatus, RunCost, SecretVersion, Settings, StyleExample,
+  AgentStart, AgentStep, AgentToolResult, GcloudStatus, GcpProject, Health, KeySource, KeyTest, Library, LoginStatus, RunCost, SecretVersion, Settings, StyleExample,
   TranscriptJob, TranscriptRequest, TrimRequest, TrimResponse, Usage, Word,
 } from "./types";
 
@@ -38,6 +38,8 @@ function detailOf(body: string): string {
 
 /** Longer than the backend's own 60 s gcloud timeout, so its error message gets through. */
 const GCLOUD_MS = 90_000;
+/** One agent step (spec: panel HTTP timeout per step 5 min). */
+const STEP_MS = 5 * 60_000;
 
 export function createBackend({ transport, token }: { transport: Transport; token: () => string }) {
   async function call<T>(method: Method, path: string, opts: { auth?: boolean; body?: unknown; timeoutMs?: number } = {}) {
@@ -81,6 +83,13 @@ export function createBackend({ transport, token }: { transport: Transport; toke
     versions: (project: string, secret: string) => call<{ versions: SecretVersion[] }>("GET",
       `/setup/versions?project=${encodeURIComponent(project)}&secret=${encodeURIComponent(secret)}`, { timeoutMs: GCLOUD_MS }),
     usage: () => call<Usage>("GET", "/usage"),
+
+    // Agent runs: each call is one Claude step (5 minutes at most). An unknown run is a 404.
+    agentStart: (body: AgentStart) => call<AgentStep>("POST", "/agent/runs", { body, timeoutMs: STEP_MS }),
+    agentResults: (runId: string, results: AgentToolResult[]) =>
+      call<AgentStep>("POST", `/agent/runs/${encodeURIComponent(runId)}/results`, { body: { results }, timeoutMs: STEP_MS }),
+    agentApprove: (runId: string) => call<AgentStep>("POST", `/agent/runs/${encodeURIComponent(runId)}/approve`, { timeoutMs: STEP_MS }),
+    agentCancel: (runId: string) => call<{ ok: boolean }>("DELETE", `/agent/runs/${encodeURIComponent(runId)}`, { timeoutMs: 10_000 }),
   };
 }
 

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { budgetEstimate, formatTokens, formatUsd, meterFraction, modelLabel, runCostLine } from "./cost";
+import { addCosts, budgetEstimate, formatTokens, formatUsd, meterFraction, modelLabel, runCostLine } from "./cost";
 import type { AiStatus, RunCost } from "../api/types";
 
 const AI: AiStatus = { provider: "gemini", model: "gemini-3.7-flash", month_usd: 0.08, limit_usd: 2, usd_per_minute: 0.003 };
@@ -84,5 +84,17 @@ describe("run cost", () => {
     expect(meterFraction(3, 2)).toBe(1);
     expect(meterFraction(0, 0)).toBe(1);
     expect(meterFraction(-1, 2)).toBe(0);
+  });
+});
+
+describe("addCosts (an instruction run that handed over to a trim)", () => {
+  const RUN: RunCost = { model: "claude-opus-5-5", input_tokens: 3000, output_tokens: 400, usd: 0.02, month_usd: 1.0, limit_usd: 20 };
+  const TRIM: RunCost = { model: "claude-opus-5-5", input_tokens: 7000, output_tokens: 1600, usd: 0.06, month_usd: 1.06, limit_usd: 20 };
+  it("adds the trim's tokens and dollars to the run's; the month is the trim's (it came after)", () => {
+    expect(addCosts(RUN, TRIM)).toEqual({ model: "claude-opus-5-5", input_tokens: 10000, output_tokens: 2000, usd: 0.08, month_usd: 1.06, limit_usd: 20 });
+  });
+  it("is unknown if either cost is; the run's alone when the trim reports none", () => {
+    expect(addCosts(RUN, { ...TRIM, usd: null }).usd).toBeNull();
+    expect(addCosts(RUN, null)).toEqual(RUN);
   });
 });

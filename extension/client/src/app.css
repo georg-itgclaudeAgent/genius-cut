@@ -226,3 +226,13 @@ select.field { appearance: auto; }
 .seg-b + .seg-b { border-left: 1px solid var(--line); }
 .seg-b[aria-pressed="true"] { background: var(--blue); color: #fff; }
 .meter.big-meter { height: 6px; }
+
+/* Instruction runs: Claude's plan, the actions done, flags for what the plan didn't name */
+.plan-text { margin: 0; white-space: pre-wrap; font-family: var(--font); font-size: 11.5px; color: var(--text); line-height: 1.5; }
+.tick.off { background: rgba(255, 122, 81, 0.16); color: var(--coral); }
+.act-lines { display: flex; flex-direction: column; gap: 4px; margin-top: 9px; }
+.act-line { display: flex; align-items: baseline; gap: 7px; font-size: 11.5px; color: var(--text-dim); }
+.act-line .mk { width: 11px; flex: none; color: var(--blue); font-size: 10px; }
+.act-line.bad .mk, .act-line.bad .tx { color: var(--rose-text); }
+.act-line .tx { min-width: 0; overflow-wrap: anywhere; }
+.why.flag { margin-left: auto; flex: none; background: rgba(255, 122, 81, 0.16); color: var(--coral); }

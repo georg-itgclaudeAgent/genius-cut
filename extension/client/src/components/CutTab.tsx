@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { runtime } from "../api/runtime";
 import { HostUnavailable, type ApplyResult } from "../api/host";
-import type { AiStatus, Health, Snapshot, SnapshotItem, TrimResponse } from "../api/types";
+import type { AiStatus, Health, RunCost, Snapshot, SnapshotItem, TrimResponse } from "../api/types";
+import type { Agent, Outcome } from "../agent/run";
 import { afterTrimRefresh, watchAiStatus } from "../lib/aiStatus";
-import { budgetEstimate } from "../lib/cost";
-import { parseClipName, submitsPrompt } from "../lib/prompt";
+import { addCosts, budgetEstimate } from "../lib/cost";
+import { submitsPrompt } from "../lib/prompt";
 import { whileBusy } from "../lib/busy";
 import { removedSpans } from "../lib/review";
 import { audioChoice, recalledAudio, rememberAudio, snapshotSummary, trimRequestFor } from "../lib/snapshot";
@@ -12,6 +13,7 @@ import { formatDuration } from "../lib/timecode";
 import { CostEstimate } from "./Cost";
 import { AudioPicker } from "./AudioPicker";
 import { CutReview } from "./CutReview";
+import { PlanView, RunResult } from "./AgentResult";
 
 type Phase =
   | { k: "idle" }
@@ -21,7 +23,12 @@ type Phase =
   | { k: "review"; snap: Snapshot; res: TrimResponse; checked: boolean[] }
   | { k: "applying"; snap: Snapshot; res: TrimResponse; checked: boolean[] }
   | { k: "applied"; snap: Snapshot; res: TrimResponse; result: ApplyResult; gapClosed: boolean; busy: boolean }
-  | { k: "error"; message: string; snap?: Snapshot; notYet?: boolean; restorable?: boolean };
+  | { k: "error"; message: string; snap?: Snapshot; notYet?: boolean; restorable?: boolean }
+  // An instruction run (agent/run.ts): Claude reads and plans, Go, the result with Undo.
+  | { k: "asking" }
+  | { k: "plan"; text: string; cost: RunCost | null }
+  | { k: "acting"; cancelling: boolean }
+  | { k: "ran"; out: Extract<Outcome, { k: "finished" }>; undoing: boolean; undoMsg: string | null; undoBad: boolean };
 
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const errorPhase = (e: unknown, snap?: Snapshot, restorable = false): Phase =>
@@ -59,9 +66,11 @@ function Stage({ state, label }: { state: "wait" | "run" | "done"; label: string
   return <div className={`stg ${state}`}><span className="dot">{state === "done" ? "✓" : ""}</span><span>{label}</span></div>;
 }
 
-export function CutTab({ health, ready, onTrimmed }: {
+export function CutTab({ health, ready, agent, onTrimmed }: {
   health: Health | null;
   ready: boolean;
+  /** The panel's instruction runs (one per panel, sharing the tool table and undo stack with the bridge). */
+  agent: Agent;
   onTrimmed: (snap: Snapshot, res: TrimResponse, checked: boolean[]) => void;
 }) {
   const [instruction, setInstruction] = useState("trim the selected clip");
@@ -81,21 +90,65 @@ export function CutTab({ health, ready, onTrimmed }: {
   const epoch = useRef(0);
   const go = (p: Phase) => { epoch.current++; setPhase(p); };
   const snap = "snap" in phase ? phase.snap : undefined;
+  // A trim handed over by an instruction run: Claude's instructions are the trim prompt, and the
+  // run's cost so far joins the trim's on the review's cost line.
+  const trimPrompt = useRef(instruction);
+  const runCost = useRef<RunCost | null>(null);
 
-  async function analyse() {
+  /** The one button: Claude decides whether this is a filler trim (today's review) or a timeline edit (plan, Go). */
+  async function send() {
     const mine = ++epoch.current;
-    setPhase({ k: "finding" });
+    setPhase({ k: "asking" });
+    const out = await agent.send(instruction);
+    aiWatch.current?.refresh();
+    if (epoch.current === mine) await handle(out);
+  }
+
+  async function handle(out: Outcome) {
+    if (out.k === "plan") return go({ k: "plan", text: out.text, cost: out.cost });
+    if (out.k === "finished") return go({ k: "ran", out, undoing: false, undoMsg: null, undoBad: false });
+    // propose_filler_cuts: today's Analyse on the selection recorded at send.
+    const found = out.snapshot;
+    if (out.snapshotError || !found) return go({ k: "error", message: out.snapshotError ?? "No clip is selected in the timeline." });
+    if (!found.found) return go({ k: "error", message: found.message });
+    // Problems (no audio, speed-changed, out of sync...) stop here, before any audio is chosen.
+    if (found.problems.length) return go({ k: "error", message: found.problems.join(" ") });
+    trimPrompt.current = out.instructions;
+    runCost.current = out.cost;
+    const choice = audioChoice(found, recalledAudio(found.sequenceId));
+    if (choice.kind === "ask") return go({ k: "choosing", snap: found, preselect: choice.preselect });
+    await run(found, choice.sources);
+  }
+
+  async function approve() {
+    if (phase.k !== "plan") return;
+    const mine = ++epoch.current;
+    setPhase({ k: "acting", cancelling: false });
+    const out = await agent.go();
+    aiWatch.current?.refresh();
+    if (epoch.current === mine) await handle(out);
+  }
+
+  async function cancelRun() {
+    if (phase.k === "acting") {
+      setPhase({ ...phase, cancelling: true }); // approve() gets the cancelled outcome when the step returns
+      await agent.cancel();
+      return;
+    }
+    const out = await agent.cancel();
+    if (out) await handle(out); else go({ k: "idle" });
+  }
+
+  async function undoRun() {
+    if (phase.k !== "ran" || !phase.out.undo || phase.undoing) return;
+    const start = phase, mine = ++epoch.current;
+    setPhase({ ...start, undoing: true });
     try {
-      const found = await whileBusy(() => runtime.host.snapshotSelection(parseClipName(instruction)));
-      if (epoch.current !== mine) return;
-      if (!found.found) return go({ k: "error", message: found.message });
-      // Problems (no audio, speed-changed, out of sync...) stop here, before any audio is chosen.
-      if (found.problems.length) return go({ k: "error", message: found.problems.join(" ") });
-      const choice = audioChoice(found, recalledAudio(found.sequenceId));
-      if (choice.kind === "ask") return go({ k: "choosing", snap: found, preselect: choice.preselect });
-      await run(found, choice.sources);
+      const said = await whileBusy(() => agent.undo(start.out.undo!));
+      if (epoch.current === mine) setPhase({ ...start, out: { ...start.out, undo: null }, undoing: false, undoMsg: said, undoBad: false });
     } catch (e) {
-      if (epoch.current === mine) go(errorPhase(e));
+      // Refused: nothing (or only part) was undone; the rest stays undoable.
+      if (epoch.current === mine) setPhase({ ...start, undoing: false, undoMsg: errMsg(e), undoBad: true });
     }
   }
 
@@ -105,9 +158,10 @@ export function CutTab({ health, ready, onTrimmed }: {
     const mine = epoch.current;
     try {
       // The refresh isn't awaited: the review shouldn't wait on /health.
-      const res = await whileBusy(() => afterTrimRefresh(() => runtime.backend.trim(trimRequestFor(found, sources, instruction)),
+      const trimmed = await whileBusy(() => afterTrimRefresh(() => runtime.backend.trim(trimRequestFor(found, sources, trimPrompt.current)),
         async () => { aiWatch.current?.refresh(); }));
       if (epoch.current !== mine) return;
+      const res = runCost.current ? { ...trimmed, cost: addCosts(runCost.current, trimmed.cost) } : trimmed;
       const checked = res.cuts.map(() => true);
       setPhase({ k: "review", snap: found, res, checked });
       onTrimmed(found, res, checked);
@@ -175,12 +229,13 @@ export function CutTab({ health, ready, onTrimmed }: {
   }
 
   const working = phase.k === "finding" || phase.k === "analysing";
+  const inRun = phase.k === "asking" || phase.k === "plan" || phase.k === "acting" || (phase.k === "ran" && phase.undoing);
   const ai = health?.ai ? freshAi ?? health.ai : null;
   const monthUsd = ai?.month_usd ?? null;
   const clipS = snap ? snap.durationS : null;
   const overLimit = ai ? budgetEstimate(ai, clipS, monthUsd).over : false;
   // One rule for the button and for Enter: submitting from code ignores a disabled button.
-  const canAnalyse = ready && !working && !overLimit && phase.k !== "applying" && phase.k !== "applied";
+  const canAnalyse = ready && !working && !inRun && !overLimit && phase.k !== "applying" && phase.k !== "applied";
 
   return (
     <>
@@ -196,12 +251,12 @@ export function CutTab({ health, ready, onTrimmed }: {
               {snap.video.length > 1 && <div className="clip-meta">recorded at Analyse</div>}
             </div>
           </div>
-        ) : <div className="muted">Select a clip in the timeline, or name it below.</div>}
+        ) : <div className="muted">Select the clips to change in the timeline, then say what to do below.</div>}
       </div>
 
       <div className="sec">
         <div className="sec-hd"><span className="lbl">Instruction</span></div>
-        <form className="prompt" ref={formRef} onSubmit={(e) => { e.preventDefault(); if (canAnalyse) analyse(); }}>
+        <form className="prompt" ref={formRef} onSubmit={(e) => { e.preventDefault(); if (canAnalyse) send(); }}>
           <textarea value={instruction} onChange={(e) => setInstruction(e.target.value)} aria-label="Instruction" rows={3}
             onKeyDown={(e) => {
               if (submitsPrompt({ key: e.key, shiftKey: e.shiftKey, isComposing: e.nativeEvent.isComposing })) {
@@ -211,7 +266,7 @@ export function CutTab({ health, ready, onTrimmed }: {
             }} />
           <button className="btn btn-p" type="submit"
             disabled={!canAnalyse}
-            title={overLimit ? "Monthly AI limit reached" : undefined}>Analyse</button>
+            title={overLimit ? "Monthly AI limit reached" : undefined}>Send</button>
         </form>
         {ai && <CostEstimate ai={ai} clipS={clipS} monthUsd={monthUsd} />}
       </div>
@@ -226,6 +281,27 @@ export function CutTab({ health, ready, onTrimmed }: {
             </div>
             {health && <Telemetry device={health.stt_device} />}
           </div>
+        )}
+
+        {(phase.k === "asking" || phase.k === "acting") && (
+          <div className="sec">
+            <div className="stages">
+              <Stage state={phase.k === "asking" ? "run" : "done"} label="Claude reads the timeline and plans" />
+              {phase.k === "acting" && <Stage state="run" label={phase.cancelling ? "Cancelling after this step…" : "Claude makes the changes"} />}
+            </div>
+            {phase.k === "acting" && (
+              <div className="actions-row" style={{ marginTop: 9 }}>
+                <button className="btn btn-g" onClick={cancelRun} disabled={phase.cancelling}>Cancel</button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {phase.k === "plan" && <PlanView text={phase.text} cost={phase.cost} onGo={approve} onCancel={cancelRun} />}
+
+        {phase.k === "ran" && (
+          <RunResult out={phase.out} undoing={phase.undoing} undoMsg={phase.undoMsg} undoBad={phase.undoBad}
+            onUndo={undoRun} onDone={() => go({ k: "idle" })} />
         )}
 
         {phase.k === "error" && (

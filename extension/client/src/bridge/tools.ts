@@ -6,7 +6,7 @@
 import type { Snapshot, SnapshotItem, TranscriptJob, TranscriptRequest } from "../api/types";
 import { round3 } from "../lib/review";
 import { trimRequestFor } from "../lib/snapshot";
-import type { Turns } from "./turns";
+import type { Turn, Turns } from "./turns";
 
 export interface Tool {
   /** act tools change the timeline: refused while the Cut tab is busy. */
@@ -22,7 +22,7 @@ export interface ToolDeps {
     transcript(req: TranscriptRequest): Promise<TranscriptJob>;
     transcriptJob(id: string, waitS: number): Promise<TranscriptJob>;
   };
-  /** The undo stack: every successful act call is pushed as one turn. */
+  /** The undo stack: every successful act call is pushed (a turn of its own, or into the open group). */
   turns: Turns;
 }
 
@@ -58,12 +58,82 @@ function cutSummary(r: any): string {
   return `Cut ${plural(r.cutCount, "range")} from ${plural(r.clipCount, "clip")} (${round3(r.removedS)} s removed)`;
 }
 
+/**
+ * What stands in the way of undoing this turn, read off the timeline before anything is reversed:
+ * markers it made that were changed or partly removed since, and clips an act call made (its idMap)
+ * that were moved, trimmed or removed since — except clips a later call of the same turn replaced
+ * on purpose. All of them gone means already undone (the host says so); that is no problem.
+ */
+export function undoProblems(turn: Turn, listing: any): string[] {
+  const problems: string[] = [];
+  const tol = listing?.fps > 0 ? 0.5 / listing.fps : 0.02;
+  const clips = new Set<string>((listing?.clips ?? []).map((c: any) => String(c.id)));
+  const markers = new Map<string, any>((listing?.markers ?? []).map((m: any) => [String(m.id), m]));
+  const replacedLater = new Set<string>();
+  for (let i = turn.actions.length - 1; i >= 0; i--) {
+    const a = turn.actions[i], u: any = a.undo;
+    if (u?.kind === "markers" && Array.isArray(u.markers) && u.markers.some((m: any) => markers.has(String(m.id)))) {
+      for (const m of u.markers) {
+        const now = markers.get(String(m.id));
+        if (!now) problems.push(`${m.name} is gone`);
+        else if (Math.abs(now.startS - m.startS) > tol || Math.abs(now.endS - m.endS) > tol || now.name !== m.name ||
+                 now.comments !== m.comments || now.colour !== m.colour) problems.push(`${m.name} was changed since`);
+      }
+    }
+    const made = Object.values(a.idMap ?? {}).flat().filter((x) => !replacedLater.has(x));
+    const there = made.filter((x) => clips.has(x)).length;
+    if (there > 0 && there < made.length) problems.push(`${a.summary}: its clips were moved, trimmed or removed since`);
+    for (const old of Object.keys(a.idMap ?? {})) replacedLater.add(old);
+  }
+  return problems;
+}
+
+/**
+ * Undo one turn (a single act call, or a whole Go), newest action first. The whole turn is checked
+ * first (undoProblems): if anything is in the way nothing is undone. A refusal only the host can see
+ * stops there; what was undone is dropped from the turn, the rest stays, and the error says so.
+ * `id`: undo that turn, refused unless it is still the newest on its sequence; none: the newest on
+ * the active sequence.
+ */
+export async function undoTurn(deps: Pick<ToolDeps, "callHost" | "turns">, sequenceId?: string, id?: string) {
+  const listing = await deps.callHost("gcutToolGetSequence", {});
+  const active = String(listing.sequenceId);
+  if (sequenceId !== undefined && sequenceId !== active) {
+    throw new Error("A different sequence is open than the one this change was made on. Open that sequence first.");
+  }
+  const turn = deps.turns.latest(active);
+  if (!turn) throw new Error("Nothing to undo on this sequence: no assistant change made on it is left to undo.");
+  if (id !== undefined && turn.id !== id) throw new Error("Newer changes were made since on this sequence; undo them first.");
+  const problems = undoProblems(turn, listing);
+  if (problems.length) throw new Error(`Nothing was undone: ${problems.join("; ")}. Use Premiere's Undo instead.`);
+  const total = turn.actions.length, summary = turn.summary, done: string[] = [];
+  let already = 0;
+  for (let i = total - 1; i >= 0; i--) {
+    const a = turn.actions[i];
+    let r: any;
+    try {
+      r = await deps.callHost("gcutToolUndo", { record: a.undo });
+    } catch (e) {
+      // A refusal throws the host's reason (what is in the way); the turn keeps what wasn't undone.
+      if (!done.length) throw e;
+      throw new Error(`Undid ${done.length} of ${total} changes (${done.join("; ")}); then stopped: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    if (r && r.alreadyUndone) already++;
+    deps.turns.dropNewest(turn.sequenceId, turn.id);
+    done.push(a.summary);
+  }
+  return already === total
+    ? { ok: true, alreadyUndone: true, undone: summary, message: "Already undone: nothing of it was left on the timeline." }
+    : { ok: true, undone: summary };
+}
+
 export function createTools(deps: ToolDeps): ToolTable {
-  /** Run an act tool on the host; on success push it as a turn and reply without the undo record (the stack keeps that). */
+  /** Run an act tool on the host; on success push it to the undo stack and reply without the undo record (the stack keeps that). */
   async function act(tool: string, fn: string, args: any, summary: (args: any, r: any) => string) {
     const r = await deps.callHost(fn, args ?? {});
     const { undo, ...reply } = r;
-    deps.turns.push({ sequenceId: String(undo.sequenceId), tool, args: args ?? {}, summary: summary(args, r), undo });
+    deps.turns.push({ sequenceId: String(undo.sequenceId), tool, args: args ?? {}, summary: summary(args, r), undo,
+      ...(r.idMap ? { idMap: r.idMap } : {}) });
     return reply;
   }
 
@@ -114,20 +184,6 @@ export function createTools(deps: ToolDeps): ToolTable {
     add_markers: { kind: "act", run: (args) => act("add_markers", "gcutToolAddMarkers", args, markersSummary) },
     cut_ranges: { kind: "act", run: (args) => act("cut_ranges", "gcutToolCutRanges", args, (_a, r) => cutSummary(r)) },
 
-    undo_last_turn: {
-      kind: "act",
-      async run() {
-        // The active sequence's id (a listing of nothing: the stretch 0–0 holds no clip).
-        const { sequenceId } = await deps.callHost("gcutToolGetSequence", { fromS: 0, toS: 0 });
-        const turn = deps.turns.latest(String(sequenceId));
-        if (!turn) throw new Error("Nothing to undo on this sequence: no assistant change made on it is left to undo.");
-        // A refusal throws the host's reason (what is in the way) and the turn stays.
-        const r = await deps.callHost("gcutToolUndo", { record: turn.undo });
-        deps.turns.pop(turn.sequenceId, turn.id);
-        return r && r.alreadyUndone
-          ? { ok: true, alreadyUndone: true, undone: turn.summary, message: "Already undone: nothing of it was left on the timeline." }
-          : { ok: true, undone: turn.summary };
-      },
-    },
+    undo_last_turn: { kind: "act", run: () => undoTurn(deps) },
   };
 }

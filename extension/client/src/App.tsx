@@ -2,6 +2,9 @@ import { useEffect, useState } from "react";
 import { dataDir, evalScript, node, openExternal } from "./api/cep";
 import { runtime } from "./api/runtime";
 import { startAssistant, type Bridge } from "./bridge/server";
+import { createTools, type ToolTable } from "./bridge/tools";
+import { createTurns } from "./bridge/turns";
+import { createAgent, type Agent } from "./agent/run";
 import { cutTabBusy } from "./lib/busy";
 import type { Snapshot, TrimResponse } from "./api/types";
 import { useBackend } from "./hooks/useBackend";
@@ -41,23 +44,37 @@ function BackendStatus({ state, onRetry }: { state: ReturnType<typeof useBackend
  * The Claude assistant's bridge: personal builds only. The literal check lets the bundler drop the
  * bridge from every other build; startAssistant also refuses outside live mode.
  */
-function useAssistantBridge() {
+function useAssistantBridge(tools: ToolTable, agent: Agent) {
   useEffect(() => {
     if (import.meta.env.VITE_GENIUSCUT_CLAUDE !== "1") return;
     let bridge: Bridge | null = null, gone = false;
     const stop = () => { gone = true; void bridge?.stop(); bridge = null; };
+    // The terminal's act calls wait while the Cut tab is busy or a panel instruction run is open.
     startAssistant({ flag: import.meta.env.VITE_GENIUSCUT_CLAUDE, mode: runtime.mode, evalScript, node, dataDir,
-      backend: runtime.backend, busy: cutTabBusy, panelVersion: VERSION })
+      tools, busy: () => cutTabBusy() || agent.isOpen(), panelVersion: VERSION })
       .then((b) => { if (gone) void b?.stop(); else bridge = b; })
       .catch((e) => console.warn("Genius Cut assistant bridge didn't start:", e));
     window.addEventListener("unload", stop);
     return () => { window.removeEventListener("unload", stop); stop(); };
-  }, []);
+  }, [tools, agent]);
+}
+
+/**
+ * ONE tool table and ONE undo stack (turns.json) per panel, shared by the instruction runs and the
+ * personal bridge: two stacks would overwrite each other's turns.json.
+ */
+function createKit() {
+  const turns = createTurns(runtime.turnStore());
+  const tools = createTools({ callHost: runtime.callHost, backend: runtime.backend, turns });
+  const agent = createAgent({ api: runtime.backend, tools, turns, callHost: runtime.callHost,
+    snapshotTrim: () => runtime.host.snapshotSelection(null) });
+  return { tools, agent };
 }
 
 export function App() {
   const { state, retry } = useBackend();
-  useAssistantBridge();
+  const [kit] = useState(createKit);
+  useAssistantBridge(kit.tools, kit.agent);
   const [lastTrim, setLastTrim] = useState<LastTrim | null>(null);
   const ready = state.kind === "ready";
   const health = state.kind === "ready" || state.kind === "starting" ? state.health : null;
@@ -121,7 +138,7 @@ export function App() {
 
           <BackendStatus state={state} onRetry={retry} />
 
-          <CutTab health={health} ready={ready}
+          <CutTab health={health} ready={ready} agent={kit.agent}
             onTrimmed={(snap: Snapshot, res: TrimResponse, checked: boolean[]) => setLastTrim({ snap, res, checked })} />
 
           <StyleLibrary ready={ready} lastTrim={lastTrim} />

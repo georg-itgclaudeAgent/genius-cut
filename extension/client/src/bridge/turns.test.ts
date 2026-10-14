@@ -24,11 +24,11 @@ describe("the undo stack (one act call = one turn)", () => {
     expect(t.latest("seq-1")).toBeUndefined();
   });
 
-  it("records id, time, sequence, tool, args, summary and the undo record", () => {
+  it("records id, time, sequence and summary, with the action (tool, args, summary, undo record) as a group of one", () => {
     const t = createTurns(memoryStore(), () => new Date("2026-10-14T08:00:00Z"));
     t.push(turn("seq-1", 1));
-    expect(t.latest("seq-1")).toEqual({ id: expect.any(String), at: "2026-10-14T08:00:00.000Z", sequenceId: "seq-1", tool: "add_markers",
-      args: { n: 1 }, summary: "turn 1", undo: { kind: "markers", sequenceId: "seq-1", n: 1 } });
+    expect(t.latest("seq-1")).toEqual({ id: expect.any(String), at: "2026-10-14T08:00:00.000Z", sequenceId: "seq-1", summary: "turn 1",
+      actions: [{ tool: "add_markers", args: { n: 1 }, summary: "turn 1", undo: { kind: "markers", sequenceId: "seq-1", n: 1 } }] });
   });
 
   it("keeps a stack per sequence", () => {
@@ -70,6 +70,54 @@ describe("the undo stack (one act call = one turn)", () => {
   it("starts empty from a missing or unreadable turns.json", () => {
     expect(createTurns(memoryStore(null)).latest("seq-1")).toBeUndefined();
     expect(createTurns(memoryStore("{not json")).latest("seq-1")).toBeUndefined();
+  });
+});
+
+describe("grouped turns (one Go = one undo turn)", () => {
+  it("between begin and end, every act call joins one turn; its summary lists them", () => {
+    const store = memoryStore(), t = createTurns(store);
+    t.push(turn("seq-1", 1));
+    const g = t.begin();
+    t.push(turn("seq-1", 2)); t.push(turn("seq-1", 3));
+    expect(t.end()).toMatchObject({ id: g, summary: "turn 2; turn 3" });
+    const top = t.latest("seq-1")!;
+    expect(top.id).toBe(g);
+    expect(top.actions.map((a) => a.summary)).toEqual(["turn 2", "turn 3"]);
+    // Saved as it grows: a run that stops part-way keeps what ran.
+    expect(JSON.parse(store.text!)["seq-1"]).toHaveLength(2);
+    t.pop("seq-1", g);
+    expect(t.latest("seq-1")!.summary).toBe("turn 1");
+  });
+
+  it("a group that did nothing leaves no turn", () => {
+    const t = createTurns(memoryStore());
+    t.begin();
+    expect(t.end()).toBeUndefined();
+    expect(t.latest("seq-1")).toBeUndefined();
+  });
+
+  it("after end, an act call is a turn of its own again", () => {
+    const t = createTurns(memoryStore());
+    t.begin(); t.push(turn("seq-1", 1)); t.end();
+    t.push(turn("seq-1", 2));
+    expect(t.latest("seq-1")!.actions).toHaveLength(1);
+  });
+
+  it("dropping the newest action shrinks the group, and the last one removes it", () => {
+    const t = createTurns(memoryStore());
+    const g = t.begin(); t.push(turn("seq-1", 1)); t.push(turn("seq-1", 2)); t.end();
+    t.dropNewest("seq-1", g);
+    expect(t.latest("seq-1")).toMatchObject({ id: g, summary: "turn 1" });
+    t.dropNewest("seq-1", g);
+    expect(t.latest("seq-1")).toBeUndefined();
+  });
+
+  it("loads Phase 1's single-action entries as groups of one", () => {
+    const legacy = { "seq-1": [{ id: "t1", at: "2026-10-14T08:00:00.000Z", sequenceId: "seq-1", tool: "add_markers", args: { n: 1 },
+      summary: "Added 1 marker: Intro", undo: { kind: "markers", sequenceId: "seq-1" } }] };
+    const t = createTurns(memoryStore(JSON.stringify(legacy)));
+    expect(t.latest("seq-1")).toEqual({ id: "t1", at: "2026-10-14T08:00:00.000Z", sequenceId: "seq-1", summary: "Added 1 marker: Intro",
+      actions: [{ tool: "add_markers", args: { n: 1 }, summary: "Added 1 marker: Intro", undo: { kind: "markers", sequenceId: "seq-1" } }] });
   });
 });
 

@@ -3,6 +3,8 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { CutTab } from "./CutTab";
 import { CutReview } from "./CutReview";
 import { mockTransport } from "../api/mock";
+import { createAgent } from "../agent/run";
+import { createTurns } from "../bridge/turns";
 import type { Health, Snapshot, TrimResponse } from "../api/types";
 
 const HEALTH: Health = {
@@ -10,17 +12,20 @@ const HEALTH: Health = {
   ai: { provider: "gemini", model: "gemini-3.7-flash", month_usd: 0.08, limit_usd: 2, usd_per_minute: 0.003 },
 };
 
-const cutTab = (health: Health | null) => renderToStaticMarkup(<CutTab health={health} ready onTrimmed={() => {}} />);
-const analyseButton = (html: string) => html.match(/<button[^>]*type="submit"[^>]*>Analyse<\/button>/)![0];
+const agent = createAgent({ api: {} as any, tools: {}, turns: createTurns({ read: () => null, write: () => {} }), callHost: async () => ({}),
+  snapshotTrim: async () => ({ found: false, message: "" }) });
+const cutTab = (health: Health | null) => renderToStaticMarkup(<CutTab health={health} ready agent={agent} onTrimmed={() => {}} />);
+// The one button: it sends the instruction to Claude (a trim, or a timeline edit).
+const analyseButton = (html: string) => html.match(/<button[^>]*type="submit"[^>]*>Send<\/button>/)![0];
 
 describe("CutTab cost estimate", () => {
-  it("shows the estimate and the month under the Analyse button", () => {
+  it("shows the estimate and the month under the Send button", () => {
     const html = cutTab(HEALTH);
     expect(html).toContain("Est. ~$0.03 per 10 min of clip · This month $0.08 of $2.00");
     expect(html).not.toContain("Monthly AI limit reached");
     expect(analyseButton(html)).not.toContain("disabled");
   });
-  it("warns and disables Analyse when the month's limit is reached", () => {
+  it("warns and disables Send when the month's limit is reached", () => {
     const html = cutTab({ ...HEALTH, ai: { ...HEALTH.ai!, month_usd: 2 } });
     expect(html).toMatch(/class="cost-est warn"[^>]*>Monthly AI limit reached/);
     expect(analyseButton(html)).toContain("disabled");

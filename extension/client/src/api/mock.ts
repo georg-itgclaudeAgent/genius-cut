@@ -101,6 +101,15 @@ export const mockTransport: Transport = async (req) => {
   }
   // Settings and the Setup page's listings (the sample panel never gates on Setup).
   const path = req.path.split("?")[0];
+  // An instruction run: the sample Claude hands every instruction to the trim review.
+  if (path === "/agent/runs" && req.method === "POST") {
+    await delay(700);
+    const b = JSON.parse(req.body || "{}");
+    return ok({ run_id: "sample-run", state: "tool_calls", text: "", message: null, reason: null, cost: sampleCost(1800, 120),
+      tool_calls: [{ id: "tu-sample", name: "propose_filler_cuts", input: { instructions: String(b.instruction || "trim the fillers") } }] });
+  }
+  if (path.startsWith("/agent/runs/") && req.method === "DELETE") return ok({ ok: true });
+  if (path.startsWith("/agent/runs/")) return { status: 404, body: JSON.stringify({ detail: "This run was lost; send the instruction again." }) };
   if (path === "/settings" && req.method === "PUT") { settings = JSON.parse(req.body || "{}"); return ok(settings); }
   if (path === "/settings") return ok(settings);
   if (path === "/settings/test-key") { await delay(600); return ok({ ok: true, message: "Sample data: no key was read." }); }
@@ -133,5 +142,15 @@ export const mockHost: Host = {
   async closeGap() { await delay(300); },
   async restore() { await delay(500); },
 };
+
+/** The tool table's host side on sample data: get_sequence lists the sample clips, all selected; nothing is edited. */
+export async function mockCallHost(fn: string, _args: unknown): Promise<any> {
+  if (fn !== "gcutToolGetSequence") throw new Error("Sample data: nothing on a timeline is changed.");
+  const clips = [...SNAPSHOT.video, ...SNAPSHOT.audio].map((x) => ({
+    id: `${x.label}@${x.startTicks}#sample-${x.label}`, track: x.label, name: x.name, startS: START_S, endS: START_S + DURATION_S,
+    inS: x.inS, source: x.mediaPath, selected: true, enabled: true, effects: x.effects, speed: 1 }));
+  return { sequenceId: SNAPSHOT.sequenceId, name: "Sample sequence", fps: SNAPSHOT.fps, durationS: 600, tracks: [], markers: [],
+    clips, selection: clips.map((c) => c.id) };
+}
 
 export function resetMockBoot() { bootedAt = Date.now(); }

@@ -13,14 +13,13 @@
  * One tool call runs at a time.
  */
 import type { Mode } from "../lib/mode";
-import { hostCaller } from "../api/host";
-import { createTools, type ToolDeps, type ToolTable } from "./tools";
-import { createTurns, fileTurnStore } from "./turns";
+import type { ToolTable } from "./tools";
 
 const MARK_HEADER = "X-Genius-Cut";
 const MARK = "gcut-assistant-bridge";
 const MAX_BODY = 1 << 20;
-export const BUSY = "Genius Cut is busy (Analyse, Apply, Restore or Close gap is running in the panel). Try again when it has finished.";
+export const BUSY = "Genius Cut is busy (an instruction run, Analyse, Apply, Restore or Close gap is running in the panel). " +
+  "Try again when it has finished.";
 
 export interface Bridge {
   port: number;
@@ -37,7 +36,7 @@ export interface BridgeDeps {
   panelVersion: string;
   token: string;
   tools: ToolTable;
-  /** True while the Cut tab runs Analyse, Apply, Restore or Close gap. */
+  /** True while the Cut tab runs Analyse, Apply, Restore or Close gap, or a panel instruction run is open. */
   busy: () => boolean;
 }
 
@@ -120,7 +119,9 @@ export interface AssistantDeps {
   evalScript: (s: string) => Promise<string>;
   node: (id: string) => any;
   dataDir: () => string;
-  backend: ToolDeps["backend"];
+  /** The panel's one tool table (and so its one undo stack, turns.json), shared with its instruction runs. */
+  tools: ToolTable;
+  /** cutTabBusy() || a panel run is open: act calls are refused meanwhile. */
   busy: () => boolean;
   panelVersion: string;
 }
@@ -132,8 +133,7 @@ export function bridgeWanted(flag: string | undefined, mode: Mode): boolean {
 
 /**
  * Check the host has the toolbox (the gcutTool* functions in host/index.jsx, which the manifest loads),
- * load the undo stack (turns.json), then start the bridge. null when this build or mode doesn't get the
- * assistant.
+ * then serve the panel's tool table. null when this build or mode doesn't get the assistant.
  */
 export async function startAssistant(d: AssistantDeps): Promise<Bridge | null> {
   if (!bridgeWanted(d.flag, d.mode)) return null;
@@ -141,9 +141,6 @@ export async function startAssistant(d: AssistantDeps): Promise<Bridge | null> {
   if (out !== "ok") {
     throw new Error(`The assistant's Premiere tools aren't loaded (host/index.jsx): ${String(out).replace(/^Error:\s*/, "")}. Restart Premiere.`);
   }
-  const callHost = hostCaller(d.evalScript), fs = d.node("fs"), path = d.node("path"), dir = d.dataDir();
-  const turns = createTurns(fileTurnStore(fs, path, path.join(dir, "turns.json")));
-  const tools = createTools({ callHost: (fn, args) => callHost(fn, args), backend: d.backend, turns });
-  return startBridge({ http: d.node("http"), fs, path, dir, pid: d.node("process").pid,
-    panelVersion: d.panelVersion, token: d.node("crypto").randomBytes(32).toString("hex"), tools, busy: d.busy });
+  return startBridge({ http: d.node("http"), fs: d.node("fs"), path: d.node("path"), dir: d.dataDir(), pid: d.node("process").pid,
+    panelVersion: d.panelVersion, token: d.node("crypto").randomBytes(32).toString("hex"), tools: d.tools, busy: d.busy });
 }

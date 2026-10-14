@@ -165,3 +165,24 @@ export interface Usage {
   /** This month's last 10 runs, newest first. */
   runs: UsageRun[];
 }
+
+// ── Agent runs (backend/geniuscut/agent.py) ──
+
+export interface AgentToolCall { id: string; name: string; input: any }
+
+export interface AgentToolResult { tool_use_id: string; content: string; is_error: boolean }
+
+/** One Claude step. tool_calls: run them and post the results; plan: show Go / Cancel; done / stopped: the run is closed. */
+export interface AgentStep {
+  run_id: string;
+  state: "tool_calls" | "plan" | "done" | "stopped";
+  tool_calls: AgentToolCall[];
+  text: string;
+  /** "stopped" only; for "limit", the exact limit message. */
+  message: string | null;
+  reason: "limit" | "key" | "error" | "refusal" | "max_tokens" | "step_cap" | null;
+  /** usd: this run's total so far. */
+  cost: RunCost | null;
+}
+
+export interface AgentStart { instruction: string; selection: unknown; sequence: unknown }

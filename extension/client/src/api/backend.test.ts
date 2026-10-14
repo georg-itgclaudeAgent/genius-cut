@@ -139,3 +139,30 @@ describe("setup, settings and usage (the Setup page and Settings)", () => {
     expect(f.seen[0]).toMatchObject({ method: "GET", path: "/usage" });
   });
 });
+
+describe("agent runs (the in-panel assistant)", () => {
+  const STEP = { run_id: "r1", state: "plan", tool_calls: [], text: "1. Add a marker", message: null, reason: null,
+    cost: { model: "claude-opus-5-5", input_tokens: 1, output_tokens: 1, usd: 0.01, month_usd: 1, limit_usd: 20 } };
+
+  it("starts, posts results, approves and cancels a run, each step allowed 5 minutes", async () => {
+    const f = fake(200, STEP);
+    const api = createBackend({ transport: f.transport, token: () => "tok" });
+    expect(await api.agentStart({ instruction: "add a marker", selection: { clipIds: ["V1@0#n"] }, sequence: { sequenceId: "s" } })).toEqual(STEP);
+    await api.agentResults("r1", [{ tool_use_id: "t1", content: "{}", is_error: false }]);
+    await api.agentApprove("r1");
+    await api.agentCancel("r/1");
+    expect(f.seen.map((r) => `${r.method} ${r.path}`)).toEqual([
+      "POST /agent/runs", "POST /agent/runs/r1/results", "POST /agent/runs/r1/approve", "DELETE /agent/runs/r%2F1"]);
+    expect(JSON.parse(f.seen[0].body!)).toEqual({ instruction: "add a marker", selection: { clipIds: ["V1@0#n"] }, sequence: { sequenceId: "s" } });
+    expect(JSON.parse(f.seen[1].body!)).toEqual({ results: [{ tool_use_id: "t1", content: "{}", is_error: false }] });
+    expect(f.seen.slice(0, 3).every((r) => r.timeoutMs === 5 * 60_000)).toBe(true);
+    expect(f.seen.every((r) => r.headers.Authorization === "Bearer tok")).toBe(true);
+  });
+
+  it("a lost run is a 404 with the backend's words", async () => {
+    const api = createBackend({ transport: fake(404, { detail: "This run was lost; send the instruction again." }).transport, token: () => "tok" });
+    const err = await api.agentApprove("gone").catch((e) => e);
+    expect(err).toBeInstanceOf(BackendError);
+    expect([err.status, err.message]).toEqual([404, "This run was lost; send the instruction again."]);
+  });
+});

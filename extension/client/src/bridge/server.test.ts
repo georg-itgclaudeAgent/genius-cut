@@ -3,8 +3,10 @@ import { createRequire } from "module";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { startAssistant, startBridge, type Bridge } from "./server";
-import type { ToolTable } from "./tools";
+import { BUSY, startAssistant, startBridge, type Bridge } from "./server";
+import { createTools, type ToolTable } from "./tools";
+import { createTurns, fileTurnStore } from "./turns";
+import { createAgent } from "../agent/run";
 
 const nodeRequire = createRequire(import.meta.url);
 const dirs: string[] = [], bridges: Bridge[] = [];
@@ -126,7 +128,7 @@ describe("startAssistant: only in a flagged build, live in Premiere", () => {
     const evalScript = vi.fn(async (_s: string) => evalOut);
     return { dir, evalScript, d: {
       flag, mode, evalScript, node: (id: string) => nodeRequire(id), dataDir: () => dir,
-      backend: { transcript: vi.fn(), transcriptJob: vi.fn() }, busy: () => false, panelVersion: "0.1.0" } };
+      tools: echo, busy: () => false, panelVersion: "0.1.0" } };
   }
 
   it.each([[undefined, "live"], ["0", "live"], ["1", "preview"], ["1", "browser"]] as const)(
@@ -157,22 +159,48 @@ describe("startAssistant: only in a flagged build, live in Premiere", () => {
     expect(existsSync(join(x.dir, "bridge.json"))).toBe(false);
   });
 
-  it("loads turns.json on start: undo_last_turn reverses a turn made before the panel reloaded", async () => {
+  it("serves the panel's one shared tool table: undo_last_turn reverses a turn from turns.json, loaded before the panel reloaded", async () => {
     const x = deps("1", "live");
     const record = { kind: "markers", sequenceId: "seq-1", markers: [{ id: "g1" }] };
     mkdirSync(x.dir, { recursive: true });
     writeFileSync(join(x.dir, "turns.json"), JSON.stringify({ "seq-1": [{ id: "t1", at: "2026-10-14T08:00:00.000Z", sequenceId: "seq-1",
       tool: "add_markers", args: {}, summary: "Added 1 marker: Intro", undo: record }] }));
-    x.evalScript.mockImplementation(async (s: string) =>
-      s.includes("gcutToolUndo(") ? JSON.stringify({ ok: true }) : s.includes("gcutToolGetSequence(") ? JSON.stringify({ sequenceId: "seq-1", clips: [] }) : "ok");
-    const b = (await startAssistant(x.d))!;
+    const host: [string, unknown][] = [];
+    const callHost = async (fn: string, a: unknown) => {
+      host.push([fn, a]);
+      return fn === "gcutToolUndo" ? { ok: true } : { sequenceId: "seq-1", clips: [] };
+    };
+    const turns = createTurns(fileTurnStore(nodeRequire("fs"), nodeRequire("path"), join(x.dir, "turns.json")));
+    const tools = createTools({ callHost, turns, backend: { transcript: vi.fn(), transcriptJob: vi.fn() } });
+    const b = (await startAssistant({ ...x.d, tools }))!;
     bridges.push(b);
     const { token } = JSON.parse(readFileSync(join(x.dir, "bridge.json"), "utf8"));
     const r = await fetch(`http://127.0.0.1:${b.port}/tool`, { method: "POST", headers: { Authorization: `Bearer ${token}` },
       body: JSON.stringify({ name: "undo_last_turn", args: {}, client: "terminal" }) });
     expect(await r.json()).toEqual({ ok: true, result: { ok: true, undone: "Added 1 marker: Intro" } });
-    const undoScript = x.evalScript.mock.calls.map((c) => c[0]).find((c) => c.includes("gcutToolUndo("))!;
-    expect(undoScript).toContain(JSON.stringify(JSON.stringify({ record })));
+    expect(host.find(([fn]) => fn === "gcutToolUndo")![1]).toEqual({ record });
     expect(JSON.parse(readFileSync(join(x.dir, "turns.json"), "utf8"))["seq-1"]).toEqual([]);
+  });
+
+  it("refuses the terminal's act calls while a panel instruction run is open (busy = Cut tab busy or a run open)", async () => {
+    const x = deps("1", "live");
+    const turns = createTurns({ read: () => null, write: () => {} });
+    const callHost = async () => ({ sequenceId: "seq-1", name: "Main", fps: 25, durationS: 10, tracks: [], markers: [],
+      selection: ["V1@0#a"], clips: [{ id: "V1@0#a", track: "V1", name: "a", startS: 0, endS: 5 }] });
+    const tools = createTools({ callHost, turns, backend: { transcript: vi.fn(), transcriptJob: vi.fn() } });
+    const plan = { run_id: "r1", state: "plan" as const, tool_calls: [], text: "1. x", message: null, reason: null, cost: null };
+    const agent = createAgent({ tools, turns, callHost, snapshotTrim: async () => ({ found: false, message: "" }),
+      api: { agentStart: async () => plan, agentResults: async () => plan, agentApprove: async () => plan, agentCancel: async () => ({ ok: true }) } });
+    const b = (await startAssistant({ ...x.d, tools, busy: () => false || agent.isOpen() }))!;
+    bridges.push(b);
+    const { token } = JSON.parse(readFileSync(join(x.dir, "bridge.json"), "utf8"));
+    const send = (name: string) => fetch(`http://127.0.0.1:${b.port}/tool`, { method: "POST", headers: { Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ name, args: {}, client: "terminal" }) }).then((r) => r.json());
+    await agent.send("x");
+    expect(await send("add_markers")).toEqual({ ok: false, message: BUSY });
+    expect(BUSY).toMatch(/instruction run/);
+    expect((await send("get_sequence")).ok).toBe(true);
+    await agent.cancel();
+    expect((await send("undo_last_turn")).message).toMatch(/Nothing to undo/);
   });
 });

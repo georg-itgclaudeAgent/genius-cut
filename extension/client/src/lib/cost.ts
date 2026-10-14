@@ -72,3 +72,16 @@ export function meterFraction(monthUsd: number, limitUsd: number): number {
 
 /** The meter turns coral from here. */
 export const METER_HOT = 0.8;
+
+/** An instruction run that handed over to a trim: one cost line for both. The month and limit are the trim's (it came last). */
+export function addCosts(run: RunCost, trim: RunCost | null | undefined): RunCost {
+  if (!trim) return run;
+  return {
+    model: trim.model,
+    input_tokens: run.input_tokens + trim.input_tokens,
+    output_tokens: run.output_tokens + trim.output_tokens,
+    usd: run.usd === null || trim.usd === null ? null : run.usd + trim.usd,
+    month_usd: trim.month_usd,
+    limit_usd: trim.limit_usd,
+  };
+}

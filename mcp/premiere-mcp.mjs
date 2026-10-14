@@ -63,17 +63,16 @@ const TOOLS = [
   {
     name: "get_transcript",
     description:
-      "Transcribe what is said in chosen clips (clipIds from get_sequence) or in a stretch of the timeline (fromS and toS). " +
+      "Transcribe what is said in chosen clips (clipIds from get_sequence) over their time on the timeline. " +
       "Returns the words with their times in seconds on the sequence timeline when the transcript is ready (cached " +
       "from an earlier Analyse or call). Otherwise it starts a transcription job and returns {id, status, progress}; " +
-      "then call wait_transcript with that id until it returns the words. Give either clipIds, or fromS and toS.",
+      "then call wait_transcript with that id until it returns the words.",
     inputSchema: {
       type: "object",
       properties: {
         clipIds: { type: "array", items: { type: "string" }, minItems: 1, description: "Clip ids from get_sequence. " + STALE },
-        fromS: { type: "number", minimum: 0, description: "Start of the stretch. " + SECONDS },
-        toS: { type: "number", minimum: 0, description: "End of the stretch. " + SECONDS },
       },
+      required: ["clipIds"],
       additionalProperties: false,
     },
     annotations: { title: "Read the transcript", ...READ },

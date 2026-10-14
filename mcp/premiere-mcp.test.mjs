@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -135,6 +135,20 @@ test("cut_ranges warns that effects are lost: acceptEffectLoss only after the us
   assert.match(byName.cut_ranges.description, /keyframes/);
   assert.match(byName.cut_ranges.description, /gain/);
   assert.match(byName.get_sequence.description, /effects/);
+}));
+
+test("get_transcript advertises exactly the arguments the panel bridge reads (clipIds), and requires them", () => withSetup(async ({ mcp }) => {
+  const { tools } = (await mcp.request("tools/list", {})).result;
+  const schema = tools.find((t) => t.name === "get_transcript").inputSchema;
+  // What the bridge's get_transcript reads from Claude's args (extension/client/src/bridge/tools.ts).
+  const src = readFileSync(fileURLToPath(new URL("../extension/client/src/bridge/tools.ts", import.meta.url)), "utf8");
+  const block = src.slice(src.indexOf("get_transcript: {"), src.indexOf("wait_transcript: {"));
+  assert.ok(block.length > 0);
+  const read = [...new Set([...block.matchAll(/args\?\.(\w+)/g)].map((m) => m[1]))].sort();
+  assert.deepEqual(read, ["clipIds"]);
+  assert.deepEqual(Object.keys(schema.properties).sort(), read);
+  assert.deepEqual(schema.required, ["clipIds"]);
+  assert.doesNotMatch(tools.find((t) => t.name === "get_transcript").description, /fromS|toS/);
 }));
 
 test("tools/call forwards name, args and client to the bridge with the token, and returns the result", () => withSetup(async ({ bridge, mcp }) => {

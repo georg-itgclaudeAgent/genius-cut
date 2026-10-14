@@ -5,8 +5,8 @@ import pytest
 from geniuscut import claude, gemini, llm
 
 
-def test_default_provider_is_gemini():
-    assert llm.provider() == "gemini"
+def test_default_provider_is_claude_on_the_anthropic_api():
+    assert llm.provider() == "anthropic"
 
 
 def test_llm_provider_variable(monkeypatch):
@@ -66,6 +66,8 @@ def test_vertex_via_the_new_variable_reaches_claude_on_vertex(monkeypatch):
 
 
 def test_model_follows_the_provider(monkeypatch):
+    assert llm.model() == claude.MODEL == "claude-opus-5-5"
+    monkeypatch.setenv("GENIUSCUT_LLM_PROVIDER", "gemini")
     assert llm.model() == "gemini-3.7-flash"
     monkeypatch.setenv("GENIUSCUT_GEMINI_MODEL", "gemini-2.5-flash")
     assert llm.model() == "gemini-2.5-flash"

@@ -56,6 +56,32 @@ def test_ask_json_raises_on_refusal_and_truncation():
         claude.ask_json("hi", {}, client=FakeClient({}, stop_reason="max_tokens"))
 
 
+def test_claude_calls_are_gated_before_anything_is_sent(monkeypatch):
+    from geniuscut import spend
+    monkeypatch.setenv("GENIUSCUT_MONTHLY_LIMIT_USD", "0.01")  # worst case 16000 * $20/M = $0.32
+    fake = FakeClient({"ok": True})
+    with pytest.raises(spend.BudgetExceeded):
+        claude.ask_json("hi", {"type": "object"}, client=fake)
+    assert fake.requests == []
+
+
+def test_claude_usage_is_recorded_at_the_opus_price():
+    from geniuscut import spend
+    fake = FakeClient({"ok": True})
+    fake._response.usage = SimpleNamespace(input_tokens=1_000, output_tokens=2_000)
+    with spend.meter() as m:
+        claude.ask_json("hi", {"type": "object"}, client=fake)
+    assert m.model == "claude-opus-5-5" and m.usd == pytest.approx(1_000 * 4e-6 + 2_000 * 20e-6)
+
+
+def test_an_unpriced_claude_model_is_refused_so_the_limit_holds(monkeypatch):
+    monkeypatch.setattr(claude, "MODEL", "claude-unpriced")
+    fake = FakeClient({"ok": True})
+    with pytest.raises(claude.ClaudeError, match="price"):
+        claude.ask_json("hi", {"type": "object"}, client=fake)
+    assert fake.requests == []
+
+
 # ── cuts.propose_cuts ──────────────────────────────────────────────
 
 def test_maps_word_index_ranges_to_exact_word_timings():

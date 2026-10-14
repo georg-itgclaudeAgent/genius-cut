@@ -4,8 +4,10 @@ the month's total would pass the limit.
 - Every call is one JSON line in `<data dir>/spend.jsonl`. Append-only; a corrupt line is
   skipped, never fatal, and a ledger that can't be written never fails the call.
 - Months are calendar months in UTC.
-- Only priced models are gated. Claude has no price here, so its calls cost `None` and
-  count as 0 towards the month.
+- Only priced models are gated; an unpriced model's calls cost `None` and count as 0
+  towards the month (gemini.py and claude.py refuse to call an unpriced model).
+- The limit is this editor's `settings.json` `monthly_limit_usd` (20 or 100), unless
+  GENIUSCUT_MONTHLY_LIMIT_USD overrides it (tests, dev).
 """
 
 import json
@@ -18,12 +20,12 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 
-from geniuscut import config
+from geniuscut import config, settings
 from geniuscut.errors import LLMError
 
 log = logging.getLogger(__name__)
 
-DEFAULT_LIMIT_USD = 2.0
+DEFAULT_LIMIT_USD = float(settings.DEFAULT_LIMIT)
 LIMIT_ENV = "GENIUSCUT_MONTHLY_LIMIT_USD"
 
 # USD per 1M tokens (input, output), Gemini API paid tier, prompts ≤200k tokens.
@@ -40,6 +42,9 @@ PRICES: dict[str, list[tuple[date, float, float]]] = {
     "gemini-2.5-pro": [(date.min, 1.25, 10.00)],
     "gemini-2.5-flash": [(date.min, 0.30, 2.50)],
     "gemini-2.5-flash-lite": [(date.min, 0.10, 0.40)],
+    # Claude on the Anthropic API (first-party rates, cached 2026-09-25). Output includes
+    # thinking, which Opus 5.5 can't turn off; usage.output_tokens already counts it.
+    "claude-opus-5-5": [(date.min, 4.00, 20.00)],
 }
 
 
@@ -209,12 +214,34 @@ def month_total(now: datetime | None = None) -> float:
 
 
 def limit_usd() -> float:
-    """GENIUSCUT_MONTHLY_LIMIT_USD, default $2.00; anything invalid or negative means the default."""
+    """GENIUSCUT_MONTHLY_LIMIT_USD if it's a finite number >= 0, else the settings' limit ($20 or $100)."""
     try:
         limit = float(os.environ.get(LIMIT_ENV, ""))
     except ValueError:
-        return DEFAULT_LIMIT_USD
-    return limit if math.isfinite(limit) and limit >= 0 else DEFAULT_LIMIT_USD
+        limit = math.nan
+    if math.isfinite(limit) and limit >= 0:
+        return limit
+    return float(settings.load().monthly_limit_usd)
+
+
+_MONTHS = ("January", "February", "March", "April", "May", "June", "July", "August", "September",
+           "October", "November", "December")
+
+
+def _next_month_start(now: datetime) -> str:
+    """'1 November 2026': the day this UTC month's spend resets."""
+    year, month = (now.year + 1, 1) if now.month == 12 else (now.year, now.month + 1)
+    return f"1 {_MONTHS[month - 1]} {year}"
+
+
+def _over_limit_message(limit: float, worst: float, so_far: float, now: datetime) -> str:
+    if limit == 20:
+        return "Partial monthly limit reached. You can increase this limit in Settings under the Usage & limit tab."
+    if limit == 100:
+        return (f"Your allowed monthly limit has been reached. Please wait until {_next_month_start(now)} "
+                "to continue, or ask your admin for additional credits.")
+    return (f"This run could cost up to {money(worst)}, and this month's AI spend is {money(so_far)} "
+            f"of the {money(limit)} limit. Raise {LIMIT_ENV} to continue.")
 
 
 def check_budget(model: str, text: str, max_tokens: int, *, now: datetime | None = None) -> None:
@@ -224,16 +251,13 @@ def check_budget(model: str, text: str, max_tokens: int, *, now: datetime | None
     is estimated at 1.5 characters per token: the transcript is one index-numbered word per
     line, which tokenises poorly (measured 2026-10-05: 19,197 characters were 12,053 tokens).
     """
-    worst = cost_usd(model, math.ceil(len(text) / CHARS_PER_TOKEN), max_tokens,
-                     on=(now or datetime.now(timezone.utc)).astimezone(timezone.utc).date())
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    worst = cost_usd(model, math.ceil(len(text) / CHARS_PER_TOKEN), max_tokens, on=now.date())
     if worst is None:
         return
     so_far, limit = month_total(now), limit_usd()
     if so_far + worst > limit:
-        raise BudgetExceeded(
-            f"This run could cost up to {money(worst)}, and this month's AI spend is {money(so_far)} "
-            f"of the {money(limit)} limit. Raise {LIMIT_ENV} to continue."
-        )
+        raise BudgetExceeded(_over_limit_message(limit, worst, so_far, now))
 
 
 # ── estimate ───────────────────────────────────────────────────────

@@ -38,7 +38,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel
 
-from geniuscut import audio, config, cuts, library, llm, secrets, spend, transcripts, trim
+from geniuscut import audio, config, cuts, library, llm, secrets, settings, spend, transcripts, trim
 from geniuscut.llm import LLMError
 from geniuscut.models import StyleExample, TranscriptJob, TranscriptRequest, TrimRequest, TrimResponse, Word
 
@@ -60,7 +60,7 @@ def ai_status() -> dict:
         month_usd = None
     per_minute = spend.estimate_per_minute(model) if model else None
     return {"provider": provider, "model": model, "month_usd": month_usd, "limit_usd": spend.limit_usd(),
-            "usd_per_minute": per_minute}
+            "limit_tier": settings.load().monthly_limit_usd, "usd_per_minute": per_minute}
 
 
 class NewExample(BaseModel):

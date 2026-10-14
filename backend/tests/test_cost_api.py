@@ -53,14 +53,14 @@ def test_run_trim_reports_the_runs_cost_and_the_month(tmp_path):
     assert (r.cost.input_tokens, r.cost.output_tokens) == (1_000_000, 500_000)
     assert r.cost.usd == pytest.approx(0.30)
     assert r.cost.month_usd == pytest.approx(0.40)
-    assert r.cost.limit_usd == 2.0
+    assert r.cost.limit_usd == 20.0
 
 
 def test_a_run_with_no_ai_call_costs_nothing(tmp_path):
     r = trim.run_trim(TrimRequest(**{**REQ, "cut_pauses": True}), FakeTranscriber([]), tmp_path,
                       propose=cuts.propose_cuts, extract=fake_extract)
     assert (r.cost.usd, r.cost.input_tokens, r.cost.output_tokens) == (0.0, 0, 0)
-    assert r.cost.model == "gemini-3.7-flash"
+    assert r.cost.model == "claude-opus-5-5"
 
 
 def test_the_trim_ledger_rows_are_tagged_trim(tmp_path):
@@ -68,7 +68,8 @@ def test_the_trim_ledger_rows_are_tagged_trim(tmp_path):
     assert '"kind": "trim"' in spend.ledger_path().read_text(encoding="utf-8")
 
 
-def test_propose_cuts_goes_through_gemini_by_default(monkeypatch):
+def test_propose_cuts_goes_through_gemini_when_chosen(monkeypatch):
+    monkeypatch.setenv("GENIUSCUT_LLM_PROVIDER", "gemini")
     monkeypatch.setenv("GENIUSCUT_GEMINI_API_KEY", "AIza-test")
     seen = []
 
@@ -96,6 +97,7 @@ def _kinds():
 
 def test_a_failed_propose_call_outside_run_trim_is_still_recorded_as_trim(monkeypatch):
     from geniuscut import llm
+    monkeypatch.setenv("GENIUSCUT_LLM_PROVIDER", "gemini")
     monkeypatch.setenv("GENIUSCUT_GEMINI_API_KEY", "AIza-test")
     with pytest.raises(llm.LLMError, match="cut off"):
         cuts.propose_cuts(WORDS, FewShot(None, []), client=_cut_off)
@@ -105,6 +107,7 @@ def test_a_failed_propose_call_outside_run_trim_is_still_recorded_as_trim(monkey
 
 def test_a_failed_run_trim_call_is_metered_and_recorded_as_trim(tmp_path, monkeypatch):
     from geniuscut import llm
+    monkeypatch.setenv("GENIUSCUT_LLM_PROVIDER", "gemini")
     monkeypatch.setenv("GENIUSCUT_GEMINI_API_KEY", "AIza-test")
     propose = lambda w, f, i: cuts.propose_cuts(w, f, i, client=_cut_off)
     with pytest.raises(llm.LLMError):
@@ -114,6 +117,7 @@ def test_a_failed_run_trim_call_is_metered_and_recorded_as_trim(tmp_path, monkey
 
 def test_summary_kind_is_recorded_outside_the_server_and_when_the_call_raises(tmp_path, monkeypatch):
     from geniuscut import library, llm
+    monkeypatch.setenv("GENIUSCUT_LLM_PROVIDER", "gemini")
     monkeypatch.setenv("GENIUSCUT_GEMINI_API_KEY", "AIza-test")
     library.add_example(WORDS, "hello", "take.mp4", tmp_path)
     with pytest.raises(llm.LLMError):
@@ -145,6 +149,7 @@ def test_budget_exceeded_is_402_with_the_message(tmp_path):
 
 def test_a_real_gate_refusal_reaches_the_panel_as_402(tmp_path, monkeypatch):
     monkeypatch.setenv("GENIUSCUT_MONTHLY_LIMIT_USD", "0.001")
+    monkeypatch.setenv("GENIUSCUT_LLM_PROVIDER", "gemini")
     monkeypatch.setenv("GENIUSCUT_GEMINI_API_KEY", "AIza-test")
     c, auth = app(tmp_path, propose=cuts.propose_cuts)
     r = c.post("/trim", json=REQ, headers=auth)
@@ -190,6 +195,7 @@ def test_summarize_402(tmp_path):
 # ── /health ────────────────────────────────────────────────────────
 
 def test_health_reports_the_ai_block(tmp_path, monkeypatch):
+    monkeypatch.setenv("GENIUSCUT_LLM_PROVIDER", "gemini")
     monkeypatch.setenv("GENIUSCUT_GEMINI_API_KEY", "AIza-must-not-appear")
     spend.record("gemini-2.5-flash-lite", 1_000_000, 0)
     c, _ = app(tmp_path)
@@ -197,16 +203,30 @@ def test_health_reports_the_ai_block(tmp_path, monkeypatch):
     assert r.status_code == 200
     ai = r.json()["ai"]
     assert ai["provider"] == "gemini" and ai["model"] == "gemini-3.7-flash"
-    assert ai["month_usd"] == pytest.approx(0.10) and ai["limit_usd"] == 2.0
+    assert ai["month_usd"] == pytest.approx(0.10) and ai["limit_usd"] == 20.0 and ai["limit_tier"] == 20
     assert ai["usd_per_minute"] == pytest.approx(spend.estimate_per_minute("gemini-3.7-flash"))
     assert "AIza" not in r.text
 
 
 def test_health_per_minute_is_null_for_unpriced_models(tmp_path, monkeypatch):
-    monkeypatch.setenv("GENIUSCUT_LLM_PROVIDER", "anthropic")
+    monkeypatch.setenv("GENIUSCUT_LLM_PROVIDER", "gemini")
+    monkeypatch.setenv("GENIUSCUT_GEMINI_MODEL", "gemini-unpriced")
     c, _ = app(tmp_path)
     ai = c.get("/health").json()["ai"]
-    assert ai["provider"] == "anthropic" and ai["usd_per_minute"] is None
+    assert ai["provider"] == "gemini" and ai["usd_per_minute"] is None
+
+
+def test_health_defaults_to_claude_opus_5_5_with_the_settings_tier(tmp_path, monkeypatch):
+    from geniuscut import settings
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-must-not-appear")
+    settings.save(settings.Settings(anthropic_key={"project": "p-1"}, monthly_limit_usd=100))
+    c, _ = app(tmp_path)
+    r = c.get("/health")
+    ai = r.json()["ai"]
+    assert ai["provider"] == "anthropic" and ai["model"] == "claude-opus-5-5"
+    assert ai["limit_usd"] == 100.0 and ai["limit_tier"] == 100
+    assert ai["usd_per_minute"] == pytest.approx(spend.estimate_per_minute("claude-opus-5-5"))
+    assert "sk-ant" not in r.text
 
 
 def test_an_unreadable_ledger_never_fails_health(tmp_path, monkeypatch):

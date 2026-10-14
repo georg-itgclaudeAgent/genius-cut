@@ -6,7 +6,7 @@ from datetime import date, datetime, timezone
 
 import pytest
 
-from geniuscut import config, llm, spend
+from geniuscut import config, llm, settings, spend
 
 UTC = timezone.utc
 
@@ -35,8 +35,15 @@ def test_fixed_prices(model, inp, out):
     assert spend.cost_usd(model, 0, 1_000_000, on=on) == pytest.approx(out)
 
 
+def test_claude_opus_5_5_price():
+    # Anthropic first-party rates: $4.00 in / $20.00 out per 1M tokens (thinking is output).
+    on = date(2026, 10, 14)
+    assert spend.cost_usd("claude-opus-5-5", 1_000_000, 0, on=on) == pytest.approx(4.00)
+    assert spend.cost_usd("claude-opus-5-5", 0, 1_000_000, on=on) == pytest.approx(20.00)
+
+
 def test_unpriced_models_cost_none():
-    assert spend.cost_usd("claude-opus-5-5", 1000, 1000, on=date(2026, 10, 5)) is None
+    assert spend.cost_usd("unpriced-model", 1000, 1000, on=date(2026, 10, 5)) is None
 
 
 def test_cost_defaults_to_today():
@@ -52,7 +59,7 @@ def test_ledger_lives_in_the_data_dir():
 def test_record_appends_one_row_per_call():
     now = datetime(2026, 10, 5, 3, 0, tzinfo=UTC)
     spend.record("gemini-3.7-flash", 1000, 2000, now=now)
-    spend.record("claude-opus-5-5", 10, 20, now=now)
+    spend.record("unpriced-model", 10, 20, now=now)
     rows = [json.loads(line) for line in spend.ledger_path().read_text(encoding="utf-8").splitlines()]
     assert len(rows) == 2
     assert rows[0]["model"] == "gemini-3.7-flash" and rows[0]["kind"] == "other"
@@ -66,7 +73,7 @@ def test_month_total_sums_this_utc_month_only():
     spend.record("gemini-2.5-flash-lite", 1_000_000, 0, now=datetime(2026, 9, 30, 23, 59, tzinfo=UTC))  # 0.10 last month
     spend.record("gemini-2.5-flash-lite", 2_000_000, 0, now=datetime(2026, 10, 1, 0, 0, tzinfo=UTC))    # 0.20
     spend.record("gemini-2.5-flash-lite", 0, 1_000_000, now=datetime(2026, 10, 31, 23, 59, tzinfo=UTC))  # 0.40
-    spend.record("claude-opus-5-5", 5, 5, now=datetime(2026, 10, 2, tzinfo=UTC))                          # unpriced: 0
+    spend.record("unpriced-model", 5, 5, now=datetime(2026, 10, 2, tzinfo=UTC))                          # unpriced: 0
     assert spend.month_total(now=datetime(2026, 10, 15, tzinfo=UTC)) == pytest.approx(0.60)
     assert spend.month_total(now=datetime(2026, 9, 1, tzinfo=UTC)) == pytest.approx(0.10)
     assert spend.month_total(now=datetime(2026, 11, 1, tzinfo=UTC)) == 0
@@ -138,7 +145,7 @@ def test_a_failed_ledger_write_still_counts_towards_the_month(monkeypatch, tmp_p
     monkeypatch.setenv("GENIUSCUT_DATA_DIR", str(blocker / "data"))
     spend.record("gemini-2.5-flash-lite", 1_000_000, 0, now=datetime(2026, 10, 5, tzinfo=UTC))   # $0.10, unwritten
     spend.record("gemini-2.5-flash-lite", 1_000_000, 0, now=datetime(2026, 9, 5, tzinfo=UTC))    # last month
-    spend.record("claude-opus-5-5", 5, 5, now=datetime(2026, 10, 5, tzinfo=UTC))                 # unpriced
+    spend.record("unpriced-model", 5, 5, now=datetime(2026, 10, 5, tzinfo=UTC))                 # unpriced
     monkeypatch.setenv("GENIUSCUT_DATA_DIR", str(tmp_path / "elsewhere"))  # the ledger is readable again
     assert spend.month_total(now=OCT) == pytest.approx(0.10)
     monkeypatch.setenv("GENIUSCUT_MONTHLY_LIMIT_USD", "0.12")
@@ -153,12 +160,22 @@ def test_no_ledger_yet_means_nothing_spent():
 # ── limit ──────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("raw, expected", [
-    (None, 2.0), ("5", 5.0), (" 0.5 ", 0.5), ("0", 0.0), ("-1", 2.0), ("lots", 2.0), ("", 2.0), ("nan", 2.0), ("inf", 2.0),
+    (None, 20.0), ("5", 5.0), (" 0.5 ", 0.5), ("0", 0.0), ("-1", 20.0), ("lots", 20.0), ("", 20.0), ("nan", 20.0),
+    ("inf", 20.0),
 ])
 def test_limit_parsing(monkeypatch, raw, expected):
     if raw is not None:
         monkeypatch.setenv("GENIUSCUT_MONTHLY_LIMIT_USD", raw)
     assert spend.limit_usd() == expected
+
+
+def test_limit_comes_from_settings_unless_the_env_overrides(monkeypatch):
+    settings.save(settings.Settings(monthly_limit_usd=100))
+    assert spend.limit_usd() == 100.0
+    monkeypatch.setenv("GENIUSCUT_MONTHLY_LIMIT_USD", "3")
+    assert spend.limit_usd() == 3.0
+    monkeypatch.setenv("GENIUSCUT_MONTHLY_LIMIT_USD", "nonsense")
+    assert spend.limit_usd() == 100.0
 
 
 # ── budget gate ────────────────────────────────────────────────────
@@ -198,7 +215,7 @@ def test_gate_estimates_input_at_1_5_characters_per_token(monkeypatch):
 
 def test_gate_ignores_unpriced_models(monkeypatch):
     monkeypatch.setenv("GENIUSCUT_MONTHLY_LIMIT_USD", "0")
-    spend.check_budget("claude-opus-5-5", "x" * 100_000, 16000)
+    spend.check_budget("unpriced-model", "x" * 100_000, 16000)
 
 
 def test_money_format():
@@ -242,13 +259,13 @@ def test_meter_with_no_calls_costs_zero():
 
 def test_meter_usd_is_none_when_only_unpriced_calls_ran():
     with spend.meter() as m:
-        spend.record("claude-opus-5-5", 100, 200)
-    assert m.usd is None and m.input_tokens == 100 and m.model == "claude-opus-5-5"
+        spend.record("unpriced-model", 100, 200)
+    assert m.usd is None and m.input_tokens == 100 and m.model == "unpriced-model"
 
 
 def test_meter_counts_priced_calls_when_mixed_with_unpriced():
     with spend.meter() as m:
-        spend.record("claude-opus-5-5", 100, 200)
+        spend.record("unpriced-model", 100, 200)
         spend.record("gemini-2.5-flash-lite", 1_000_000, 0)
     assert m.usd == pytest.approx(0.10)
 
@@ -274,4 +291,30 @@ def test_estimate_matches_the_measured_10_47_clip():
     # Live run 2026-10-05, thinking low: $0.019 for a 10:47 clip. The panel shows ~$0.02.
     clip = spend.estimate_per_minute("gemini-3.7-flash", on=date(2026, 10, 5)) * (647 / 60)
     assert clip == pytest.approx(0.02, rel=0.25)
-    assert spend.estimate_per_minute("claude-opus-5-5") is None
+    assert spend.estimate_per_minute("unpriced-model") is None
+    assert spend.estimate_per_minute("claude-opus-5-5") is not None
+
+
+# ── limit messages (20 / 100 tiers) ───────────────────────────────
+
+def test_the_20_dollar_tier_says_the_limit_can_be_raised_in_settings():
+    now = datetime(2026, 10, 14, tzinfo=UTC)
+    spend.record("gemini-2.5-flash-lite", 0, 50_000_000, now=now)  # $20.00
+    with pytest.raises(spend.BudgetExceeded) as e:
+        spend.check_budget("claude-opus-5-5", "hi", 16000, now=now)
+    assert str(e.value) == ("Partial monthly limit reached. You can increase this limit in Settings "
+                            "under the Usage & limit tab.")
+
+
+@pytest.mark.parametrize("now, date_text", [
+    (datetime(2026, 10, 14, tzinfo=UTC), "1 November 2026"),
+    (datetime(2026, 12, 31, 23, 0, tzinfo=UTC), "1 January 2027"),
+    (datetime(2027, 1, 1, tzinfo=UTC), "1 February 2027"),
+])
+def test_the_100_dollar_tier_says_when_the_month_resets(now, date_text):
+    settings.save(settings.Settings(monthly_limit_usd=100))
+    spend.record("gemini-2.5-flash-lite", 0, 250_000_000, now=now)  # $100.00
+    with pytest.raises(spend.BudgetExceeded) as e:
+        spend.check_budget("claude-opus-5-5", "hi", 16000, now=now)
+    assert str(e.value) == (f"Your allowed monthly limit has been reached. Please wait until {date_text} "
+                            "to continue, or ask your admin for additional credits.")

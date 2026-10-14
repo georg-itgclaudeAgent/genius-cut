@@ -1,4 +1,4 @@
-"""The AI (Gemini by default, see `llm.py`) proposes which words to cut, in the editor's style.
+"""The AI (Claude Opus 5.5 by default, see `llm.py`) proposes which words to cut, in the editor's style.
 
 The model returns inclusive *word index* ranges, never timecodes. It's reliable at indices
 and unreliable at arithmetic on times, so indices are resolved to times here, and any

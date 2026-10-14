@@ -1,8 +1,8 @@
 """The provider switch: every AI call in Genius Cut goes through here.
 
 GENIUSCUT_LLM_PROVIDER (falling back to the older GENIUSCUT_CLAUDE_PROVIDER) picks:
-- `gemini` (default): the Gemini API, see `gemini.py`;
-- `anthropic`: Claude on the Anthropic API;
+- `anthropic` (default): Claude Opus 5.5 on the Anthropic API, see `claude.py`;
+- `gemini`: the Gemini API, see `gemini.py`;
 - `vertex`: Claude on Google Cloud Vertex AI.
 `LLMError` is the one error type callers catch; `claude.ClaudeError` and
 `spend.BudgetExceeded` are both subclasses.
@@ -26,7 +26,7 @@ def provider() -> str:
             if raw not in PROVIDERS:
                 raise LLMError(f"Unknown {var} {raw!r}: use 'gemini', 'anthropic' or 'vertex'.")
             return raw
-    return "gemini"
+    return "anthropic"
 
 
 def _backend():

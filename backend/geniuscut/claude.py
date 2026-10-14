@@ -3,14 +3,18 @@
 - Model `claude-opus-5-5` (override with GENIUSCUT_CLAUDE_MODEL).
 - Provider: the Anthropic API (key from env/GSM) or Google Cloud Vertex AI
   (GENIUSCUT_LLM_PROVIDER or GENIUSCUT_CLAUDE_PROVIDER = vertex; bills the GCP project,
-  uses the gcloud login). Reached through `llm.py`, whose default is Gemini.
+  uses the gcloud login). Reached through `llm.py`, whose default is this module on the
+  Anthropic API; the key comes from the editor's own Secret Manager (`settings.json`).
 - JSON comes back through structured outputs (`output_config.format`). Forced
   `tool_choice` returns a 400 on this model.
-- Effort is always set explicitly; this model's default is `medium`.
+- Effort is always set explicitly; this model's default is `medium`. Thinking can't be
+  turned off on Opus 5.5; it's billed as output, which `usage.output_tokens` includes.
 - On the Anthropic API, server-side refusal fallback is on (`fallbacks="default"`), so a
   policy decline is retried on a fallback model inside the same call. Vertex doesn't offer it.
 - A refusal or a truncated reply raises instead of being silently parsed.
-- Usage is recorded in the spend ledger; Claude has no price there, so it costs `None`.
+- Before every call the spend gate checks the worst case against the monthly limit, so a
+  refused run never reaches the API; an unpriced model is refused. Usage is recorded in the
+  spend ledger after every reply.
 """
 
 import json
@@ -60,6 +64,10 @@ def _api_message(e) -> str:
 
 
 def _call(prompt: str, *, system: str | None, client, output_config: dict, max_tokens: int):
+    if spend.price(MODEL) is None:  # an unpriced model would skip the gate: unlimited spend
+        raise ClaudeError(f"No price is known for Claude model '{MODEL}', so the monthly limit can't be "
+                          f"enforced. Use one of: {', '.join(sorted(spend.PRICES))}.")
+    spend.check_budget(MODEL, (system or "") + prompt, max_tokens)
     client = client or default_client()
     kwargs = dict(
         model=MODEL,

@@ -48,6 +48,12 @@ PRICES: dict[str, list[tuple[date, float, float]]] = {
     "claude-opus-5-5": [(date.min, 4.00, 20.00)],
 }
 
+# Prompt-cache prices, USD per 1M tokens (cache write, cache read). Opus 5.5: a write is the
+# input rate x 1.25, a read $0.20. A model without an entry pays its input rate for both.
+CACHE_PRICES: dict[str, tuple[float, float]] = {
+    "claude-opus-5-5": (5.00, 0.20),
+}
+
 
 CHARS_PER_TOKEN = 1.5  # prompt-size estimate for the gate, see check_budget
 
@@ -72,11 +78,13 @@ def price(model: str, on: date | None = None) -> tuple[float, float] | None:
     return current
 
 
-def cost_usd(model: str, input_tokens: int, output_tokens: int, on: date | None = None) -> float | None:
+def cost_usd(model: str, input_tokens: int, output_tokens: int, on: date | None = None, *,
+             cache_write: int = 0, cache_read: int = 0) -> float | None:
     p = price(model, on)
     if p is None:
         return None
-    return (input_tokens * p[0] + output_tokens * p[1]) / 1_000_000
+    write, read = CACHE_PRICES.get(model, (p[0], p[0]))
+    return (input_tokens * p[0] + output_tokens * p[1] + cache_write * write + cache_read * read) / 1_000_000
 
 
 def money(usd: float) -> str:
@@ -160,16 +168,27 @@ def ledger_path():
     return config.data_dir() / "spend.jsonl"
 
 
-def record(model: str, input_tokens: int, output_tokens: int, *, now: datetime | None = None) -> float | None:
-    """Log one call's usage (to the ledger and any open meter); returns its cost."""
+def record(model: str, input_tokens: int, output_tokens: int, *, now: datetime | None = None,
+           cache_write: int = 0, cache_read: int = 0, price_as: str | None = None) -> float | None:
+    """Log one call's usage (to the ledger and any open meter); returns its cost.
+
+    `model` is the model that answered (a server-side fallback may differ from the one asked);
+    if it has no price, it is priced as `price_as`, so a fallback can't switch the gate off.
+    A meter counts cache writes and reads as input tokens."""
     now = now or datetime.now(timezone.utc)
-    usd = cost_usd(model, input_tokens, output_tokens, on=now.astimezone(timezone.utc).date())
+    on = now.astimezone(timezone.utc).date()
+    priced = model if price(model, on) is not None or not price_as else price_as
+    usd = cost_usd(priced, input_tokens, output_tokens, on=on, cache_write=cache_write, cache_read=cache_read)
     m = _current.get()
     if m is not None:
-        m.calls.append((model, input_tokens, output_tokens, usd))
+        m.calls.append((model, input_tokens + cache_write + cache_read, output_tokens, usd))
     row = {"ts": now.astimezone(timezone.utc).isoformat(timespec="seconds"), "model": model,
            "kind": _kind.get(), "input_tokens": input_tokens, "output_tokens": output_tokens,
            "usd": usd}
+    if cache_write or cache_read:
+        row.update(cache_write_tokens=cache_write, cache_read_tokens=cache_read)
+    if priced != model:
+        row["priced_as"] = priced
     if _run.get():
         row["run"] = _run.get()
     try:
@@ -290,13 +309,26 @@ def check_budget(model: str, text: str, max_tokens: int, *, now: datetime | None
     is estimated at 1.5 characters per token: the transcript is one index-numbered word per
     line, which tokenises poorly (measured 2026-10-05: 19,197 characters were 12,053 tokens).
     """
+    check_tokens(model, math.ceil(len(text) / CHARS_PER_TOKEN), max_tokens, now=now)
+
+
+def check_tokens(model: str, input_tokens: int, max_tokens: int, *, now: datetime | None = None) -> None:
+    """The gate on an input-token estimate: input priced at the full input rate (no cache
+    discount) plus a reply of `max_tokens`. The agent loop estimates each step from the previous
+    step's actual usage (`estimate_step`)."""
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    worst = cost_usd(model, math.ceil(len(text) / CHARS_PER_TOKEN), max_tokens, on=now.date())
+    worst = cost_usd(model, input_tokens, max_tokens, on=now.date())
     if worst is None:
         return
     so_far, limit = month_total(now), limit_usd()
     if so_far + worst > limit:
         raise BudgetExceeded(_over_limit_message(limit, worst, so_far, now))
+
+
+def estimate_step(prev_input: int, prev_output: int, new_chars: int) -> int:
+    """Input tokens of the next agent step: everything the previous step read (incl. cached),
+    its reply (now in the history), and the new content at 1.5 characters per token."""
+    return prev_input + prev_output + math.ceil(new_chars / CHARS_PER_TOKEN)
 
 
 # ── estimate ───────────────────────────────────────────────────────

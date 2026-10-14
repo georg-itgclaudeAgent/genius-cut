@@ -16,7 +16,8 @@ also stops DNS-rebinding tricks.
 `GET`/`PUT /settings` read and save this editor's settings (where their Anthropic key lives,
 the monthly limit; never a key), and `POST /settings/test-key` checks a key source (a pass saves it
 and marks setup complete). `/setup/*` and `/usage` serve the Setup and Settings screens; their
-request/response shapes are listed at the top of geniuscut/setup.py.
+request/response shapes are listed at the top of geniuscut/setup.py. `/agent/runs*` run Claude's
+side of an instruction (shapes at the top of geniuscut/agent.py).
 
 AI errors: a missing key is 503, the monthly spend limit (`spend.BudgetExceeded`) is
 402, and any other provider error is 502. `/health` reports the AI provider, model and
@@ -42,9 +43,9 @@ from typing import Callable
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from geniuscut import audio, claude, config, cuts, library, llm, secrets, settings, setup, spend, transcripts, trim
+from geniuscut import agent, audio, claude, config, cuts, library, llm, secrets, settings, setup, spend, transcripts, trim
 from geniuscut.llm import LLMError
 from geniuscut.models import StyleExample, TranscriptJob, TranscriptRequest, TrimRequest, TrimResponse, Word
 
@@ -74,6 +75,22 @@ class TestKeyRequest(BaseModel):
     anthropic_key: settings.KeySource | None = None
 
 
+class AgentStart(BaseModel):
+    instruction: str = Field(pattern=r"\S")
+    selection: dict | list = {}
+    sequence: dict = {}
+
+
+class ToolResult(BaseModel):
+    tool_use_id: str
+    content: str
+    is_error: bool = False
+
+
+class AgentResults(BaseModel):
+    results: list[ToolResult]
+
+
 class NewExample(BaseModel):
     raw_words: list[Word]
     final_text: str
@@ -95,6 +112,7 @@ def create_app(
     gcloud_run: Callable = subprocess.run,
     find_gcloud: Callable[[], str | None] = setup.find_gcloud,
     login: setup.Login | None = None,
+    agent_runs: agent.Runs | None = None,
 ) -> FastAPI:
     llm_cost = globals()["llm"].run_cost  # the `llm` parameter shadows the module in here
     app = FastAPI(title="Genius Cut backend", version=config.VERSION)
@@ -276,6 +294,32 @@ def create_app(
     @app.get("/usage", dependencies=auth)
     def get_usage() -> dict:
         return spend.usage()
+
+    # ── agent runs (shapes: geniuscut/agent.py) ────────────────────────
+    runs = agent_runs or agent.Runs()
+
+    def agent_call(fn, *args) -> dict:
+        try:
+            return fn(*args)
+        except agent.RunError as e:
+            raise HTTPException(status_code=e.status, detail=str(e)) from e
+
+    @app.post("/agent/runs", dependencies=auth)
+    def post_agent_run(body: AgentStart) -> dict:
+        return agent_call(runs.start, body.instruction, body.selection, body.sequence)
+
+    @app.post("/agent/runs/{run_id}/results", dependencies=auth)
+    def post_agent_results(run_id: str, body: AgentResults) -> dict:
+        return agent_call(runs.results, run_id, [r.model_dump() for r in body.results])
+
+    @app.post("/agent/runs/{run_id}/approve", dependencies=auth)
+    def post_agent_approve(run_id: str) -> dict:
+        return agent_call(runs.approve, run_id)
+
+    @app.delete("/agent/runs/{run_id}", dependencies=auth)
+    def delete_agent_run(run_id: str) -> dict:
+        runs.cancel(run_id)
+        return {"ok": True}
 
     return app
 

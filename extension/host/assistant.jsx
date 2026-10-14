@@ -208,11 +208,12 @@ function gcutSameMarker(now, was, clock) {
 
 /**
  * Undo an add_markers: every recorded marker must still be exactly as recorded, then all of them go.
- * None of them left: already undone. Some gone or any changed: refused, nothing deleted.
+ * None of them left: already undone. Some gone or any changed: refused, nothing deleted. A record
+ * with no markers is refused as incomplete.
  */
 function gcutUndoMarkers(seq, record, clock) {
-    var now = gcutMarkerList(seq), live = [], gone = 0, changed = [], i, j;
-    var recs = gcutIsArray(record.markers) ? record.markers : [];
+    if (!gcutIsArray(record.markers) || !record.markers.length) throw new Error("This undo record is incomplete.");
+    var now = gcutMarkerList(seq), live = [], gone = 0, changed = [], recs = record.markers, i, j;
     for (i = 0; i < recs.length; i++) {
         var m = null;
         for (j = 0; j < now.length; j++) if (String(now[j].guid) === String(recs[i].id)) m = now[j];

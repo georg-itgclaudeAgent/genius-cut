@@ -2344,6 +2344,17 @@ describe("gcutToolAddMarkers and its undo", () => {
     expect(undo(s, record)).toEqual({ ok: true, alreadyUndone: true });
   });
 
+  it.each([
+    ["no markers", { kind: "markers", sequenceId: "seq-1", markers: [] }],
+    ["no marker list", { kind: "markers", sequenceId: "seq-1" }],
+    ["a marker list that isn't one", { kind: "markers", sequenceId: "seq-1", markers: "Intro" }],
+  ])("undo refuses a record with %s as incomplete (not already undone), deleting nothing", (_, record) => {
+    const s = georgScene();
+    add(s, TWO);
+    expect(() => undo(s, record)).toThrow("This undo record is incomplete.");
+    expect(s.seq.markers.numMarkers).toBe(2);
+  });
+
   it("undo refuses on a different sequence, and a record it doesn't know", () => {
     const s = georgScene();
     const record = add(s, TWO).undo;

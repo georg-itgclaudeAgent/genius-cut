@@ -1859,7 +1859,7 @@ function gcutEnabled(it) { return it.disabled !== true; }
  * Undo a change of one setting per clip (on/off, volume, speed): record.items [{...ref, before, after}].
  * Every clip must still be exactly where it was, its setting reading `after` (or `before` where the
  * change left it so); all reading `before`: already undone; any other value, or some set back and some
- * not: changed by hand, refused. read(it) gives the setting, write(it, v) sets it, same(a, b) compares.
+ * not: changed by hand, refused. read(it) gives the setting, write(it, v, x) sets it, same(a, b) compares.
  */
 function gcutUndoSettings(seq, record, check, what, read, write, same) {
     var list = record.items, live = [], changed = [], back = [], i;
@@ -1875,7 +1875,7 @@ function gcutUndoSettings(seq, record, check, what, read, write, same) {
     if (!changed.length && !live.length) return { ok: true, alreadyUndone: true };
     if (changed.length || back.length) throw new Error("These clips were changed by hand since: " + changed.concat(back).join("; ") + ". " + GCUT_BY_HAND);
     if (check) return { ok: true, wouldUndo: true };
-    for (i = 0; i < live.length; i++) write(live[i].it, live[i].x.before);
+    for (i = 0; i < live.length; i++) write(live[i].it, live[i].x.before, live[i].x);
     for (i = 0; i < live.length; i++) {
         if (!same(read(live[i].it), live[i].x.before)) throw new Error("Premiere didn't take back " + live[i].x.label + "'s " + what + ". Use Premiere's Undo.");
     }
@@ -2081,7 +2081,7 @@ function gcutUndoMoves(seq, record, clock, check) {
 
 // ── split_at, and the splits switch_angle makes ──────────────────────────────────────
 
-/** The QE track of this kind and index (app.enableQE, measured); refuses when QE isn't there. */
+/** The QE track of this kind and index (app.enableQE, measured); refuses when QE isn't there. Used by split_at, switch_angle, add_transition and set_speed. */
 function gcutQeTrack(kind, trackIndex) {
     var qt = null;
     try {
@@ -2089,7 +2089,7 @@ function gcutQeTrack(kind, trackIndex) {
         var qseq = qe.project.getActiveSequence();
         qt = kind === "audio" ? qseq.getAudioTrackAt(trackIndex) : qseq.getVideoTrackAt(trackIndex);
     } catch (e) { qt = null; }
-    if (!qt) throw new Error("Premiere's QE interface isn't available, so clips can't be split here. Nothing was changed; split them by hand.");
+    if (!qt) throw new Error("Premiere's QE interface isn't available here. Nothing was changed; do it by hand.");
     return qt;
 }
 
@@ -2521,6 +2521,241 @@ function gcutToolSwitchAngle(argsJson) {
     }
 }
 
+// ── set_volume ────────────────────────────────────────────────────────────────────────
+
+/** The audio clip's Volume component "Level" property (linear, 0.17783 at 0 dB, measured), or null. */
+function gcutLevelParam(it) {
+    if (!it || !it.components) return null;
+    for (var i = 0; i < it.components.numItems; i++) {
+        var c = it.components[i];
+        if (c.displayName !== "Volume" || !c.properties) continue;
+        for (var j = 0; j < c.properties.numItems; j++) if (c.properties[j].displayName === "Level") return c.properties[j];
+    }
+    return null;
+}
+
+function gcutLevel(it) { var p = gcutLevelParam(it); return p ? Number(p.getValue()) : NaN; }
+
+/** True if two linear levels are the same to Premiere's float precision. */
+function gcutSameLevel(a, b) { return Math.abs(a - b) <= 1e-4 * Math.max(Math.abs(a), Math.abs(b), 1e-6); }
+
+/**
+ * args: { sequenceId, clipIds (audio clips), db } — set each chosen clip's Volume level to db decibels
+ * (clip level, as the Effect Controls' Volume > Level; at most +15). Level is linear: v = 10^((db - 15) / 20)
+ * (measured: 0.17783 at 0 dB). Refuses, changing nothing: a video clip, volume keyframes, a locked track.
+ * Returns { ok, db, level, changed, idMap: {}, undo: { kind: "volume", sequenceId, items: [{kind, trackIndex,
+ * label, node, startT, endT, before, after}] } }.
+ */
+function gcutToolSetVolume(argsJson) {
+    try {
+        var args = gcutParse(argsJson) || {}, k;
+        var seq = gcutSequence();
+        gcutSameSequence(seq, args.sequenceId);
+        if (!gcutIsTime(args.db) || args.db > 15) throw new Error("db must be a number of decibels, at most +15 (Premiere's clip volume limit).");
+        var chosen = gcutResolveIds(seq, args.clipIds), params = [], items = [], changed = 0, v = Math.pow(10, (args.db - 15) / 20);
+        for (k = 0; k < chosen.length; k++) {
+            if (chosen[k].kind !== "audio") {
+                throw new Error(gcutLabel(chosen[k].kind, chosen[k].trackIndex) + "'s clip is video: set_volume works on audio clips. Nothing was changed.");
+            }
+        }
+        gcutRefuseLocked(seq, chosen, "change the volume");
+        for (k = 0; k < chosen.length; k++) {
+            var label = gcutLabel("audio", chosen[k].trackIndex), p = gcutLevelParam(chosen[k].item);
+            if (!p) throw new Error(label + "'s clip has no Volume level Premiere shows to a script. Nothing was changed; set it by hand.");
+            if (typeof p.isTimeVarying === "function" && p.isTimeVarying()) {
+                throw new Error(label + "'s volume has keyframes, so one level would replace them. Nothing was changed; set it by hand.");
+            }
+            var x = gcutRef("audio", chosen[k].trackIndex, chosen[k].item);
+            x.before = Number(p.getValue());
+            params.push(p); items.push(x);
+        }
+        for (k = 0; k < params.length; k++) params[k].setValue(v, true);
+        for (k = 0; k < params.length; k++) {
+            items[k].after = Number(params[k].getValue());
+            if (!(Math.abs(items[k].after - v) <= 1e-3 * v)) {
+                for (var j = 0; j < params.length; j++) { try { params[j].setValue(items[j].before, true); } catch (ignored) { /* best effort */ } }
+                throw new Error("Premiere didn't set " + items[k].label + "'s volume. Nothing was changed.");
+            }
+            if (!gcutSameLevel(items[k].before, items[k].after)) changed++;
+        }
+        return gcutOk({ ok: true, db: args.db, level: v, changed: changed, idMap: {}, undo: { kind: "volume", sequenceId: gcutSeqId(seq), items: items } });
+    } catch (e) {
+        return gcutFail(e);
+    }
+}
+
+// ── mute_track ────────────────────────────────────────────────────────────────────────
+
+/**
+ * args: { sequenceId, kind: "audio" | "video", track (1-based), muted } — mute or unmute the whole track
+ * (track.setMute, measured on audio). Returns { ok, track: label, muted, changed, idMap: {}, undo: { kind:
+ * "mute", sequenceId, trackKind, trackIndex, label, before, after } }.
+ */
+function gcutToolMuteTrack(argsJson) {
+    try {
+        var args = gcutParse(argsJson) || {};
+        var seq = gcutSequence();
+        gcutSameSequence(seq, args.sequenceId);
+        if (args.kind !== "audio" && args.kind !== "video") throw new Error("kind must be \"audio\" or \"video\".");
+        var tracks = gcutKindTracks(seq, args.kind), n = args.track;
+        if (typeof n !== "number" || Math.floor(n) !== n || n < 1 || n > tracks.numTracks) {
+            throw new Error("track must be a track number from 1 to " + tracks.numTracks + " (" + gcutLabel(args.kind, 0) + " is 1).");
+        }
+        if (typeof args.muted !== "boolean") throw new Error("muted must be true or false.");
+        var track = tracks[n - 1], label = gcutLabel(args.kind, n - 1);
+        if (typeof track.setMute !== "function") throw new Error("Premiere can't mute " + label + " from a script. Nothing was changed.");
+        var before = !!track.isMuted();
+        track.setMute(args.muted ? 1 : 0);
+        if (!!track.isMuted() !== args.muted) {
+            try { track.setMute(before ? 1 : 0); } catch (ignored) { /* best effort */ }
+            throw new Error("Premiere didn't " + (args.muted ? "mute " : "unmute ") + label + ". Nothing was changed.");
+        }
+        return gcutOk({ ok: true, track: label, muted: args.muted, changed: before !== args.muted, idMap: {},
+                        undo: { kind: "mute", sequenceId: gcutSeqId(seq), trackKind: args.kind, trackIndex: n - 1, label: label, before: before, after: args.muted } });
+    } catch (e) {
+        return gcutFail(e);
+    }
+}
+
+/** Undo a mute_track: already undone when the track reads `before`; otherwise set it back. */
+function gcutUndoMute(seq, record, check) {
+    if ((record.trackKind !== "audio" && record.trackKind !== "video") || typeof record.trackIndex !== "number" || typeof record.before !== "boolean") {
+        throw new Error("This undo record is incomplete.");
+    }
+    var tracks = gcutKindTracks(seq, record.trackKind);
+    if (record.trackIndex >= tracks.numTracks) throw new Error(record.label + " no longer exists. " + GCUT_BY_HAND);
+    var track = tracks[record.trackIndex];
+    if (!!track.isMuted() === record.before) return { ok: true, alreadyUndone: true };
+    if (check) return { ok: true, wouldUndo: true };
+    track.setMute(record.before ? 1 : 0);
+    if (!!track.isMuted() !== record.before) throw new Error("Premiere didn't " + (record.before ? "mute " : "unmute ") + record.label + " again. Use Premiere's Undo.");
+    return { ok: true };
+}
+
+// ── add_transition ────────────────────────────────────────────────────────────────────
+
+var GCUT_VIDEO_TRANSITION = "Cross Dissolve";
+var GCUT_AUDIO_TRANSITION = "Constant Power";
+
+/**
+ * args: { sequenceId, clipId, at: "start" | "end", seconds } — add a transition at the clip's start or end,
+ * `seconds` long (to the frame), centred on the edit: Cross Dissolve on video, Constant Power on audio,
+ * through QE's addTransition on the clip (the measured call; it counts as added only if the track's
+ * transition count went up). Returns { ok, transition, at, seconds, idMap: {}, undo: { kind: "transition",
+ * sequenceId, clip: {kind, trackIndex, label, node, startT, endT}, at, transition } }. Its undo always
+ * refuses: no script call to remove one transition was found (Premiere's Undo removes it).
+ */
+function gcutToolAddTransition(argsJson) {
+    try {
+        var args = gcutParse(argsJson) || {};
+        var seq = gcutSequence(), clock = gcutClock(seq);
+        gcutSameSequence(seq, args.sequenceId);
+        if (args.at !== "start" && args.at !== "end") throw new Error("at must be \"start\" or \"end\".");
+        var durT = gcutIsTime(args.seconds) ? gcutFrameT(args.seconds, clock) : 0;
+        if (durT < clock.tpf) throw new Error("seconds must be the transition's length, at least one frame.");
+        var c = gcutResolveIds(seq, [args.clipId])[0], ref = gcutRef(c.kind, c.trackIndex, c.item);
+        gcutRefuseLocked(seq, [c], "add a transition");
+        if (durT > ref.endT - ref.startT + clock.half) {
+            throw new Error("A " + gcutSecText(durT / GCUT_TICKS) + " s transition is longer than " + ref.label + "'s clip (" +
+                gcutSecText((ref.endT - ref.startT) / GCUT_TICKS) + " s). Nothing was changed.");
+        }
+        var name = c.kind === "video" ? GCUT_VIDEO_TRANSITION : GCUT_AUDIO_TRANSITION, tr = null, qt = gcutQeTrack(c.kind, c.trackIndex);
+        try { tr = c.kind === "video" ? qe.project.getVideoTransitionByName(name) : qe.project.getAudioTransitionByName(name); } catch (e1) { tr = null; }
+        if (!tr) throw new Error("Premiere didn't find its " + name + " transition. Nothing was changed.");
+        var qi = gcutQeClipAt(qt, ref.startT, clock);
+        if (!qi) throw new Error("Premiere's QE interface didn't find " + ref.label + "'s clip. Nothing was changed.");
+        var before = Number(qt.numTransitions);
+        qi.addTransition(tr, args.at === "start", gcutTimecode(durT, clock), "00:00:00:00", 0.5, false, true);
+        var after = Number(gcutQeTrack(c.kind, c.trackIndex).numTransitions);
+        if (!(isFinite(before) && isFinite(after) && after > before)) throw new Error("Premiere didn't add the transition to " + ref.label + "'s clip. Nothing was changed.");
+        return gcutOk({ ok: true, transition: name, at: args.at, seconds: durT / GCUT_TICKS, idMap: {},
+                        undo: { kind: "transition", sequenceId: gcutSeqId(seq), clip: ref, at: args.at, transition: name } });
+    } catch (e) {
+        return gcutFail(e);
+    }
+}
+
+// ── set_speed ─────────────────────────────────────────────────────────────────────────
+
+/** The QE clip for a ref ({kind, trackIndex, startT}), or null. */
+function gcutQeClipFor(ref, clock) { return gcutQeClipAt(gcutQeTrack(ref.kind, ref.trackIndex), ref.startT, clock); }
+
+/**
+ * A clip's own sound or picture on the other kind of track: the same source, overlapping it, in sync (its
+ * source time at any moment is the same), as { kind, trackIndex, startT, label }; or null.
+ */
+function gcutSyncPartner(seq, c, clock) {
+    var other = c.kind === "audio" ? "video" : "audio", tracks = gcutKindTracks(seq, other), n = gcutNode(c.item);
+    var s = gcutT(c.item.start), e = gcutT(c.item.end), off = c.item.inPoint.seconds - s / GCUT_TICKS;
+    for (var t = 0; t < tracks.numTracks; t++) {
+        var items = gcutItems(tracks[t]);
+        for (var i = 0; i < items.length; i++) {
+            var it = items[i], ps = gcutT(it.start);
+            if (gcutNode(it) !== n || !gcutOverlaps(ps, gcutT(it.end), s, e, clock)) continue;
+            if (gcutNear(it.inPoint.seconds - ps / GCUT_TICKS, off, clock.frameS)) return { kind: other, trackIndex: t, startT: ps, label: gcutLabel(other, t) };
+        }
+    }
+    return null;
+}
+
+/**
+ * args: { sequenceId, clipIds, speed } — play each chosen clip at `speed` (1 = 100%, 2 = twice as fast) with
+ * QE's setSpeed(speed, "", false, false, false): measured, the clip keeps its place and timeline length (so
+ * nothing else moves) and its content plays faster or slower; its linked partner is unchanged. So a clip
+ * whose own sound or picture (same source, in sync, on the other kind of track) isn't chosen with it is
+ * refused: they would go out of sync. Also refused, changing nothing: a reversed clip, a locked track.
+ * Returns { ok, speed, changed, idMap: {} (ids don't change), undo: { kind: "speed", sequenceId, items:
+ * [{kind, trackIndex, label, node, startT, endT, before, after}] } }.
+ */
+function gcutToolSetSpeed(argsJson) {
+    try {
+        var args = gcutParse(argsJson) || {}, k;
+        var seq = gcutSequence(), clock = gcutClock(seq);
+        gcutSameSequence(seq, args.sequenceId);
+        if (!gcutIsTime(args.speed) || args.speed <= 0 || args.speed > 100) {
+            throw new Error("speed must be a number above 0 and at most 100 (1 = 100%, 2 = twice as fast).");
+        }
+        var chosen = gcutResolveIds(seq, args.clipIds), items = [], changed = 0;
+        gcutRefuseLocked(seq, chosen, "change the speed");
+        for (k = 0; k < chosen.length; k++) {
+            var label = gcutLabel(chosen[k].kind, chosen[k].trackIndex);
+            if (gcutSpeed(chosen[k].item) < 0) throw new Error(label + "'s clip plays reversed. Nothing was changed; set its speed by hand.");
+            var p = gcutSyncPartner(seq, chosen[k], clock);
+            if (p && !gcutRecordedAt(gcutChosenFound(chosen), p.kind, p.trackIndex, p.startT)) {
+                throw new Error(label + "'s clip and its own " + (p.kind === "audio" ? "sound" : "picture") + " on " + p.label +
+                    " would go out of sync. Choose both, or neither. Nothing was changed.");
+            }
+            var x = gcutRef(chosen[k].kind, chosen[k].trackIndex, chosen[k].item);
+            x.before = gcutSpeed(chosen[k].item); x.after = args.speed;
+            if (Math.abs(x.before - x.after) > 1e-6) changed++;
+            items.push(x);
+        }
+        var qis = [];
+        for (k = 0; k < items.length; k++) {
+            qis.push(gcutQeClipFor(items[k], clock));
+            if (!qis[k]) throw new Error("Premiere's QE interface didn't find " + items[k].label + "'s clip. Nothing was changed.");
+        }
+        for (k = 0; k < items.length; k++) {
+            qis[k].setSpeed(args.speed, "", false, false, false);
+            var now = gcutFindRef(seq, items[k]);
+            if (!now || Math.abs(gcutSpeed(now) - args.speed) > 1e-4) {
+                for (var j = k; j >= 0; j--) { try { qis[j].setSpeed(items[j].before, "", false, false, false); } catch (ignored) { /* best effort */ } }
+                throw new Error("Premiere didn't set " + items[k].label + "'s speed. Nothing was changed.");
+            }
+        }
+        return gcutOk({ ok: true, speed: args.speed, changed: changed, idMap: {}, undo: { kind: "speed", sequenceId: gcutSeqId(seq), items: items } });
+    } catch (e) {
+        return gcutFail(e);
+    }
+}
+
+/** Chosen clips ({kind, trackIndex, item}) as gcutRecordedAt reads them. */
+function gcutChosenFound(chosen) {
+    var out = [];
+    for (var k = 0; k < chosen.length; k++) out.push({ kind: chosen[k].kind, trackIndex: chosen[k].trackIndex, startT: gcutT(chosen[k].item.start) });
+    return out;
+}
+
 /**
  * args: { record, check? } — the `undo` record an act tool returned, as it returned it (pure data, so it
  * survives a panel reload). Returns { ok: true }, or { ok: true, alreadyUndone: true } when nothing of
@@ -2545,6 +2780,21 @@ function gcutToolUndo(argsJson) {
         if (record.kind === "enabled") {
             return gcutOk(gcutUndoSettings(seq, record, check, "on/off", gcutEnabled,
                 function (it, v) { it.disabled = !v; }, function (a, b) { return a === b; }));
+        }
+        if (record.kind === "volume") {
+            return gcutOk(gcutUndoSettings(seq, record, check, "volume", gcutLevel,
+                function (it, v) { gcutLevelParam(it).setValue(v, true); }, gcutSameLevel));
+        }
+        if (record.kind === "speed") {
+            return gcutOk(gcutUndoSettings(seq, record, check, "speed", gcutSpeed, function (it, v, x) {
+                var qi = gcutQeClipFor(x, clock);
+                if (!qi) throw new Error("Premiere's QE interface didn't find " + x.label + "'s clip. Use Premiere's Undo.");
+                qi.setSpeed(v, "", false, false, false);
+            }, function (a, b) { return Math.abs(a - b) <= 1e-4; }));
+        }
+        if (record.kind === "mute") return gcutOk(gcutUndoMute(seq, record, check));
+        if (record.kind === "transition") {
+            throw new Error("Genius Cut can't take a transition off: Premiere has no script call for it. Remove the transition by hand (Premiere's Undo).");
         }
         throw new Error("Genius Cut can't undo a change of kind " + record.kind + ".");
     } catch (e) {

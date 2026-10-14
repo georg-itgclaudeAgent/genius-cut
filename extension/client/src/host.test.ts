@@ -74,6 +74,22 @@ class ProjectItem {
   getOutPoint() { return Time.s(this.outS); }
 }
 
+/** A component property as measured in Premiere 26.5.2 (2026-10-14): the audio Volume component's "Level" reads
+ *  0.17783 at 0 dB and is linear (dB = 20·log10(v) + 15); setValue(v, true) reads back v. */
+class Param {
+  timeVarying = false;
+  constructor(public displayName: string, public value: any) {}
+  getValue() { return this.value; }
+  setValue(v: any, _update: boolean) { this.value = v; return 0; }
+  isTimeVarying() { return this.timeVarying; }
+}
+const coll = <T,>(xs: T[]) => Object.assign([...xs], { numItems: xs.length });
+/** A clip's components; an audio clip's Volume has Bypass and Level (0 dB). */
+function components(names: string[], level = 0.17783) {
+  return coll(names.map((displayName) => (displayName === "Volume"
+    ? { displayName, properties: coll([new Param("Bypass", false), new Param("Level", level)]) } : { displayName })));
+}
+
 class TrackItem {
   start: Time; outPoint: Time;
   /** The source time the clip really starts at; `inPoint` is what Premiere reports of it. */
@@ -89,8 +105,7 @@ class TrackItem {
   constructor(public track: Track, public projectItem: ProjectItem, startT: number, inS: number, durT: number, public mediaType: string) {
     this.start = Time.k(startT); this._end = Time.k(startT + durT);
     this.trueIn = Time.s(inS); this.outPoint = Time.s(inS + durT / TICKS);
-    const names = mediaType === "Video" ? ["Opacity", "Motion"] : ["Volume", "Channel Volume", "Panner"];
-    this.components = Object.assign(names.map((displayName) => ({ displayName })), { numItems: names.length });
+    this.components = components(mediaType === "Video" ? ["Opacity", "Motion"] : ["Volume", "Channel Volume", "Panner"]);
   }
   /** Premiere 26.5.2 (measured 2026-10-08) reports the in point floored to the SEQUENCE's frames
    *  (`seq.inPointOnSeqGrid`); the simulator's own edits always use `trueIn`. */
@@ -115,6 +130,8 @@ class TrackItem {
   /** The simulator's own trims (overwrites), never refused. */
   setEnd(t: number) { this._end = Time.k(t); this.outPoint = Time.s(this.trueIn.seconds + (t - this.start.t) / TICKS); }
   get name() { return this.projectItem.name; }
+  /** The Volume component's Level (linear), or undefined on a clip without one. */
+  get level() { return this.components.find((c: any) => c.displayName === "Volume")?.properties[1].value; }
   isSelected() { return this.selected; }
   getSpeed() { return this.speed; }
   isSpeedReversed() { return this.reversed; }
@@ -140,6 +157,8 @@ class Track {
   constructor(public seq: Seq, public kind: "video" | "audio", public index: number) {}
   get name() { return (this.kind === "video" ? "Video " : "Audio ") + (this.index + 1); }
   isMuted() { return this.muted; }
+  /** Premiere 26.5.2 (measured 2026-10-14): setMute(1) / setMute(0) toggles, isMuted() reads it back. */
+  setMute(v: number) { this.muted = !!v; }
   get clips() {
     const arr: any = [...this.items].sort((a, b) => a.start.t - b.start.t);
     arr.numItems = arr.length;
@@ -274,7 +293,10 @@ class FakeQE {
       getVideoTrackAt: (i: number) => this.track(this.seq.videoTracks[i]),
     }),
     getAudioTransitionByName: (name: string) => (this.transition && name === "Constant Power" ? { name } : null),
+    getVideoTransitionByName: (name: string) => (this.transition && name === "Cross Dissolve" ? { name } : null),
   };
+  /** Premiere taking setSpeed and doing nothing. */
+  speedNoop = false;
   /** Premiere 26.5.2 (measured 2026-10-14): qeTrack.razor("HH:MM:SS:FF") splits the clip under that frame on THAT track only
    *  (a linked partner on another track is not split); both pieces keep the clip's effects and state. */
   private razor(t: Track, tc: string) {
@@ -288,7 +310,8 @@ class FakeQE {
     if (!c) return true;
     const right = new TrackItem(t, c.projectItem, at, c.trueIn.seconds + (at - c.start.t) / TICKS, c.end.t - at, c.mediaType);
     right.disabled = c.disabled; right.speed = c.speed; right.reversed = c.reversed;
-    right.components = Object.assign(c.components.map((x: any) => ({ ...x })), { numItems: c.components.numItems });
+    const lvl = c.level;
+    right.components = components(c.components.map((x: any) => x.displayName), lvl);
     c.setEnd(at);
     t.items.push(right);
     return true;
@@ -305,6 +328,10 @@ class FakeQE {
           c.transitions.push({ applyToStart, duration, offset, alignment });
           return true;
         },
+        // Measured 2026-10-14: setSpeed(2, "", false, false, false) plays the clip at 2x and keeps its timeline length;
+        // its linked partner is unchanged.
+        setSpeed: (speed: number) => { if (!this.speedNoop) c.speed = speed; return true; },
+        getSpeed: () => c.speed,
       });
       cursor = c.end.t;
     }
@@ -3412,6 +3439,329 @@ describe("gcutToolSwitchAngle: show one angle for a stretch by switching the oth
       const c = switched();
       change(c);
       checkMatchesUndo(c.s, c.record, name === "untouched", c.original);
+    });
+  });
+});
+
+describe("gcutToolSetVolume: a clip-level volume in dB on chosen audio clips, and its undo", () => {
+  const vol = (s: any, clipIds: string[], db: unknown) => act(s, "gcutToolSetVolume", { clipIds, db });
+  const levelParam = (it: TrackItem) => it.components.find((c: any) => c.displayName === "Volume").properties[1] as Param;
+  const ZERO_DB = 0.17783;
+
+  it("sets the Volume component's Level, linear as measured (v = 10^((dB - 15) / 20)), on each chosen clip only", () => {
+    const s = scene();
+    s.seq.audioTracks[1].add(wav("music.wav", "node-9", 300), 90, 0, 40);
+    const r = vol(s, idsOn(s, "A1", "A2"), -6);
+    expect(r).toMatchObject({ ok: true, changed: 2, idMap: {} });
+    expect(r.level).toBeCloseTo(Math.pow(10, -21 / 20), 9);
+    expect(s.a.level).toBeCloseTo(0.0891251, 6);
+    expect(s.seq.audioTracks[1].items[0].level).toBeCloseTo(0.0891251, 6);
+    expect(Math.pow(10, (0 - 15) / 20)).toBeCloseTo(ZERO_DB, 5); // the formula meets the measured 0 dB value
+  });
+
+  it("undo puts each clip's previous level back exactly, from the stored record", () => {
+    const s = scene();
+    levelParam(s.a).value = 0.3;
+    const r = vol(s, idsOn(s, "A1"), 3);
+    expect(r.undo).toMatchObject({ kind: "volume", sequenceId: "seq-1" });
+    expect(asStored(r.undo)).toEqual(r.undo);
+    expect(undoTool({ host: load(s.seq) }, asStored(r.undo))).toEqual({ ok: true });
+    expect(s.a.level).toBe(0.3);
+  });
+
+  it.each([
+    ["a video clip", (s: any) => idsOn(s, "V1"), -6, "V1's clip is video: set_volume works on audio clips. Nothing was changed."],
+    ["more than +15 dB", (s: any) => idsOn(s, "A1"), 16, "db must be a number of decibels, at most +15 (Premiere's clip volume limit)."],
+    ["no dB", (s: any) => idsOn(s, "A1"), undefined, "db must be a number of decibels, at most +15 (Premiere's clip volume limit)."],
+  ])("refuses %s, changing nothing", (_, ids, db, msg) => {
+    const s = scene();
+    expect(() => vol(s, ids(s), db)).toThrow(msg);
+    expect(s.a.level).toBe(ZERO_DB);
+  });
+
+  it("refuses volume keyframes (a single level would replace them) and a locked track, changing nothing", () => {
+    const s = scene();
+    levelParam(s.a).timeVarying = true;
+    expect(() => vol(s, idsOn(s, "A1"), -6)).toThrow("A1's volume has keyframes, so one level would replace them. Nothing was changed; set it by hand.");
+    levelParam(s.a).timeVarying = false;
+    s.seq.audioTracks[0].locked = true;
+    expect(() => vol(s, idsOn(s, "A1"), -6)).toThrow("A1 is locked. Unlock it to change the volume.");
+    expect(s.a.level).toBe(ZERO_DB);
+  });
+
+  describe("undo", () => {
+    function set() {
+      const s = scene();
+      const record = asStored(vol(s, idsOn(s, "A1"), -6).undo);
+      return { s, record };
+    }
+    it("refuses, changing nothing, when the level was changed by hand since", () => {
+      const { s, record } = set();
+      levelParam(s.a).value = 0.5;
+      expect(() => undoTool(s, record)).toThrow("These clips were changed by hand since: A1's volume was changed. Nothing was undone; use Premiere's Undo instead.");
+      expect(s.a.level).toBe(0.5);
+    });
+    it("refuses when the clip was moved since", () => {
+      const { s, record } = set();
+      s.a.move(Time.s(1));
+      expect(() => undoTool(s, record)).toThrow(/A1's clip was moved, trimmed or removed/);
+    });
+    it("when the level is back (Premiere's Undo), says it is already undone", () => {
+      const { s, record } = set();
+      levelParam(s.a).value = ZERO_DB;
+      expect(undoTool(s, record)).toEqual({ ok: true, alreadyUndone: true });
+    });
+    it.each([
+      ["untouched", (_: any) => {}],
+      ["changed by hand", ({ s }: any) => { levelParam(s.a).value = 0.5; }],
+      ["back", ({ s }: any) => { levelParam(s.a).value = ZERO_DB; }],
+    ])("check: true matches the real undo (%s)", (name, change) => {
+      const c = set();
+      change(c);
+      checkMatchesUndo(c.s, c.record, name === "untouched");
+      if (name === "untouched") expect(c.s.a.level).toBe(ZERO_DB);
+    });
+  });
+});
+
+describe("gcutToolMuteTrack: mute or unmute a whole track, and its undo", () => {
+  const mute = (s: any, kind: unknown, track: unknown, muted: unknown) => act(s, "gcutToolMuteTrack", { kind, track, muted });
+
+  it("mutes an audio track with setMute (measured) and undo unmutes it", () => {
+    const s = multiScene();
+    const r = mute(s, "audio", 3, true);
+    expect(r).toMatchObject({ ok: true, track: "A3", muted: true, changed: true, idMap: {} });
+    expect(s.seq.audioTracks[2].muted).toBe(true);
+    expect(r.undo).toEqual({ kind: "mute", sequenceId: "seq-1", trackKind: "audio", trackIndex: 2, label: "A3", before: false, after: true });
+    expect(undoTool({ host: load(s.seq) }, asStored(r.undo))).toEqual({ ok: true });
+    expect(s.seq.audioTracks[2].muted).toBe(false);
+  });
+
+  it("unmutes a video track; a track already that way is unchanged and its undo is already undone", () => {
+    const s = multiScene();
+    s.seq.videoTracks[3].muted = true;
+    expect(mute(s, "video", 4, false)).toMatchObject({ ok: true, track: "V4", muted: false, changed: true });
+    expect(s.seq.videoTracks[3].muted).toBe(false);
+    const r = mute(s, "audio", 1, false);
+    expect(r).toMatchObject({ changed: false });
+    expect(undoTool(s, r.undo)).toEqual({ ok: true, alreadyUndone: true });
+  });
+
+  it.each([
+    ["an unknown kind", "music", 1, true, "kind must be \"audio\" or \"video\"."],
+    ["a track that doesn't exist", "audio", 4, true, "track must be a track number from 1 to 3 (A1 is 1)."],
+    ["a track that isn't a number", "audio", "A1", true, "track must be a track number from 1 to 3 (A1 is 1)."],
+    ["muted not a boolean", "audio", 1, "yes", "muted must be true or false."],
+  ])("refuses %s, changing nothing", (_, kind, track, muted, msg) => {
+    const s = multiScene();
+    expect(() => mute(s, kind, track, muted)).toThrow(msg);
+    expect(s.seq.audioTracks.map((t: Track) => t.muted)).toEqual([false, false, false]);
+  });
+
+  it("refuses when Premiere doesn't take it, leaving the track as it was", () => {
+    const s = multiScene();
+    s.seq.audioTracks[2].setMute = () => {};
+    expect(() => mute(s, "audio", 3, true)).toThrow("Premiere didn't mute A3. Nothing was changed.");
+  });
+
+  describe("undo", () => {
+    it("when the track was unmuted by hand (or Premiere's Undo), says it is already undone; a second undo too", () => {
+      const s = multiScene();
+      const record = asStored(mute(s, "audio", 3, true).undo);
+      s.seq.audioTracks[2].muted = false;
+      expect(undoTool(s, record)).toEqual({ ok: true, alreadyUndone: true });
+      s.seq.audioTracks[2].muted = true;
+      expect(undoTool(s, record)).toEqual({ ok: true });
+      expect(undoTool(s, record)).toEqual({ ok: true, alreadyUndone: true });
+    });
+    it("refuses when the track no longer exists", () => {
+      const s = multiScene();
+      const record = asStored(mute(s, "audio", 3, true).undo);
+      s.seq.audioTracks.numTracks = 2;
+      expect(() => undoTool(s, record)).toThrow("A3 no longer exists. Nothing was undone; use Premiere's Undo instead.");
+    });
+    it.each([["untouched"], ["unmuted by hand"]])("check: true matches the real undo (%s)", (name) => {
+      const s = multiScene();
+      const record = asStored(mute(s, "audio", 3, true).undo);
+      if (name !== "untouched") s.seq.audioTracks[2].muted = false;
+      const checked = undoCheck(s, record);
+      expect(s.seq.audioTracks[2].muted).toBe(name === "untouched");
+      const real = undoTool(s, record);
+      if (name === "untouched") { expect(checked).toEqual({ ok: true, wouldUndo: true }); expect(real).toEqual({ ok: true }); }
+      else expect(real).toEqual(checked);
+      expect(s.seq.audioTracks[2].muted).toBe(false);
+    });
+  });
+});
+
+describe("gcutToolAddTransition: a cross dissolve or constant power fade at a clip's start or end (QE), and its undo", () => {
+  const add = (s: any, clipId: string, at: unknown, seconds: unknown) => act(s, "gcutToolAddTransition", { clipId, at, seconds });
+  const NO_UNDO = "Genius Cut can't take a transition off: Premiere has no script call for it. Remove the transition by hand (Premiere's Undo).";
+
+  it("adds a video Cross Dissolve at the clip's start through QE (measured call), counted on the track", () => {
+    const s = georgScene();
+    const r = add(s, idsOn(s, "V1")[0], "start", 1);
+    expect(r).toMatchObject({ ok: true, transition: "Cross Dissolve", at: "start", seconds: 1, idMap: {} });
+    expect(s.v1.transitions).toEqual([{ applyToStart: true, duration: "00:00:01:00", offset: "00:00:00:00", alignment: 0.5 }]);
+    expect(asStored(r.undo)).toEqual(r.undo);
+    expect(r.undo).toMatchObject({ kind: "transition", sequenceId: "seq-1" });
+  });
+
+  it("adds an audio Constant Power fade at the clip's end, to the frame", () => {
+    const s = georgScene();
+    const r = add(s, idsOn(s, "A1")[0], "end", 0.49); // 12.25 frames: the nearest is 12
+    expect(r).toMatchObject({ ok: true, transition: "Constant Power", at: "end", seconds: 0.48 });
+    expect(s.a1.transitions).toEqual([{ applyToStart: false, duration: "00:00:00:12", offset: "00:00:00:00", alignment: 0.5 }]);
+  });
+
+  it("undo refuses, there being no measured call to remove one transition, in check mode too", () => {
+    const s = georgScene();
+    const r = add(s, idsOn(s, "V1")[0], "start", 1);
+    expect(() => undoCheck(s, asStored(r.undo))).toThrow(NO_UNDO);
+    expect(() => undoTool(s, asStored(r.undo))).toThrow(NO_UNDO);
+    expect(s.v1.transitions).toHaveLength(1);
+  });
+
+  it.each([
+    ["at that isn't start or end", "middle", 1, "at must be \"start\" or \"end\"."],
+    ["no length", "start", undefined, "seconds must be the transition's length, at least one frame."],
+    ["less than a frame", "start", 0.01, "seconds must be the transition's length, at least one frame."],
+    ["longer than the clip", "start", 11, "A 11 s transition is longer than V1's clip (10 s). Nothing was changed."],
+  ])("refuses %s, adding nothing", (_, at, seconds, msg) => {
+    const s = georgScene();
+    expect(() => add(s, idsOn(s, "V1")[0], at, seconds)).toThrow(msg);
+    expect(s.v1.transitions).toEqual([]);
+  });
+
+  it("refuses when Premiere doesn't have the transition, or adds nothing", () => {
+    const s = georgScene();
+    s.host.qe.transition = false;
+    expect(() => add(s, idsOn(s, "V1")[0], "start", 1)).toThrow("Premiere didn't find its Cross Dissolve transition. Nothing was changed.");
+    s.host.qe.transition = true;
+    const real = s.host.qe.project.getActiveSequence;
+    s.host.qe.project.getActiveSequence = () => {
+      const q = real(), t = q.getVideoTrackAt(0);
+      return { ...q, getVideoTrackAt: () => ({ ...t, numItems: t.numItems, getItemAt: (k: number) => ({ ...t.getItemAt(k), addTransition: () => true }), numTransitions: 0 }) };
+    };
+    expect(() => add(s, idsOn(s, "V1")[0], "start", 1)).toThrow("Premiere didn't add the transition to V1's clip. Nothing was changed.");
+  });
+
+  it("refuses a locked track and a stale id, adding nothing", () => {
+    const s = georgScene(), id = idsOn(s, "V1")[0];
+    s.seq.videoTracks[0].locked = true;
+    expect(() => add(s, id, "start", 1)).toThrow("V1 is locked. Unlock it to add a transition.");
+    s.seq.videoTracks[0].locked = false;
+    s.v1.start = Time.s(100.2);
+    expect(() => add(s, id, "start", 1)).toThrow(STALE);
+    expect(s.v1.transitions).toEqual([]);
+  });
+});
+
+describe("gcutToolSetSpeed: play chosen clips faster or slower (QE setSpeed, timeline length kept), and its undo", () => {
+  const speed = (s: any, clipIds: string[], v: unknown) => act(s, "gcutToolSetSpeed", { clipIds, speed: v });
+
+  it("sets each chosen clip's speed with QE setSpeed; its place and length stay (measured)", () => {
+    const s = georgScene(), before = exact(s.seq);
+    const r = speed(s, idsOn(s, "V2"), 2);
+    expect(r).toMatchObject({ ok: true, speed: 2, changed: 1, idMap: {} });
+    expect(s.v2.speed).toBe(2);
+    expect(exact(s.seq)).toEqual(before);
+    expect(getSeq(s).clips.find((c: any) => c.track === "V2").speed).toBe(2);
+  });
+
+  it("undo sets the previous speed back, from the stored record", () => {
+    const s = georgScene();
+    s.v2.speed = 0.5;
+    const r = speed(s, idsOn(s, "V2"), 2);
+    expect(r.undo).toMatchObject({ kind: "speed", sequenceId: "seq-1" });
+    expect(asStored(r.undo)).toEqual(r.undo);
+    expect(undoTool({ host: load(s.seq) }, asStored(r.undo))).toEqual({ ok: true });
+    expect(s.v2.speed).toBe(0.5);
+  });
+
+  it("refuses a clip whose own sound (or picture) isn't chosen with it: they would go out of sync", () => {
+    const s = scene();
+    expect(() => speed(s, idsOn(s, "V1"), 2)).toThrow(
+      "V1's clip and its own sound on A1 would go out of sync. Choose both, or neither. Nothing was changed.");
+    expect(() => speed(s, idsOn(s, "A1"), 2)).toThrow(
+      "A1's clip and its own picture on V1 would go out of sync. Choose both, or neither. Nothing was changed.");
+    expect([s.v.speed, s.a.speed]).toEqual([1, 1]);
+    expect(speed(s, idsOn(s, "V1", "A1"), 2)).toMatchObject({ ok: true, changed: 2 });
+    expect([s.v.speed, s.a.speed]).toEqual([2, 2]);
+  });
+
+  it.each([
+    ["no speed", undefined, "speed must be a number above 0 and at most 100 (1 = 100%, 2 = twice as fast)."],
+    ["zero", 0, "speed must be a number above 0 and at most 100 (1 = 100%, 2 = twice as fast)."],
+    ["a reverse (negative)", -1, "speed must be a number above 0 and at most 100 (1 = 100%, 2 = twice as fast)."],
+  ])("refuses %s, changing nothing", (_, v, msg) => {
+    const s = georgScene();
+    expect(() => speed(s, idsOn(s, "V2"), v)).toThrow(msg);
+    expect(s.v2.speed).toBe(1);
+  });
+
+  it("refuses a reversed clip, a locked track, and Premiere not taking it, changing nothing", () => {
+    const s = georgScene();
+    s.v2.reversed = 1;
+    expect(() => speed(s, idsOn(s, "V2"), 2)).toThrow("V2's clip plays reversed. Nothing was changed; set its speed by hand.");
+    s.v2.reversed = 0;
+    s.seq.videoTracks[1].locked = true;
+    expect(() => speed(s, idsOn(s, "V2"), 2)).toThrow("V2 is locked. Unlock it to change the speed.");
+    s.seq.videoTracks[1].locked = false;
+    s.host.qe.speedNoop = true;
+    expect(() => speed(s, idsOn(s, "V2", "V3"), 2)).toThrow("Premiere didn't set V2's speed. Nothing was changed.");
+    expect([s.v2.speed, s.v3.speed]).toEqual([1, 1]);
+  });
+
+  it("puts back the speeds it set when a later clip fails", () => {
+    const s = georgScene();
+    const realGet = s.host.qe.project.getActiveSequence;
+    s.host.qe.project.getActiveSequence = () => {
+      const q = realGet(), t3 = q.getVideoTrackAt(2);
+      return { ...q, getVideoTrackAt: (i: number) => (i !== 2 ? q.getVideoTrackAt(i)
+        : { ...t3, numItems: t3.numItems, getItemAt: (k: number) => ({ ...t3.getItemAt(k), setSpeed: () => true }) }) };
+    };
+    expect(() => speed(s, idsOn(s, "V2", "V3"), 2)).toThrow("Premiere didn't set V3's speed. Nothing was changed.");
+    expect([s.v2.speed, s.v3.speed]).toEqual([1, 1]);
+  });
+
+  describe("undo", () => {
+    function fast() {
+      const s = georgScene();
+      const record = asStored(speed(s, idsOn(s, "V2", "V3"), 2).undo);
+      return { s, record };
+    }
+    it("refuses, changing nothing, when a speed was changed by hand since", () => {
+      const { s, record } = fast();
+      s.v3.speed = 1.5;
+      expect(() => undoTool(s, record)).toThrow("These clips were changed by hand since: V3's speed was changed. Nothing was undone; use Premiere's Undo instead.");
+      expect([s.v2.speed, s.v3.speed]).toEqual([2, 1.5]);
+    });
+    it("refuses, changing nothing, when one was set back and the other not", () => {
+      const { s, record } = fast();
+      s.v3.speed = 1;
+      expect(() => undoTool(s, record)).toThrow("These clips were changed by hand since: V3's speed was set back. Nothing was undone; use Premiere's Undo instead.");
+      expect([s.v2.speed, s.v3.speed]).toEqual([2, 1]);
+    });
+    it("when both are back, says it is already undone; a second undo too", () => {
+      const { s, record } = fast();
+      expect(undoTool(s, record)).toEqual({ ok: true });
+      expect([s.v2.speed, s.v3.speed]).toEqual([1, 1]);
+      expect(undoTool(s, record)).toEqual({ ok: true, alreadyUndone: true });
+    });
+    it.each([
+      ["untouched", (_: any) => {}],
+      ["changed by hand", ({ s }: any) => { s.v3.speed = 1.5; }],
+      ["back", ({ s }: any) => { s.v2.speed = 1; s.v3.speed = 1; }],
+    ])("check: true matches the real undo (%s)", (name, change) => {
+      const c = fast();
+      change(c);
+      const speeds = [c.s.v2.speed, c.s.v3.speed];
+      const checked = outcomeOf(() => undoCheck(c.s, c.record));
+      expect([c.s.v2.speed, c.s.v3.speed]).toEqual(speeds);
+      const real = outcomeOf(() => undoTool(c.s, c.record));
+      if (name === "untouched") { expect(checked).toEqual({ ok: true, wouldUndo: true }); expect(real).toEqual({ ok: true }); }
+      else expect(real).toEqual(checked);
     });
   });
 });

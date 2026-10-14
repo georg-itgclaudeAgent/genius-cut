@@ -2590,6 +2590,25 @@ describe("gcutToolCutRanges: timeline ranges cut from chosen clips with Apply's 
       expect(allTracks(s.seq)).toEqual(original);
     });
 
+    it("when the original clips don't go back, lays the cut version back as it was and says so", () => {
+      const { s, record, cut } = cutGeorg();
+      const bins = s.seq.bin.map((pi) => [pi.inS, pi.outS]);
+      s.seq.dropSpanIndex = (s.seq as any).placements; // the undo's first placement goes missing
+      expect(() => undoTool(s, record)).toThrow("The original clips didn't go back as expected, so the cut version was put back as it was. " +
+        "Nothing was undone; try again, or use Premiere's Undo.");
+      expect(allTracks(s.seq)).toEqual(cut);
+      expect(s.seq.bin.map((pi) => [pi.inS, pi.outS])).toEqual(bins);
+    });
+
+    it("is not \"already undone\" when one clip is back but another's cut pieces remain: refuses, changing nothing", () => {
+      const { s, record, original, saved } = cutGeorg();
+      s.seq.videoTracks[0].items = saved[0]; // V1 back as it was (Premiere's Undo of part of it); V2, V3 and A1 still cut
+      expect(span(s.seq.videoTracks[0])).toEqual(original[0]);
+      const now = allTracks(s.seq);
+      expect(() => undoTool(s, record)).toThrow(/changed since.*Nothing was undone/);
+      expect(allTracks(s.seq)).toEqual(now);
+    });
+
     it("refuses when a source is no longer in the project, changing nothing", () => {
       const { s, record, cut } = cutGeorg();
       s.seq.bin = s.seq.bin.filter((pi) => pi !== s.b);

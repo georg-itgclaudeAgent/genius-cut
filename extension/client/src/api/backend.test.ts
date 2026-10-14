@@ -91,3 +91,51 @@ describe("transcript jobs (the assistant)", () => {
     expect(f.seen[1].timeoutMs!).toBeGreaterThan(60_000);
   });
 });
+
+describe("setup, settings and usage (the Setup page and Settings)", () => {
+  const SRC = { project: "my-proj-1", secret: "ANTHROPIC_API_KEY", version: "latest" };
+
+  it("reads and saves the settings: GET and PUT /settings with the token", async () => {
+    const f = fake(200, { anthropic_key: SRC, monthly_limit_usd: 20, setup_complete: true });
+    const api = createBackend({ transport: f.transport, token: () => "tok" });
+    expect(await api.settings()).toMatchObject({ setup_complete: true });
+    await api.saveSettings({ anthropic_key: SRC, monthly_limit_usd: 100, setup_complete: true });
+    expect(f.seen[0]).toMatchObject({ method: "GET", path: "/settings" });
+    expect(f.seen[1]).toMatchObject({ method: "PUT", path: "/settings" });
+    expect(JSON.parse(f.seen[1].body!)).toEqual({ anthropic_key: SRC, monthly_limit_usd: 100, setup_complete: true });
+    expect(f.seen.every((r) => r.headers.Authorization === "Bearer tok")).toBe(true);
+  });
+
+  it("tests a key source: POST /settings/test-key {anthropic_key}, allowing for gcloud and one Anthropic call", async () => {
+    const f = fake(200, { ok: true, message: "Connected" });
+    const api = createBackend({ transport: f.transport, token: () => "tok" });
+    expect(await api.testKey(SRC)).toEqual({ ok: true, message: "Connected" });
+    expect(f.seen[0]).toMatchObject({ method: "POST", path: "/settings/test-key" });
+    expect(JSON.parse(f.seen[0].body!)).toEqual({ anthropic_key: SRC });
+    expect(f.seen[0].timeoutMs!).toBeGreaterThanOrEqual(120_000);
+  });
+
+  it("calls the gcloud setup routes, with the project and secret escaped in the query", async () => {
+    const f = fake(200, {});
+    const api = createBackend({ transport: f.transport, token: () => "tok" });
+    await api.gcloud();
+    await api.startLogin();
+    await api.loginStatus();
+    await api.projects();
+    await api.secrets("my-proj-1");
+    await api.versions("my-proj-1", "A&B");
+    expect(f.seen.map((r) => `${r.method} ${r.path}`)).toEqual([
+      "GET /setup/gcloud", "POST /setup/login", "GET /setup/login", "GET /setup/projects",
+      "GET /setup/secrets?project=my-proj-1", "GET /setup/versions?project=my-proj-1&secret=A%26B"]);
+    expect(f.seen.every((r) => r.headers.Authorization === "Bearer tok")).toBe(true);
+    // gcloud can take a while (it has a 60 s timeout on the backend).
+    expect(f.seen[3].timeoutMs!).toBeGreaterThan(60_000);
+  });
+
+  it("reads the month's usage: GET /usage", async () => {
+    const f = fake(200, { month_usd: 1, limit_usd: 20, limit_tier: 20, resets_on: "2026-11-01", run_count: 0, runs: [] });
+    const api = createBackend({ transport: f.transport, token: () => "tok" });
+    expect(await api.usage()).toMatchObject({ resets_on: "2026-11-01" });
+    expect(f.seen[0]).toMatchObject({ method: "GET", path: "/usage" });
+  });
+});

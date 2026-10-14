@@ -1,12 +1,15 @@
 import { useEffect, useState } from "react";
-import { dataDir, evalScript, node } from "./api/cep";
+import { dataDir, evalScript, node, openExternal } from "./api/cep";
 import { runtime } from "./api/runtime";
 import { startAssistant, type Bridge } from "./bridge/server";
 import { cutTabBusy } from "./lib/busy";
 import type { Snapshot, TrimResponse } from "./api/types";
 import { useBackend } from "./hooks/useBackend";
 import { startingMessage } from "./lib/lifecycle";
+import { setupGate } from "./lib/setup";
 import { CutTab } from "./components/CutTab";
+import { SetupPage } from "./components/Setup";
+import { SettingsPage } from "./components/Settings";
 import { StyleLibrary, type LastTrim } from "./components/StyleLibrary";
 
 const VERSION = "0.1.0";
@@ -58,12 +61,28 @@ export function App() {
   const [lastTrim, setLastTrim] = useState<LastTrim | null>(null);
   const ready = state.kind === "ready";
   const health = state.kind === "ready" || state.kind === "starting" ? state.health : null;
+  const reachable = health !== null;
+
+  // Live mode opens on Setup until the backend says it's complete (only a passing key test does).
+  const [setupComplete, setSetupComplete] = useState<boolean | null>(null);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  useEffect(() => {
+    if (runtime.mode !== "live" || !reachable || setupComplete !== null || settingsError) return;
+    runtime.backend.settings().then((s) => setSetupComplete(s.setup_complete),
+      (e) => setSettingsError(e instanceof Error ? e.message : String(e)));
+  }, [reachable, setupComplete, settingsError]);
+  const gate = setupGate(runtime.mode, setupComplete);
 
   return (
     <div className="panel">
       <header className="hd">
         <span className="mark">GC</span>
         <span className="wm">Genius<span>Cut</span></span>
+        {gate === "open" && reachable && (
+          <button className={`gear${settingsOpen ? " on" : ""}`} aria-label="Settings" title="Settings" aria-pressed={settingsOpen}
+            onClick={() => setSettingsOpen(!settingsOpen)}>⚙</button>
+        )}
         <span className="ver">{VERSION}</span>
       </header>
 
@@ -75,18 +94,39 @@ export function App() {
         <div className="banner"><b>Sample data.</b> Running outside Premiere: the clip, cuts and results are illustrative.</div>
       )}
 
-      <div className="tabs" role="tablist">
-        <button className="tab" role="tab" aria-selected="true">Cut</button>
-        <button className="tab" role="tab" aria-selected="false" disabled>Generate</button>
-        <button className="tab" role="tab" aria-selected="false" disabled>Sound</button>
-      </div>
+      {gate !== "open" && <BackendStatus state={state} onRetry={retry} />}
 
-      <BackendStatus state={state} onRetry={retry} />
+      {gate === "checking" && settingsError && (
+        <div className="sec">
+          <div className="note bad">Couldn't read Genius Cut's settings: {settingsError}
+            <div className="actions-row"><button className="btn btn-g" onClick={() => setSettingsError(null)}>Retry</button></div>
+          </div>
+        </div>
+      )}
+      {gate === "setup" && reachable && (
+        <SetupPage api={runtime.backend} openUrl={openExternal} onDone={() => setSetupComplete(true)} />
+      )}
+      {gate === "open" && settingsOpen && (
+        <SettingsPage api={runtime.backend} keyFromCache={!!health?.ai?.key_from_cache} onClose={() => setSettingsOpen(false)} />
+      )}
 
-      <CutTab health={health} ready={ready}
-        onTrimmed={(snap: Snapshot, res: TrimResponse, checked: boolean[]) => setLastTrim({ snap, res, checked })} />
+      {/* Hidden, not unmounted, while Settings is open: a review in progress stays as it was. */}
+      {gate === "open" && (
+        <div className="main" hidden={settingsOpen}>
+          <div className="tabs" role="tablist">
+            <button className="tab" role="tab" aria-selected="true">Cut</button>
+            <button className="tab" role="tab" aria-selected="false" disabled>Generate</button>
+            <button className="tab" role="tab" aria-selected="false" disabled>Sound</button>
+          </div>
 
-      <StyleLibrary ready={ready} lastTrim={lastTrim} />
+          <BackendStatus state={state} onRetry={retry} />
+
+          <CutTab health={health} ready={ready}
+            onTrimmed={(snap: Snapshot, res: TrimResponse, checked: boolean[]) => setLastTrim({ snap, res, checked })} />
+
+          <StyleLibrary ready={ready} lastTrim={lastTrim} />
+        </div>
+      )}
     </div>
   );
 }

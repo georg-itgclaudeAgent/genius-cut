@@ -6,7 +6,9 @@
 import { API_VERSION } from "../lib/lifecycle";
 import type { Transport } from "./backend";
 import type { Host } from "./host";
-import type { AiStatus, Health, Library, RunCost, SequenceCut, Snapshot, SnapshotItem, Span, StyleExample, TrimResponse, Word } from "./types";
+import type {
+  AiStatus, Health, Library, RunCost, SequenceCut, Settings, Snapshot, SnapshotItem, Span, StyleExample, TrimResponse, Usage, Word,
+} from "./types";
 
 const W = (w: string, start: number, end: number): Word => ({ w, start, end });
 const WORDS: Word[] = [
@@ -97,8 +99,27 @@ export const mockTransport: Transport = async (req) => {
     summary = "- Cut filler words (um, uh, you know) at the start of an answer.\n- Keep product names intact.";
     return ok({ summary, cost: sampleCost(2400, 900) });
   }
+  // Settings and the Setup page's listings (the sample panel never gates on Setup).
+  const path = req.path.split("?")[0];
+  if (path === "/settings" && req.method === "PUT") { settings = JSON.parse(req.body || "{}"); return ok(settings); }
+  if (path === "/settings") return ok(settings);
+  if (path === "/settings/test-key") { await delay(600); return ok({ ok: true, message: "Sample data: no key was read." }); }
+  if (path === "/setup/gcloud") return ok({ installed: true, path: null, version: "520.0.0", account: "editor@example.com" });
+  if (path === "/setup/login") return ok({ state: "done", message: "Signed in." });
+  if (path === "/setup/projects") return ok({ projects: [{ id: "sample-project", name: "Sample project" }] });
+  if (path === "/setup/secrets") return ok({ secrets: ["ANTHROPIC_API_KEY"] });
+  if (path === "/setup/versions") return ok({ versions: [{ version: "1", state: "enabled" }] });
+  if (path === "/usage") {
+    const now = new Date(), next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
+    const usage: Usage = { month_usd: monthUsd, limit_usd: settings.monthly_limit_usd, limit_tier: settings.monthly_limit_usd,
+      resets_on: next.toISOString().slice(0, 10), run_count: 1, runs: [{ at: now.toISOString(), kind: "trim", model: MODEL, usd: 0.02 }] };
+    return ok(usage);
+  }
   return { status: 404, body: JSON.stringify({ detail: `No mock for ${req.path}` }) };
 };
+
+let settings: Settings = { anthropic_key: { project: "sample-project", secret: "ANTHROPIC_API_KEY", version: "latest" },
+  monthly_limit_usd: 20, setup_complete: true };
 
 export const mockHost: Host = {
   async snapshotSelection() { await delay(300); return SNAPSHOT; },

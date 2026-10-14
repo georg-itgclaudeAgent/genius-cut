@@ -3,10 +3,15 @@
  * Node's http module (CEP --enable-nodejs), so CORS never applies; in a browser it's the
  * sample-data mock.
  */
-import type { Health, Library, RunCost, StyleExample, TranscriptJob, TranscriptRequest, TrimRequest, TrimResponse, Word } from "./types";
+import type {
+  GcloudStatus, GcpProject, Health, KeySource, KeyTest, Library, LoginStatus, RunCost, SecretVersion, Settings, StyleExample,
+  TranscriptJob, TranscriptRequest, TrimRequest, TrimResponse, Usage, Word,
+} from "./types";
+
+type Method = "GET" | "POST" | "PUT" | "DELETE";
 
 export interface TransportRequest {
-  method: "GET" | "POST";
+  method: Method;
   path: string;
   headers: Record<string, string>;
   body?: string;
@@ -31,8 +36,11 @@ function detailOf(body: string): string {
   return body.trim() || "No response body";
 }
 
+/** Longer than the backend's own 60 s gcloud timeout, so its error message gets through. */
+const GCLOUD_MS = 90_000;
+
 export function createBackend({ transport, token }: { transport: Transport; token: () => string }) {
-  async function call<T>(method: "GET" | "POST", path: string, opts: { auth?: boolean; body?: unknown; timeoutMs?: number } = {}) {
+  async function call<T>(method: Method, path: string, opts: { auth?: boolean; body?: unknown; timeoutMs?: number } = {}) {
     const headers: Record<string, string> = {};
     if (opts.auth !== false) headers.Authorization = `Bearer ${token()}`;
     let body: string | undefined;
@@ -58,6 +66,21 @@ export function createBackend({ transport, token }: { transport: Transport; toke
     transcript: (req: TranscriptRequest) => call<TranscriptJob>("POST", "/transcript", { body: req, timeoutMs: 30_000 }),
     transcriptJob: (id: string, waitS: number) =>
       call<TranscriptJob>("GET", `/transcript/${encodeURIComponent(id)}?wait=${waitS}`, { timeoutMs: (waitS + 30) * 1000 }),
+
+    // The Setup page and Settings. gcloud calls have a 60 s timeout on the backend; the key test
+    // reads the secret through gcloud, then makes one Anthropic call.
+    settings: () => call<Settings>("GET", "/settings"),
+    saveSettings: (s: Settings) => call<Settings>("PUT", "/settings", { body: s }),
+    testKey: (anthropic_key: KeySource) => call<KeyTest>("POST", "/settings/test-key", { body: { anthropic_key }, timeoutMs: GCLOUD_MS * 2 }),
+    gcloud: () => call<GcloudStatus>("GET", "/setup/gcloud", { timeoutMs: GCLOUD_MS }),
+    startLogin: () => call<LoginStatus>("POST", "/setup/login", { timeoutMs: GCLOUD_MS }),
+    loginStatus: () => call<LoginStatus>("GET", "/setup/login"),
+    projects: () => call<{ projects: GcpProject[] }>("GET", "/setup/projects", { timeoutMs: GCLOUD_MS }),
+    secrets: (project: string) =>
+      call<{ secrets: string[] }>("GET", `/setup/secrets?project=${encodeURIComponent(project)}`, { timeoutMs: GCLOUD_MS }),
+    versions: (project: string, secret: string) => call<{ versions: SecretVersion[] }>("GET",
+      `/setup/versions?project=${encodeURIComponent(project)}&secret=${encodeURIComponent(secret)}`, { timeoutMs: GCLOUD_MS }),
+    usage: () => call<Usage>("GET", "/usage"),
   };
 }
 

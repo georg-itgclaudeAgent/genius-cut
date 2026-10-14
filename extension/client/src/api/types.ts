@@ -98,6 +98,10 @@ export interface AiStatus {
   month_usd: number | null;       // null: the spend ledger couldn't be read
   limit_usd: number;
   usd_per_minute: number | null;  // null: the model has no price
+  /** The editor's chosen monthly limit, 20 or 100 (absent on backends before the Setup page). */
+  limit_tier?: 20 | 100;
+  /** The key in use is the encrypted local copy: gcloud couldn't read Secret Manager (login expired?). */
+  key_from_cache?: boolean;
 }
 
 export interface Health {
@@ -125,3 +129,39 @@ export interface StyleExample {
 }
 
 export interface Library { examples: StyleExample[]; summary: string | null }
+
+// ── Setup page and Settings (backend/geniuscut/setup.py, settings.py, spend.usage) ──
+
+/** Where the editor's Anthropic key lives: their own GCP project's Secret Manager. */
+export interface KeySource { project: string; secret: string; version: string }
+
+export interface Settings {
+  anthropic_key: KeySource;
+  monthly_limit_usd: 20 | 100;
+  /** Set only by a passing key test. */
+  setup_complete: boolean;
+}
+
+export interface KeyTest { ok: boolean; message: string }
+
+/** account null: nobody is signed in to gcloud. */
+export interface GcloudStatus { installed: boolean; path: string | null; version: string | null; account: string | null }
+
+export interface LoginStatus { state: "idle" | "running" | "done" | "failed"; message: string }
+
+export interface GcpProject { id: string; name: string }
+
+export interface SecretVersion { version: string; state: string }
+
+export interface UsageRun { at: string; kind: string; model: string; usd: number | null }
+
+export interface Usage {
+  month_usd: number;
+  limit_usd: number;
+  limit_tier: 20 | 100;
+  /** YYYY-MM-DD: the 1st of next month. */
+  resets_on: string;
+  run_count: number;
+  /** This month's last 10 runs, newest first. */
+  runs: UsageRun[];
+}

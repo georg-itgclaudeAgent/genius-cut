@@ -5,6 +5,7 @@ import { backendPaths, liveRuntimePython } from "../lib/paths";
 declare global {
   interface Window {
     cep_node?: { require: (id: string) => any };
+    cep?: { util?: { openURLInDefaultBrowser?: (url: string) => void } };
     CSInterface?: new () => { evalScript(script: string, cb?: (r: string) => void): void; getSystemPath(t: string): string };
   }
 }
@@ -96,4 +97,11 @@ export function killProcess(pid: number): void {
 
 export function evalScript(script: string): Promise<string> {
   return new Promise((resolve) => new window.CSInterface!().evalScript(script, resolve));
+}
+
+/** Open a web page in the default browser (CEP's own call inside Premiere, a new tab outside it). */
+export function openExternal(url: string): void {
+  const open = window.cep?.util?.openURLInDefaultBrowser;
+  if (open) open(url);
+  else window.open(url, "_blank", "noopener");
 }

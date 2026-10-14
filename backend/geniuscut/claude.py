@@ -12,6 +12,9 @@
 - On the Anthropic API, server-side refusal fallback is on (`fallbacks="default"`), so a
   policy decline is retried on a fallback model inside the same call. Vertex doesn't offer it.
 - A refusal or a truncated reply raises instead of being silently parsed.
+- `agent_step` is one step of the panel's agent loop (agent.py): streamed, tools offered with
+  `tool_choice` auto, effort high, adaptive thinking (the default: no `thinking` param), prompt
+  caching on (`cache_control` auto), recorded under `response.model` with cache tokens.
 - Before every call the spend gate checks the worst case against the monthly limit, so a
   refused run never reaches the API; an unpriced model is refused. Usage is recorded in the
   spend ledger after every reply.
@@ -20,6 +23,7 @@
 import json
 import os
 import subprocess
+from contextlib import contextmanager
 
 import anthropic
 
@@ -28,6 +32,7 @@ from geniuscut.errors import LLMError
 
 MODEL = os.environ.get("GENIUSCUT_CLAUDE_MODEL", "claude-opus-5-5")
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
+AGENT_MAX_TOKENS = 16000
 
 
 class ClaudeError(LLMError):
@@ -83,8 +88,27 @@ def _call(prompt: str, *, system: str | None, client, output_config: dict, max_t
     else:
         kwargs.update(betas=[FALLBACK_BETA], fallbacks="default")
         create = client.beta.messages.create
-    try:
+    with _api_errors():
         response = create(**kwargs)
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        spend.record(MODEL, int(getattr(usage, "input_tokens", 0) or 0), int(getattr(usage, "output_tokens", 0) or 0))
+    if response.stop_reason == "refusal":
+        details = getattr(response, "stop_details", None)
+        raise ClaudeError(f"Claude declined the request ({getattr(details, 'category', None) or 'no category'}).")
+    if response.stop_reason == "max_tokens":
+        raise ClaudeError("Claude's reply was cut off at max_tokens. Try a shorter clip.")
+    text = "".join(b.text for b in response.content if getattr(b, "type", None) == "text")
+    if not text.strip():
+        raise ClaudeError("Claude returned no text.")
+    return text
+
+
+@contextmanager
+def _api_errors():
+    """Anthropic SDK errors as ClaudeError with a plain message."""
+    try:
+        yield
     except anthropic.AuthenticationError as e:
         raise ClaudeError(f"The Anthropic API key was rejected: {_api_message(e)}") from e
     except anthropic.RateLimitError as e:
@@ -98,18 +122,38 @@ def _call(prompt: str, *, system: str | None, client, output_config: dict, max_t
             raise ClaudeError("No Google Cloud login for Vertex AI on this machine. "
                               "Run: gcloud auth application-default login") from e
         raise
+
+
+def _tokens(usage, name: str) -> int:
+    return int(getattr(usage, name, 0) or 0)
+
+
+def agent_step(messages: list, tools: list[dict], system: str, *, client, input_tokens: int):
+    """One agent step: gate on `input_tokens` (the caller's estimate) plus AGENT_MAX_TOKENS,
+    stream, return the final message. The caller handles stop_reason (refusal, max_tokens,
+    tool_use, end_turn) and appends `response.content` whole. Spend is recorded under the model
+    that answered (an unpriced fallback is priced as MODEL), cache tokens included."""
+    if spend.price(MODEL) is None:
+        raise ClaudeError(f"No price is known for Claude model '{MODEL}', so the monthly limit can't be "
+                          f"enforced. Use one of: {', '.join(sorted(spend.PRICES))}.")
+    spend.check_tokens(MODEL, input_tokens, AGENT_MAX_TOKENS)
+    kwargs = dict(model=MODEL, max_tokens=AGENT_MAX_TOKENS, system=system, tools=tools,
+                  tool_choice={"type": "auto"}, messages=messages, output_config={"effort": "high"},
+                  cache_control={"type": "ephemeral"})
+    if provider() == "vertex":
+        stream = client.messages.stream
+    else:
+        kwargs.update(betas=[FALLBACK_BETA], fallbacks="default")
+        stream = client.beta.messages.stream
+    with _api_errors():
+        with stream(**kwargs) as s:
+            response = s.get_final_message()
     usage = getattr(response, "usage", None)
     if usage is not None:
-        spend.record(MODEL, int(getattr(usage, "input_tokens", 0) or 0), int(getattr(usage, "output_tokens", 0) or 0))
-    if response.stop_reason == "refusal":
-        details = getattr(response, "stop_details", None)
-        raise ClaudeError(f"Claude declined the request ({getattr(details, 'category', None) or 'no category'}).")
-    if response.stop_reason == "max_tokens":
-        raise ClaudeError("Claude's reply was cut off at max_tokens. Try a shorter clip.")
-    text = "".join(b.text for b in response.content if getattr(b, "type", None) == "text")
-    if not text.strip():
-        raise ClaudeError("Claude returned no text.")
-    return text
+        spend.record(getattr(response, "model", None) or MODEL, _tokens(usage, "input_tokens"),
+                     _tokens(usage, "output_tokens"), cache_write=_tokens(usage, "cache_creation_input_tokens"),
+                     cache_read=_tokens(usage, "cache_read_input_tokens"), price_as=MODEL)
+    return response
 
 
 def ask_json(prompt: str, schema: dict, *, system: str | None = None, client=None,

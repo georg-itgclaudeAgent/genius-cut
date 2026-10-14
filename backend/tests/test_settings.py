@@ -152,7 +152,7 @@ def test_no_project_ignores_any_cached_key():
 def test_fresh_only_skips_env_and_cache(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-env")
     calls = []
-    src = settings.KeySource(project="p-1")
+    src = settings.KeySource(project="proj-1")
     assert secrets.anthropic_api_key(run=_ok("sk-gsm", calls), gcloud="gcloud", source=src, fresh_only=True) == "sk-gsm"
     assert calls
     with pytest.raises(secrets.MissingKeyError):

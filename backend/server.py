@@ -14,7 +14,10 @@ CORS is configured: a browser page can't reach the API, and the Host check below
 also stops DNS-rebinding tricks.
 
 `GET`/`PUT /settings` read and save this editor's settings (where their Anthropic key lives,
-the monthly limit; never a key), and `POST /settings/test-key` checks a key source.
+the monthly limit; never a key), and `POST /settings/test-key` checks a key source (a pass saves it
+and marks setup complete). `/setup/*` and `/usage` serve the Setup and Settings screens; their
+request/response shapes are listed at the top of geniuscut/setup.py. `/agent/runs*` run Claude's
+side of an instruction (shapes at the top of geniuscut/agent.py).
 
 AI errors: a missing key is 503, the monthly spend limit (`spend.BudgetExceeded`) is
 402, and any other provider error is 502. `/health` reports the AI provider, model and
@@ -33,15 +36,16 @@ if _here not in _sys.path:
 import hmac
 import os
 import logging
+import subprocess
 import threading
 from pathlib import Path
 from typing import Callable
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from geniuscut import audio, claude, config, cuts, library, llm, secrets, settings, spend, transcripts, trim
+from geniuscut import agent, audio, claude, config, cuts, library, llm, secrets, settings, setup, spend, transcripts, trim
 from geniuscut.llm import LLMError
 from geniuscut.models import StyleExample, TranscriptJob, TranscriptRequest, TrimRequest, TrimResponse, Word
 
@@ -63,11 +67,28 @@ def ai_status() -> dict:
         month_usd = None
     per_minute = spend.estimate_per_minute(model) if model else None
     return {"provider": provider, "model": model, "month_usd": month_usd, "limit_usd": spend.limit_usd(),
-            "limit_tier": settings.load().monthly_limit_usd, "usd_per_minute": per_minute}
+            "limit_tier": settings.load().monthly_limit_usd, "usd_per_minute": per_minute,
+            "key_from_cache": secrets.key_from_cache()}
 
 
 class TestKeyRequest(BaseModel):
     anthropic_key: settings.KeySource | None = None
+
+
+class AgentStart(BaseModel):
+    instruction: str = Field(pattern=r"\S")
+    selection: dict | list = {}
+    sequence: dict = {}
+
+
+class ToolResult(BaseModel):
+    tool_use_id: str
+    content: str
+    is_error: bool = False
+
+
+class AgentResults(BaseModel):
+    results: list[ToolResult]
 
 
 class NewExample(BaseModel):
@@ -88,6 +109,10 @@ def create_app(
     stt_phase: Callable[[], str | None] = lambda: None,
     retry_load: Callable[[], None] = lambda: None,
     check_key: Callable[[settings.KeySource], dict] = claude.check_key,
+    gcloud_run: Callable = subprocess.run,
+    find_gcloud: Callable[[], str | None] = setup.find_gcloud,
+    login: setup.Login | None = None,
+    agent_runs: agent.Runs | None = None,
 ) -> FastAPI:
     llm_cost = globals()["llm"].run_cost  # the `llm` parameter shadows the module in here
     app = FastAPI(title="Genius Cut backend", version=config.VERSION)
@@ -203,6 +228,8 @@ def create_app(
             settings.validate_for_save(body)
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
+        old = settings.load()  # only a passing key test completes setup; a new source undoes it
+        body.setup_complete = old.setup_complete and old.anthropic_key == body.anthropic_key
         return settings.save(body)
 
     @app.post("/settings/test-key", dependencies=auth)
@@ -212,7 +239,87 @@ def create_app(
             settings.validate_key_source(src)
         except ValueError as e:
             return {"ok": False, "message": str(e)}
-        return check_key(src)
+        result = check_key(src)
+        if result.get("ok"):
+            src = src.model_copy(update={"project": src.project.strip()})
+            settings.save(settings.load().model_copy(update={"anthropic_key": src, "setup_complete": True}))
+        return result
+
+    # ── setup screen (shapes: geniuscut/setup.py) ──────────────────────
+    login_job = login or setup.Login(find=find_gcloud)
+
+    def setup_errors(e: Exception) -> HTTPException:
+        if isinstance(e, ValueError):
+            return HTTPException(status_code=422, detail=str(e))
+        return HTTPException(status_code=502, detail=str(e))
+
+    @app.get("/setup/gcloud", dependencies=auth)
+    def get_gcloud() -> dict:
+        return setup.status(run=gcloud_run, find=find_gcloud)
+
+    @app.post("/setup/login", dependencies=auth, status_code=202)
+    def post_login() -> dict:
+        try:
+            return login_job.start()
+        except setup.LoginBusy as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        except setup.SetupError as e:
+            raise setup_errors(e) from e
+
+    @app.get("/setup/login", dependencies=auth)
+    def get_login() -> dict:
+        return login_job.status()
+
+    @app.get("/setup/projects", dependencies=auth)
+    def get_projects() -> dict:
+        try:
+            return {"projects": setup.list_projects(run=gcloud_run, find=find_gcloud)}
+        except (ValueError, setup.SetupError) as e:
+            raise setup_errors(e) from e
+
+    @app.get("/setup/secrets", dependencies=auth)
+    def get_secrets(project: str = "") -> dict:
+        try:
+            return {"secrets": setup.list_secrets(project, run=gcloud_run, find=find_gcloud)}
+        except (ValueError, setup.SetupError) as e:
+            raise setup_errors(e) from e
+
+    @app.get("/setup/versions", dependencies=auth)
+    def get_versions(project: str = "", secret: str = "") -> dict:
+        try:
+            return {"versions": setup.list_versions(project, secret, run=gcloud_run, find=find_gcloud)}
+        except (ValueError, setup.SetupError) as e:
+            raise setup_errors(e) from e
+
+    @app.get("/usage", dependencies=auth)
+    def get_usage() -> dict:
+        return spend.usage()
+
+    # ── agent runs (shapes: geniuscut/agent.py) ────────────────────────
+    runs = agent_runs or agent.Runs()
+
+    def agent_call(fn, *args) -> dict:
+        try:
+            return fn(*args)
+        except agent.RunError as e:
+            raise HTTPException(status_code=e.status, detail=str(e)) from e
+
+    @app.post("/agent/runs", dependencies=auth)
+    def post_agent_run(body: AgentStart) -> dict:
+        return agent_call(runs.start, body.instruction, body.selection, body.sequence)
+
+    @app.post("/agent/runs/{run_id}/results", dependencies=auth)
+    def post_agent_results(run_id: str, body: AgentResults) -> dict:
+        return agent_call(runs.results, run_id, [r.model_dump() for r in body.results])
+
+    @app.post("/agent/runs/{run_id}/approve", dependencies=auth)
+    def post_agent_approve(run_id: str) -> dict:
+        return agent_call(runs.approve, run_id)
+
+    @app.delete("/agent/runs/{run_id}", dependencies=auth)
+    def delete_agent_run(run_id: str) -> dict:
+        runs.cancel(run_id)
+        return {"ok": True}
 
     return app
 

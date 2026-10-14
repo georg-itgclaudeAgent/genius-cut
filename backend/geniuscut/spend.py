@@ -15,6 +15,7 @@ import logging
 import math
 import os
 import threading
+import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -47,6 +48,12 @@ PRICES: dict[str, list[tuple[date, float, float]]] = {
     "claude-opus-5-5": [(date.min, 4.00, 20.00)],
 }
 
+# Prompt-cache prices, USD per 1M tokens (cache write, cache read). Opus 5.5: a write is the
+# input rate x 1.25, a read $0.20. A model without an entry pays its input rate for both.
+CACHE_PRICES: dict[str, tuple[float, float]] = {
+    "claude-opus-5-5": (5.00, 0.20),
+}
+
 
 CHARS_PER_TOKEN = 1.5  # prompt-size estimate for the gate, see check_budget
 
@@ -71,11 +78,13 @@ def price(model: str, on: date | None = None) -> tuple[float, float] | None:
     return current
 
 
-def cost_usd(model: str, input_tokens: int, output_tokens: int, on: date | None = None) -> float | None:
+def cost_usd(model: str, input_tokens: int, output_tokens: int, on: date | None = None, *,
+             cache_write: int = 0, cache_read: int = 0) -> float | None:
     p = price(model, on)
     if p is None:
         return None
-    return (input_tokens * p[0] + output_tokens * p[1]) / 1_000_000
+    write, read = CACHE_PRICES.get(model, (p[0], p[0]))
+    return (input_tokens * p[0] + output_tokens * p[1] + cache_write * write + cache_read * read) / 1_000_000
 
 
 def money(usd: float) -> str:
@@ -128,14 +137,22 @@ def tagged(kind: str):
         _kind.reset(token)
 
 
+_run: ContextVar[str | None] = ContextVar("geniuscut_spend_run", default=None)
+
+
 @contextmanager
-def meter(kind: str = "other"):
-    m = Meter(kind=kind)
+def meter(kind: str = "other", *, run: str | None = None, m: Meter | None = None):
+    """Collect the calls made inside the block. Their ledger rows share one run id (`run`, else the
+    enclosing block's, else a new one), so the Usage tab shows a multi-call run as one run. Pass an
+    existing Meter as `m` to keep adding to it (an agent run's steps)."""
+    m = m or Meter(kind=kind)
     token = _current.set(m)
+    run_token = _run.set(run or _run.get() or uuid.uuid4().hex)
     try:
         with tagged(kind):
             yield m
     finally:
+        _run.reset(run_token)
         _current.reset(token)
 
 
@@ -151,16 +168,29 @@ def ledger_path():
     return config.data_dir() / "spend.jsonl"
 
 
-def record(model: str, input_tokens: int, output_tokens: int, *, now: datetime | None = None) -> float | None:
-    """Log one call's usage (to the ledger and any open meter); returns its cost."""
+def record(model: str, input_tokens: int, output_tokens: int, *, now: datetime | None = None,
+           cache_write: int = 0, cache_read: int = 0, price_as: str | None = None) -> float | None:
+    """Log one call's usage (to the ledger and any open meter); returns its cost.
+
+    `model` is the model that answered (a server-side fallback may differ from the one asked);
+    if it has no price, it is priced as `price_as`, so a fallback can't switch the gate off.
+    A meter counts cache writes and reads as input tokens."""
     now = now or datetime.now(timezone.utc)
-    usd = cost_usd(model, input_tokens, output_tokens, on=now.astimezone(timezone.utc).date())
+    on = now.astimezone(timezone.utc).date()
+    priced = model if price(model, on) is not None or not price_as else price_as
+    usd = cost_usd(priced, input_tokens, output_tokens, on=on, cache_write=cache_write, cache_read=cache_read)
     m = _current.get()
     if m is not None:
-        m.calls.append((model, input_tokens, output_tokens, usd))
+        m.calls.append((model, input_tokens + cache_write + cache_read, output_tokens, usd))
     row = {"ts": now.astimezone(timezone.utc).isoformat(timespec="seconds"), "model": model,
            "kind": _kind.get(), "input_tokens": input_tokens, "output_tokens": output_tokens,
            "usd": usd}
+    if cache_write or cache_read:
+        row.update(cache_write_tokens=cache_write, cache_read_tokens=cache_read)
+    if priced != model:
+        row["priced_as"] = priced
+    if _run.get():
+        row["run"] = _run.get()
     try:
         path = ledger_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -194,10 +224,16 @@ def month_total(now: datetime | None = None) -> float:
     this_month = (now.year, now.month)
     with _unwritten_lock:
         total = sum(usd for ts, usd in _unwritten if (ts.year, ts.month) == this_month)
+    return total + sum(usd for _row, _ts, usd in _month_rows(now))
+
+
+def _month_rows(now: datetime):
+    """(row, UTC time, usd) for each readable ledger row of `now`'s UTC month, in file order."""
+    this_month = (now.year, now.month)
     try:
         lines = ledger_path().read_bytes().splitlines()
     except FileNotFoundError:
-        return total
+        return
     for line in lines:
         try:
             row = json.loads(line.decode("utf-8"))
@@ -209,8 +245,30 @@ def month_total(now: datetime | None = None) -> float:
                 log.warning("Skipping a corrupt spend ledger line: %s", e)
             continue
         if (ts.year, ts.month) == this_month:
-            total += usd
-    return total
+            yield row, ts, usd
+
+
+def usage(now: datetime | None = None, last: int = 10) -> dict:
+    """The Usage & limit tab: this month's spend, the limit, the reset day and the last runs.
+    Rows sharing a run id are one run (an agent run's steps, a trim's calls); a row with none
+    is a run of its own. Runs are newest first, by their latest row."""
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    runs: dict[str, dict] = {}
+    for i, (row, ts, usd) in enumerate(_month_rows(now)):
+        key = str(row.get("run") or f"row-{i}")
+        r = runs.get(key)
+        if r is None:
+            r = runs[key] = {"at": ts.isoformat(timespec="seconds"), "kind": str(row.get("kind", "other")),
+                             "model": str(row.get("model", "")), "usd": None, "_last": ts}
+        r["model"], r["_last"] = str(row.get("model", r["model"])), max(r["_last"], ts)
+        if row.get("usd") is not None:
+            r["usd"] = round((r["usd"] or 0.0) + usd, 6)
+    ordered = sorted(runs.values(), key=lambda r: r["_last"], reverse=True)
+    year, month = (now.year + 1, 1) if now.month == 12 else (now.year, now.month + 1)
+    return {"month_usd": round(month_total(now), 6), "limit_usd": limit_usd(),
+            "limit_tier": settings.load().monthly_limit_usd, "resets_on": date(year, month, 1).isoformat(),
+            "run_count": len(ordered),
+            "runs": [{k: v for k, v in r.items() if k != "_last"} for r in ordered[:last]]}
 
 
 def limit_usd() -> float:
@@ -251,13 +309,26 @@ def check_budget(model: str, text: str, max_tokens: int, *, now: datetime | None
     is estimated at 1.5 characters per token: the transcript is one index-numbered word per
     line, which tokenises poorly (measured 2026-10-05: 19,197 characters were 12,053 tokens).
     """
+    check_tokens(model, math.ceil(len(text) / CHARS_PER_TOKEN), max_tokens, now=now)
+
+
+def check_tokens(model: str, input_tokens: int, max_tokens: int, *, now: datetime | None = None) -> None:
+    """The gate on an input-token estimate: input priced at the full input rate (no cache
+    discount) plus a reply of `max_tokens`. The agent loop estimates each step from the previous
+    step's actual usage (`estimate_step`)."""
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    worst = cost_usd(model, math.ceil(len(text) / CHARS_PER_TOKEN), max_tokens, on=now.date())
+    worst = cost_usd(model, input_tokens, max_tokens, on=now.date())
     if worst is None:
         return
     so_far, limit = month_total(now), limit_usd()
     if so_far + worst > limit:
         raise BudgetExceeded(_over_limit_message(limit, worst, so_far, now))
+
+
+def estimate_step(prev_input: int, prev_output: int, new_chars: int) -> int:
+    """Input tokens of the next agent step: everything the previous step read (incl. cached),
+    its reply (now in the history), and the new content at 1.5 characters per token."""
+    return prev_input + prev_output + math.ceil(new_chars / CHARS_PER_TOKEN)
 
 
 # ── estimate ───────────────────────────────────────────────────────

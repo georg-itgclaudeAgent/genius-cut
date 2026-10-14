@@ -38,7 +38,7 @@ def test_get_settings_returns_the_defaults(tmp_path):
     r = c.get("/settings", headers=auth)
     assert r.status_code == 200
     assert r.json() == {"anthropic_key": {"project": "", "secret": "ANTHROPIC_API_KEY", "version": "latest"},
-                        "monthly_limit_usd": 20}
+                        "monthly_limit_usd": 20, "setup_complete": False}
 
 
 def test_put_settings_saves_and_returns_them(tmp_path):
@@ -46,7 +46,7 @@ def test_put_settings_saves_and_returns_them(tmp_path):
     body = {"anthropic_key": {**SRC, "project": "  editor-proj "}, "monthly_limit_usd": 100}
     r = c.put("/settings", json=body, headers=auth)
     assert r.status_code == 200, r.text
-    assert r.json() == {"anthropic_key": SRC, "monthly_limit_usd": 100}
+    assert r.json() == {"anthropic_key": SRC, "monthly_limit_usd": 100, "setup_complete": False}
     assert settings.load().anthropic_key.project == "editor-proj"
     assert c.get("/settings", headers=auth).json()["monthly_limit_usd"] == 100
 
@@ -76,9 +76,9 @@ def test_settings_never_carry_a_key(tmp_path, monkeypatch):
 def test_test_key_uses_the_given_source(tmp_path):
     seen = []
     c, auth = app(tmp_path, check_key=lambda src: seen.append(src) or {"ok": True, "message": "Connected."})
-    r = c.post("/settings/test-key", json={"anthropic_key": {**SRC, "project": "other"}}, headers=auth)
+    r = c.post("/settings/test-key", json={"anthropic_key": {**SRC, "project": "other-proj"}}, headers=auth)
     assert r.status_code == 200 and r.json() == {"ok": True, "message": "Connected."}
-    assert seen[0].project == "other"
+    assert seen[0].project == "other-proj"
 
 
 def test_test_key_defaults_to_the_saved_source(tmp_path):

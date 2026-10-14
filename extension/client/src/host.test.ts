@@ -2352,6 +2352,42 @@ describe("gcutToolAddMarkers and its undo", () => {
     expect(s.seq.markers.numMarkers).toBe(2);
   });
 
+  describe("check: true runs every refusal and changes nothing, matching the real undo's outcome", () => {
+    const check = (s: { host: ReturnType<typeof load> }, record: unknown) => s.host.call("gcutToolUndo", { record, check: true });
+    const outcome = (f: () => unknown) => { try { return f(); } catch (e) { return String((e as Error).message); } };
+
+    it.each([
+      ["untouched", (_: ReturnType<typeof georgScene>) => {}],
+      ["one renamed", (s: ReturnType<typeof georgScene>) => { s.seq.markers.list[0].name = "Prices"; }],
+      ["one deleted", (s: ReturnType<typeof georgScene>) => { s.seq.markers.deleteMarker(s.seq.markers.list[1]); }],
+      ["all deleted", (s: ReturnType<typeof georgScene>) => { for (const m of [...s.seq.markers.list]) s.seq.markers.deleteMarker(m); }],
+    ])("%s", (name, change) => {
+      const s = georgScene();
+      const record = asStored(add(s, TWO).undo);
+      change(s);
+      const before = all(s);
+      const checked = outcome(() => check(s, record));
+      expect(all(s)).toEqual(before);
+      expect(outcome(() => check(s, record))).toEqual(checked); // checking twice is the same: nothing changed
+      const real = outcome(() => undo(s, record));
+      if (name === "untouched") {
+        expect(checked).toEqual({ ok: true, wouldUndo: true });
+        expect(real).toEqual({ ok: true });
+      } else {
+        expect(real).toEqual(checked);
+      }
+    });
+
+    it("refuses an incomplete record, and a different sequence, the same way", () => {
+      const s = georgScene();
+      const record = add(s, TWO).undo;
+      expect(() => check(s, { kind: "markers", sequenceId: "seq-1" })).toThrow("This undo record is incomplete.");
+      s.seq.sequenceID = "seq-2";
+      expect(() => check(s, record)).toThrow(/different sequence/);
+      expect(s.seq.markers.numMarkers).toBe(2);
+    });
+  });
+
   it("undo refuses on a different sequence, and a record it doesn't know", () => {
     const s = georgScene();
     const record = add(s, TWO).undo;
@@ -2638,6 +2674,38 @@ describe("gcutToolCutRanges: timeline ranges cut from chosen clips with Apply's 
       s.seq.sequenceID = "seq-2";
       expect(() => undoTool(s, record)).toThrow(/different sequence/);
       expect(allTracks(s.seq)).toEqual(cut);
+    });
+
+    describe("check: true runs every refusal and changes nothing, matching the real undo's outcome", () => {
+      const checkTool = (s: { host: ReturnType<typeof load> }, record: unknown) => s.host.call("gcutToolUndo", { record, check: true });
+      const outcome = (f: () => unknown) => { try { return f(); } catch (e) { return String((e as Error).message); } };
+      type Ctx = ReturnType<typeof cutGeorg>;
+
+      it.each([
+        ["untouched", (_: Ctx) => {}],
+        ["a cut piece moved", ({ s }: Ctx) => { s.seq.videoTracks[0].clips[1].move(Time.s(0.2)); }],
+        ["a cut piece slip-edited", ({ s }: Ctx) => { const p = s.seq.videoTracks[0].clips[1]; p.trueIn = Time.s(p.trueIn.seconds + 0.4); }],
+        ["something placed in the gap", ({ s }: Ctx) => { s.seq.videoTracks[0].add(s.a, 108.2, 40, 40.8); }],
+        ["the original back (Premiere's Undo)", ({ s, saved }: Ctx) => { [...s.seq.videoTracks, ...s.seq.audioTracks].forEach((t: Track, k: number) => { t.items = saved[k]; }); }],
+        ["one clip back, the others still cut", ({ s, saved }: Ctx) => { s.seq.videoTracks[0].items = saved[0]; }],
+        ["a source gone from the project", ({ s }: Ctx) => { s.seq.bin = s.seq.bin.filter((pi) => pi !== s.b); }],
+      ])("%s", (name, change) => {
+        const ctx = cutGeorg(), { s, record } = ctx;
+        change(ctx);
+        const now = allTracks(s.seq), bins = s.seq.bin.map((pi) => [pi.inS, pi.outS]), placements = (s.seq as any).placements;
+        const checked = outcome(() => checkTool(s, record));
+        expect(allTracks(s.seq)).toEqual(now);
+        expect(s.seq.bin.map((pi) => [pi.inS, pi.outS])).toEqual(bins);
+        expect((s.seq as any).placements).toBe(placements);
+        const real = outcome(() => undoTool(s, record));
+        if (name === "untouched") {
+          expect(checked).toEqual({ ok: true, wouldUndo: true });
+          expect(real).toEqual({ ok: true });
+          expect(allTracks(s.seq)).toEqual(ctx.original);
+        } else {
+          expect(real).toEqual(checked);
+        }
+      });
     });
   });
 });

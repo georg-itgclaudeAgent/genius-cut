@@ -1529,9 +1529,10 @@ function gcutSameMarker(now, was, clock) {
 /**
  * Undo an add_markers: every recorded marker must still be exactly as recorded, then all of them go.
  * None of them left: already undone. Some gone or any changed: refused, nothing deleted. A record
- * with no markers is refused as incomplete.
+ * with no markers is refused as incomplete. check: run every refusal, delete nothing, and return
+ * { ok: true, wouldUndo: true } when the real undo would go ahead.
  */
-function gcutUndoMarkers(seq, record, clock) {
+function gcutUndoMarkers(seq, record, clock, check) {
     if (!gcutIsArray(record.markers) || !record.markers.length) throw new Error("This undo record is incomplete.");
     var now = gcutMarkerList(seq), live = [], gone = 0, changed = [], recs = record.markers, i, j;
     for (i = 0; i < recs.length; i++) {
@@ -1543,6 +1544,7 @@ function gcutUndoMarkers(seq, record, clock) {
     }
     if (gone === recs.length) return { ok: true, alreadyUndone: true };
     if (changed.length) throw new Error("These markers were changed by hand since: " + changed.join("; ") + ". Nothing was undone.");
+    if (check) return { ok: true, wouldUndo: true };
     for (i = 0; i < live.length; i++) seq.markers.deleteMarker(live[i]);
     return { ok: true };
 }
@@ -1742,9 +1744,11 @@ function gcutSlipped(seq, rec, plan, clock) {
  * Undo a cut_ranges, as Restore undoes an Apply: only if every planned piece is still exactly where
  * the cut laid it (place, length and in point) and nothing new is in the way; then every recorded item goes back to its own
  * original place, checked, with the others left as they were. Already undone (gcutCutGone): says so.
- * A refusal changes nothing; a re-lay that fails puts the cut version back.
+ * A refusal changes nothing; a re-lay that fails puts the cut version back. check: run every
+ * refusal (rehydrate, count, slip, in the way, already undone), change nothing, and return
+ * { ok: true, wouldUndo: true } when the real undo would go ahead.
  */
-function gcutUndoCuts(seq, record, clock) {
+function gcutUndoCuts(seq, record, clock, check) {
     var rec = gcutRehydrate(record), marks = [], k;
     if (gcutCutGone(seq, rec, clock)) return { ok: true, alreadyUndone: true };
     var plan = gcutPlan(rec.items, rec.cutsT), want = 0;
@@ -1762,6 +1766,7 @@ function gcutUndoCuts(seq, record, clock) {
     var span = gcutSpan(rec.items), others = gcutOthers(seq, ours, span.fromT, span.toT);
     var blocked = gcutInTheWay(seq, rec, others, clock);
     if (blocked) throw new Error(blocked);
+    if (check) return { ok: true, wouldUndo: true };
     try {
         for (k = 0; k < rec.items.length; k++) {
             var seen = false;
@@ -1785,10 +1790,11 @@ function gcutUndoCuts(seq, record, clock) {
 }
 
 /**
- * args: { record } — the `undo` record an act tool returned, as it returned it (pure data, so it
+ * args: { record, check? } — the `undo` record an act tool returned, as it returned it (pure data, so it
  * survives a panel reload). Returns { ok: true }, or { ok: true, alreadyUndone: true } when nothing of
  * that change is left (Premiere's own Undo took it back); refuses, changing nothing, when what that
- * change made was changed by hand since.
+ * change made was changed by hand since. check: true runs the same refusals and changes nothing,
+ * returning { ok: true, wouldUndo: true } or { ok: true, alreadyUndone: true }, or the same refusal.
  */
 function gcutToolUndo(argsJson) {
     try {
@@ -1798,8 +1804,9 @@ function gcutToolUndo(argsJson) {
         if (String(record.sequenceId) !== gcutSeqId(seq)) {
             throw new Error("A different sequence is open than the one this change was made on. Open that sequence first.");
         }
-        if (record.kind === "markers") return gcutOk(gcutUndoMarkers(seq, record, clock));
-        if (record.kind === "cuts") return gcutOk(gcutUndoCuts(seq, record, clock));
+        var check = args.check === true;
+        if (record.kind === "markers") return gcutOk(gcutUndoMarkers(seq, record, clock, check));
+        if (record.kind === "cuts") return gcutOk(gcutUndoCuts(seq, record, clock, check));
         throw new Error("Genius Cut can't undo a change of kind " + record.kind + ".");
     } catch (e) {
         return gcutFail(e);

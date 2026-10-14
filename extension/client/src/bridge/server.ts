@@ -119,8 +119,6 @@ export interface AssistantDeps {
   mode: Mode;
   evalScript: (s: string) => Promise<string>;
   node: (id: string) => any;
-  /** The installed extension's folder (its host/ is next to client/). */
-  extensionRoot: () => string;
   dataDir: () => string;
   backend: ToolDeps["backend"];
   busy: () => boolean;
@@ -132,13 +130,17 @@ export function bridgeWanted(flag: string | undefined, mode: Mode): boolean {
   return flag === "1" && mode === "live";
 }
 
-/** Load host/assistant.jsx into Premiere, load the undo stack (turns.json), then start the bridge. null when this build or mode doesn't get the assistant. */
+/**
+ * Check the host has the toolbox (the gcutTool* functions in host/index.jsx, which the manifest loads),
+ * load the undo stack (turns.json), then start the bridge. null when this build or mode doesn't get the
+ * assistant.
+ */
 export async function startAssistant(d: AssistantDeps): Promise<Bridge | null> {
   if (!bridgeWanted(d.flag, d.mode)) return null;
-  const file = `${d.extensionRoot().replace(/\\/g, "/")}/host/assistant.jsx`;
-  const out = await d.evalScript(
-    `(function () { try { $.evalFile(new File(${JSON.stringify(file)})); return typeof gcutToolGetSequence === "function" ? "ok" : "Error: gcutToolGetSequence is missing"; } catch (e) { return "Error: " + e; } })()`);
-  if (out !== "ok") throw new Error(`The assistant's Premiere script didn't load (${file}): ${String(out).replace(/^Error:\s*/, "")}`);
+  const out = await d.evalScript(`typeof gcutToolGetSequence === "function" ? "ok" : "Error: gcutToolGetSequence is missing"`);
+  if (out !== "ok") {
+    throw new Error(`The assistant's Premiere tools aren't loaded (host/index.jsx): ${String(out).replace(/^Error:\s*/, "")}. Restart Premiere.`);
+  }
   const callHost = hostCaller(d.evalScript), fs = d.node("fs"), path = d.node("path"), dir = d.dataDir();
   const turns = createTurns(fileTurnStore(fs, path, path.join(dir, "turns.json")));
   const tools = createTools({ callHost: (fn, args) => callHost(fn, args), backend: d.backend, turns });

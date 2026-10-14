@@ -135,6 +135,8 @@ const TOOLS = [
       "span. Cutting rebuilds the chosen clips from their source: effects on them (get_sequence lists them) are removed, " +
       "so the call refuses, naming them, unless acceptEffectLoss is true; tell the user and set it only after they agree. " +
       "Intrinsic keyframes (Motion, Opacity, Volume) and audio gain are not kept either: they are rebuilt from the source. " +
+      "The reply's idMap maps each chosen clip's old id to the ids of the pieces it became ({oldId: [newIds]}; a clip whose " +
+      "id didn't change is left out). " +
       STALE + " Undo with undo_last_turn.",
     inputSchema: {
       type: "object",

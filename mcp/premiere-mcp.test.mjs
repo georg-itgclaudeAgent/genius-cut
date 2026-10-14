@@ -120,6 +120,7 @@ test("tools/list offers exactly the Phase 1 tools with schemas written for Claud
   assert.match(byName.get_sequence.description, /seconds/);
   assert.match(byName.cut_ranges.description, /get_sequence/);
   assert.match(byName.cut_ranges.description, /undo_last_turn/);
+  assert.match(byName.cut_ranges.description, /idMap maps each chosen clip.s old id to the ids of the pieces it became/);
   // It doesn't ripple: the chosen clips close up among themselves, and a gap is left after them.
   assert.match(byName.cut_ranges.description, /leaves a gap of removedS at the end of the chosen clips; later clips don't move\./);
   assert.doesNotMatch(byName.cut_ranges.description, /ripple|close the gaps/i);

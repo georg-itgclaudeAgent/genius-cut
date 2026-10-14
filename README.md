@@ -20,7 +20,8 @@ you approve. Client footage never leaves the machine.
 
 Lets Claude Code read and edit the open Premiere sequence through the Genius Cut panel, using your own
 Claude Code login (no API key). It is never in builds for editors: `scripts/package.py` refuses a
-`client/dist` that contains it, and `host/assistant.jsx` is never packaged.
+`client/dist` that contains the bridge, and `mcp/` is never packaged. (The Premiere-side tools, the
+`gcutTool*` functions, are in `host/index.jsx`, which every build ships.)
 
 1. **Build the panel with the assistant.** Create `extension/client/.env.production.local` (gitignored):
    ```

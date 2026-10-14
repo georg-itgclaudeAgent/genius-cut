@@ -15,8 +15,9 @@ Guards (each fails the build with a message):
     the bridge marker `gcut-assistant-bridge` (the bridge's reply header, compiled in only with
     VITE_GENIUSCUT_CLAUDE=1, however that flag got set). Personal builds are never packaged.
 
-The assistant's host toolbox (extension/host/assistant.jsx) is never zipped, and mcp/ is never
-part of the package.
+The assistant's host toolbox (the gcutTool* functions) is part of extension/host/index.jsx and is
+packaged with it: editors' panels call it through the backend's agent. The personal door to it (the
+HTTP bridge above, and mcp/) is never part of the package.
 
 Prints, for CI:
   preview=true|false          — a preview build (VITE_GENIUSCUT_PREVIEW=1 in
@@ -40,7 +41,6 @@ BUNDLE_ID = "com.attract.genius-cut"
 SEMVER = re.compile(r"^\d+\.\d+\.\d+$")
 
 BRIDGE_MARKER = b"gcut-assistant-bridge"
-HOST_SKIP = {"host/assistant.jsx"}  # the Claude assistant's toolbox: personal builds only
 
 BACKEND_SKIP_DIRS = {".venv", "tests", "__pycache__", ".pytest_cache"}
 BACKEND_SKIP_SUFFIXES = {".pyc", ".wav", ".log"}
@@ -92,7 +92,7 @@ def files(include_backend: bool):
     for sub in ("CSXS", "host", "client/dist"):
         for p in sorted((EXT / sub).rglob("*")):
             arc = p.relative_to(EXT).as_posix()
-            if p.is_file() and not p.name.endswith(".map") and arc not in HOST_SKIP:
+            if p.is_file() and not p.name.endswith(".map"):
                 yield p, arc
     if not include_backend:
         return

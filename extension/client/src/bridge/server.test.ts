@@ -125,7 +125,7 @@ describe("startAssistant: only in a flagged build, live in Premiere", () => {
     const dir = tempDir();
     const evalScript = vi.fn(async (_s: string) => evalOut);
     return { dir, evalScript, d: {
-      flag, mode, evalScript, node: (id: string) => nodeRequire(id), extensionRoot: () => "C:/ext/genius-cut", dataDir: () => dir,
+      flag, mode, evalScript, node: (id: string) => nodeRequire(id), dataDir: () => dir,
       backend: { transcript: vi.fn(), transcriptJob: vi.fn() }, busy: () => false, panelVersion: "0.1.0" } };
   }
 
@@ -137,20 +137,23 @@ describe("startAssistant: only in a flagged build, live in Premiere", () => {
       expect(existsSync(join(x.dir, "bridge.json"))).toBe(false);
     });
 
-  it("flagged and live: loads host/assistant.jsx with $.evalFile first, then serves with a fresh 32-byte token", async () => {
+  it("flagged and live: checks the host has the toolbox (in index.jsx, no $.evalFile) first, then serves with a fresh 32-byte token", async () => {
     const x = deps("1", "live");
     const b = (await startAssistant(x.d))!;
     bridges.push(b);
-    expect(x.evalScript.mock.calls[0][0]).toContain('$.evalFile(new File("C:/ext/genius-cut/host/assistant.jsx"))');
+    const check = x.evalScript.mock.calls[0][0];
+    expect(check).toContain('typeof gcutToolGetSequence === "function"');
+    expect(check).not.toContain("evalFile");
+    expect(check).not.toContain("assistant.jsx");
     const info = JSON.parse(readFileSync(join(x.dir, "bridge.json"), "utf8"));
     expect(info).toMatchObject({ port: b.port, pid: process.pid, panelVersion: "0.1.0" });
     expect(info.token).toMatch(/^[0-9a-f]{64}$/);
     expect((await fetch(`http://127.0.0.1:${b.port}/ping`)).status).toBe(200);
   });
 
-  it("doesn't serve when the assistant's host script fails to load", async () => {
-    const x = deps("1", "live", "Error: syntax error");
-    await expect(startAssistant(x.d)).rejects.toThrow(/syntax error/);
+  it("doesn't serve when the host has no toolbox (an older index.jsx still loaded)", async () => {
+    const x = deps("1", "live", "Error: gcutToolGetSequence is missing");
+    await expect(startAssistant(x.d)).rejects.toThrow(/gcutToolGetSequence is missing/);
     expect(existsSync(join(x.dir, "bridge.json"))).toBe(false);
   });
 
@@ -161,7 +164,7 @@ describe("startAssistant: only in a flagged build, live in Premiere", () => {
     writeFileSync(join(x.dir, "turns.json"), JSON.stringify({ "seq-1": [{ id: "t1", at: "2026-10-14T08:00:00.000Z", sequenceId: "seq-1",
       tool: "add_markers", args: {}, summary: "Added 1 marker: Intro", undo: record }] }));
     x.evalScript.mockImplementation(async (s: string) =>
-      s.includes("$.evalFile") ? "ok" : s.includes("gcutToolUndo(") ? JSON.stringify({ ok: true }) : JSON.stringify({ sequenceId: "seq-1", clips: [] }));
+      s.includes("gcutToolUndo(") ? JSON.stringify({ ok: true }) : s.includes("gcutToolGetSequence(") ? JSON.stringify({ sequenceId: "seq-1", clips: [] }) : "ok");
     const b = (await startAssistant(x.d))!;
     bridges.push(b);
     const { token } = JSON.parse(readFileSync(join(x.dir, "bridge.json"), "utf8"));

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { dataDir, evalScript, extensionRoot, node } from "./api/cep";
+import { dataDir, evalScript, node } from "./api/cep";
 import { runtime } from "./api/runtime";
 import { startAssistant, type Bridge } from "./bridge/server";
 import { cutTabBusy } from "./lib/busy";
@@ -43,7 +43,7 @@ function useAssistantBridge() {
     if (import.meta.env.VITE_GENIUSCUT_CLAUDE !== "1") return;
     let bridge: Bridge | null = null, gone = false;
     const stop = () => { gone = true; void bridge?.stop(); bridge = null; };
-    startAssistant({ flag: import.meta.env.VITE_GENIUSCUT_CLAUDE, mode: runtime.mode, evalScript, node, extensionRoot, dataDir,
+    startAssistant({ flag: import.meta.env.VITE_GENIUSCUT_CLAUDE, mode: runtime.mode, evalScript, node, dataDir,
       backend: runtime.backend, busy: cutTabBusy, panelVersion: VERSION })
       .then((b) => { if (gone) void b?.stop(); else bridge = b; })
       .catch((e) => console.warn("Genius Cut assistant bridge didn't start:", e));

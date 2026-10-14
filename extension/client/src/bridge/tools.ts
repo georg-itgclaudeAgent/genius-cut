@@ -1,6 +1,6 @@
 /**
- * The assistant's tool table: name → {kind, run(args)}. Host tools go to extension/host/assistant.jsx
- * through evalScript; transcripts go to the backend. Every time Claude sends or receives is in seconds
+ * The assistant's tool table: name → {kind, run(args)}. Host tools go to the gcutTool* functions in
+ * extension/host/index.jsx through evalScript; transcripts go to the backend. Every time Claude sends or receives is in seconds
  * on the sequence.
  */
 import type { Snapshot, SnapshotItem, TranscriptJob, TranscriptRequest } from "../api/types";

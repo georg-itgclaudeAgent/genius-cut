@@ -19,8 +19,6 @@ const TICKS = 254016000000;
 const FPS = 25;
 const TPF = TICKS / FPS;
 const HOST_SRC = readFileSync(resolve(__dirname, "../../host/index.jsx"), "utf8");
-// The assistant's toolbox: the flagged panel loads it after index.jsx ($.evalFile), into the same globals.
-const ASSIST_SRC = readFileSync(resolve(__dirname, "../../host/assistant.jsx"), "utf8");
 
 class Time {
   t = 0;
@@ -301,7 +299,6 @@ function load(seq: Seq, { qe = true } = {}) {
   const ctx = vm.createContext(sandbox);
   vm.runInContext("delete this.JSON;", ctx); // ExtendScript has no JSON
   vm.runInContext(HOST_SRC, ctx);
-  vm.runInContext(ASSIST_SRC, ctx);
   const call = (fn: string, arg: unknown) => {
     const out: string = (ctx as any)[fn](JSON.stringify(arg));
     if (out.startsWith("Error:")) throw new Error(out.slice(6).trim());
@@ -2142,7 +2139,7 @@ describe("clean cuts: a 2-frame Constant Power crossfade at every internal cut o
   });
 });
 
-// ── the assistant's toolbox (extension/host/assistant.jsx) ──────────────────────────
+// ── the assistant's toolbox (the gcutTool* functions in extension/host/index.jsx) ────
 
 const getSeq = (s: { host: ReturnType<typeof load> }, args: unknown = {}) => s.host.call("gcutToolGetSequence", args);
 /** A clip id as get_sequence gives it: <V|A><track>@<startTicks>#<nodeId>. */
@@ -2410,6 +2407,26 @@ describe("gcutToolCutRanges: timeline ranges cut from chosen clips with Apply's 
     expect(undoTool(s, asStored(r.undo))).toEqual({ ok: true });
     expect(allTracks(s.seq)).toEqual(original);
     expect(bins(s)).toEqual([[2, 58], [2, 58], [2, 58], [2, 58]]);
+  });
+
+  it("returns idMap: each chosen clip's old id to the ids of the pieces it became, as get_sequence now gives them", () => {
+    const s = georgScene();
+    const r = cutTool(s, getSeq(s).selection, RANGES);
+    expect(r.idMap).toEqual({
+      [idOf("V1", 100, "node-a")]: [idOf("V1", 100, "node-a"), idOf("V1", 102, "node-a"), idOf("V1", 106, "node-a")],
+      [idOf("V2", 100.24, "node-b")]: [idOf("V2", 100.24, "node-b"), idOf("V2", 102, "node-b"), idOf("V2", 106, "node-b")],
+      [idOf("V3", 100.28, "node-r")]: [idOf("V3", 100.28, "node-r"), idOf("V3", 102, "node-r"), idOf("V3", 106, "node-r")],
+      [idOf("A1", 99, "node-m")]: [idOf("A1", 99, "node-m"), idOf("A1", 102, "node-m"), idOf("A1", 106, "node-m")],
+    });
+    const now = getSeq(s).clips.map((c: any) => c.id);
+    for (const ids of Object.values(r.idMap) as string[][]) for (const id of ids) expect(now).toContain(id);
+  });
+
+  it("idMap leaves out a chosen clip whose id didn't change (cut only past its end, or only its tail trimmed)", () => {
+    const s = georgScene();
+    // Only A1 runs past 110 s: V1-V3 are laid back whole where they were; A1 keeps its start, losing its tail.
+    const r = cutTool(s, getSeq(s).selection, [{ fromS: 110.5, toS: 111 }]);
+    expect(r).toMatchObject({ ok: true, idMap: {} });
   });
 
   it("the undo record is pure data: the cut's place, its cuts, each item as Apply records it, and the others as gcutOthers gives them", () => {

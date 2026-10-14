@@ -2375,6 +2375,17 @@ const allTracks = (seq: Seq) => [...Array.from({ length: seq.videoTracks.numTrac
   ...Array.from({ length: seq.audioTracks.numTracks }, (_, t) => span(seq.audioTracks[t]))];
 const RANGES = [{ fromS: 102, toS: 103 }, { fromS: 107, toS: 108 }];
 
+describe("gcutToolAdvice: Apply's refusals worded for Claude, who reads the timeline instead of analysing", () => {
+  const advice = (msg: string) => (load(new Seq()).ctx as any).gcutToolAdvice(new Error(msg)).message;
+  it.each([
+    ["V1's clip changed since Analyse. Analyse again.", "V1's clip changed since you read the timeline. Read the timeline again."],
+    ["V3 is locked. Unlock it to apply.", "V3 is locked. Unlock it to cut."],
+    ["Add a video track, then Apply again.", "Add a video track, then call cut_ranges again."],
+    ["Deselect it, then Analyse again.", "Deselect it, then read the timeline again."],
+    ["Move that clip off A1's time.", "Move that clip off A1's time."],
+  ])("%s", (from, to) => expect(advice(from)).toBe(to));
+});
+
 describe("gcutToolCutRanges: timeline ranges cut from chosen clips with Apply's engine, and its undo", () => {
   const bins = (s: ReturnType<typeof georgScene>) => [s.a, s.b, s.scr, s.mic].map((pi) => [pi.inS, pi.outS]);
   function marked() {
@@ -2459,6 +2470,23 @@ describe("gcutToolCutRanges: timeline ranges cut from chosen clips with Apply's 
         s.seq.audioTracks[1].add(wav("music.wav", "node-9", 300), 90, 0, 40);
         return { s, ids: getSeq(s).selection, msg: "A2 (music.wav) sits under the selected video clips, and rebuilding them could overwrite it. " +
           "Select it too, or move it off the clips' time, then read the timeline again." };
+      }],
+      ["a locked track, saying to unlock it to cut (not to apply)", () => {
+        const s = georgScene(); s.seq.videoTracks[2].locked = true; return { s, ids: getSeq(s).selection, msg: "V3 is locked. Unlock it to cut." };
+      }],
+      ["audio from a video file with no video track of its number, saying to call cut_ranges again (not Apply)", () => {
+        const seq = new Seq(1, 2);
+        seq.audioTracks[1].add(new ProjectItem("Zoom.mp4", "node-z", 600), 100, 10, 20);
+        const s = { seq, host: load(seq) };
+        return { s, ids: getSeq(s).clips.map((c: any) => c.id), msg: "A2's audio comes from a video file, and Premiere drops its picture onto V2 " +
+          "when it's placed, but this sequence has no V2. Add a video track, then call cut_ranges again." };
+      }],
+      ["a chosen clip with no source media, with its own message", () => {
+        const s = georgScene();
+        const title = s.seq.videoTracks[3].items[0];
+        (title as any).projectItem = null;
+        Object.defineProperty(title, "name", { value: "Graphic" });
+        return { s, ids: [`V4@${title.start.ticks}#`], ranges: [{ fromS: 113, toS: 114 }], msg: "V4's clip can't be cut: it has no source media." };
       }],
       ["a different sequence", () => { const s = georgScene(); return { s, ids: getSeq(s).selection, seqId: "seq-2", msg: /different sequence/ }; }],
       ["a stale id", () => { const s = georgScene(); const ids = getSeq(s).selection; s.v2.start = Time.s(100.2); return { s, ids, msg: STALE }; }],

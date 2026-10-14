@@ -229,9 +229,14 @@ function gcutUndoMarkers(seq, record, clock) {
 
 // ── cut_ranges: Apply's engine on chosen clips ─────────────────────────────────────
 
-/** Apply's pre-check refusals, worded for the tool: there is no Analyse, Claude reads the timeline again. */
+/** Apply's pre-check refusals, worded for the tool: there is no Analyse or Apply, Claude reads the timeline and calls cut_ranges. */
 function gcutToolAdvice(e) {
-    return new Error(String(e && e.message ? e.message : e).replace(/Analyse again/g, "read the timeline again"));
+    return new Error(String(e && e.message ? e.message : e)
+        .replace(/since Analyse/g, "since you read the timeline")
+        .replace(/\. Analyse again/g, ". Read the timeline again")
+        .replace(/Analyse again/g, "read the timeline again")
+        .replace(/ to apply\b/g, " to cut")
+        .replace(/Apply again/g, "call cut_ranges again"));
 }
 
 /**
@@ -302,6 +307,7 @@ function gcutToolCutRanges(argsJson) {
         gcutSameSequence(seq, args.sequenceId);
         var chosen = gcutResolveIds(seq, args.clipIds), spec = { items: [] };
         for (k = 0; k < chosen.length; k++) {
+            if (!chosen[k].item.projectItem) throw new Error(gcutLabel(chosen[k].kind, chosen[k].trackIndex) + "'s clip can't be cut: it has no source media.");
             spec.items.push({ kind: chosen[k].kind, trackIndex: chosen[k].trackIndex,
                               startTicks: chosen[k].item.start.ticks, endTicks: chosen[k].item.end.ticks });
         }

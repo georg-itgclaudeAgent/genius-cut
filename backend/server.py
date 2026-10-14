@@ -13,6 +13,9 @@ The panel calls this through Node's `http` module (CEP `--enable-nodejs`), so no
 CORS is configured: a browser page can't reach the API, and the Host check below
 also stops DNS-rebinding tricks.
 
+`GET`/`PUT /settings` read and save this editor's settings (where their Anthropic key lives,
+the monthly limit; never a key), and `POST /settings/test-key` checks a key source.
+
 AI errors: a missing key is 503, the monthly spend limit (`spend.BudgetExceeded`) is
 402, and any other provider error is 502. `/health` reports the AI provider, model and
 the month's spend so far, never a key.
@@ -38,7 +41,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel
 
-from geniuscut import audio, config, cuts, library, llm, secrets, settings, spend, transcripts, trim
+from geniuscut import audio, claude, config, cuts, library, llm, secrets, settings, spend, transcripts, trim
 from geniuscut.llm import LLMError
 from geniuscut.models import StyleExample, TranscriptJob, TranscriptRequest, TrimRequest, TrimResponse, Word
 
@@ -63,6 +66,10 @@ def ai_status() -> dict:
             "limit_tier": settings.load().monthly_limit_usd, "usd_per_minute": per_minute}
 
 
+class TestKeyRequest(BaseModel):
+    anthropic_key: settings.KeySource | None = None
+
+
 class NewExample(BaseModel):
     raw_words: list[Word]
     final_text: str
@@ -80,6 +87,7 @@ def create_app(
     load_error: Callable[[], str | None] = lambda: None,
     stt_phase: Callable[[], str | None] = lambda: None,
     retry_load: Callable[[], None] = lambda: None,
+    check_key: Callable[[settings.KeySource], dict] = claude.check_key,
 ) -> FastAPI:
     llm_cost = globals()["llm"].run_cost  # the `llm` parameter shadows the module in here
     app = FastAPI(title="Genius Cut backend", version=config.VERSION)
@@ -183,6 +191,28 @@ def create_app(
         except (secrets.MissingKeyError, LLMError) as e:
             raise ai_errors(e) from e
         return {"summary": summary, "cost": llm_cost(m).model_dump()}
+
+    @app.get("/settings", dependencies=auth)
+    def get_settings() -> settings.Settings:
+        return settings.load()
+
+    @app.put("/settings", dependencies=auth)
+    def put_settings(body: settings.Settings) -> settings.Settings:
+        body.anthropic_key.project = body.anthropic_key.project.strip()
+        try:
+            settings.validate_for_save(body)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e)) from e
+        return settings.save(body)
+
+    @app.post("/settings/test-key", dependencies=auth)
+    def post_test_key(body: TestKeyRequest | None = None) -> dict:
+        src = (body.anthropic_key if body else None) or settings.load().anthropic_key
+        try:
+            settings.validate_key_source(src)
+        except ValueError as e:
+            return {"ok": False, "message": str(e)}
+        return check_key(src)
 
     return app
 

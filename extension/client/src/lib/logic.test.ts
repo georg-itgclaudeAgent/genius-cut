@@ -236,9 +236,9 @@ describe("ensureBackend with an outdated backend", () => {
 });
 
 describe("API_VERSION", () => {
-  it("is 4 (transcript jobs) and matches the backend's config.py", () => {
+  it("is 5 (settings) and matches the backend's config.py", () => {
     const py = readFileSync(resolve(__dirname, "../../../../backend/geniuscut/config.py"), "utf8");
-    expect(API_VERSION).toBe(4);
-    expect(py).toMatch(/^API_VERSION = 4\b/m);
+    expect(API_VERSION).toBe(5);
+    expect(py).toMatch(/^API_VERSION = 5\b/m);
   });
 });

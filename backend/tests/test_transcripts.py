@@ -70,8 +70,8 @@ def finish(c, auth, job_id):
     return r.json()
 
 
-def test_api_version_is_4_for_transcript_jobs():
-    assert config.API_VERSION == 4
+def test_api_version_is_5_for_settings():
+    assert config.API_VERSION == 5
 
 
 # ── transcribe_range ───────────────────────────────────────────────

@@ -19,6 +19,7 @@
 
 import json
 import os
+import subprocess
 
 import anthropic
 
@@ -119,6 +120,27 @@ def ask_json(prompt: str, schema: dict, *, system: str | None = None, client=Non
         return json.loads(text)
     except json.JSONDecodeError as e:
         raise ClaudeError(f"Claude returned invalid JSON: {e}") from e
+
+
+def check_key(source, *, run=subprocess.run, gcloud: str | None = None, make_client=None) -> dict:
+    """The setup screen's "Test": read the key from `source` (Secret Manager only: no env var,
+    no cache) and make one free authenticated call. Returns {ok, message}; never the key."""
+    try:
+        key = secrets.anthropic_api_key(run=run, gcloud=gcloud, source=source, fresh_only=True)
+    except secrets.MissingKeyError as e:
+        return {"ok": False, "message": str(e)}
+    where = f"secret {source.secret} in project {source.project.strip()}"
+    try:
+        (make_client or anthropic.Anthropic)(api_key=key).models.retrieve(MODEL)
+    except anthropic.AuthenticationError:
+        message = f"Anthropic rejected the API key in {where}."
+    except anthropic.APIStatusError as e:
+        message = f"Anthropic API error {e.status_code}: {_api_message(e)}"
+    except anthropic.APIConnectionError:
+        message = "Couldn't reach the Anthropic API. Check the internet connection."
+    else:
+        return {"ok": True, "message": f"Connected: the API key in {where} works with {MODEL}."}
+    return {"ok": False, "message": message.replace(key, "[redacted]")}
 
 
 def ask_text(prompt: str, *, system: str | None = None, client=None,

@@ -9,9 +9,9 @@ const V1 = id("V1", 100.5, "node-a"), A1 = id("A1", 100, "node-m"), A2 = id("A2"
 const LISTING = {
   sequenceId: "seq-1", name: "Main", fps: 25, durationS: 120, tracks: [], markers: [], selection: [],
   clips: [
-    { id: V1, track: "V1", name: "Camera A.mov", startS: 100.5, endS: 110, inS: 10, source: "D:/Camera A.mov", selected: false, enabled: true },
-    { id: A1, track: "A1", name: "mic.wav", startS: 100, endS: 112, inS: 50, source: "D:/mic.wav", selected: false, enabled: true },
-    { id: A2, track: "A2", name: "lav.wav", startS: 90, endS: 105, inS: 5, source: "D:/lav.wav", selected: false, enabled: true },
+    { id: V1, track: "V1", name: "Camera A.mov", startS: 100.5, endS: 110, inS: 10, source: "D:/Camera A.mov", selected: false, enabled: true, speed: 1 },
+    { id: A1, track: "A1", name: "mic.wav", startS: 100, endS: 112, inS: 50, source: "D:/mic.wav", selected: false, enabled: true, speed: 1 },
+    { id: A2, track: "A2", name: "lav.wav", startS: 90, endS: 105, inS: 5, source: "D:/lav.wav", selected: false, enabled: true, speed: 1 },
   ],
 };
 
@@ -93,6 +93,18 @@ describe("the bridge's tool table", () => {
       await expect(createTools(f.deps).get_transcript.run({ clipIds: [id("V1", 7, "node-x")] })).rejects.toThrow(/call get_sequence again/);
       await expect(createTools(f.deps).get_transcript.run({ clipIds: [] })).rejects.toThrow(/at least one clip/);
       expect(f.posted).toEqual([]);
+    });
+
+    it("refuses a chosen clip not at 100% speed, as the Cut tab does, without asking the backend", async () => {
+      const f = fakes();
+      const listing = { ...LISTING, clips: LISTING.clips.map((c) => (c.id === V1 ? { ...c, speed: 2 } : c.id === A2 ? { ...c, speed: -1 } : c)) };
+      const deps: ToolDeps = { ...f.deps, callHost: async (fn, a) => (fn === "gcutToolGetSequence" ? listing : f.deps.callHost(fn, a)) };
+      const t = createTools(deps);
+      await expect(t.get_transcript.run({ clipIds: [V1, A1] })).rejects.toThrow("V1 isn't at 100% speed.");
+      await expect(t.get_transcript.run({ clipIds: [A1, A2] })).rejects.toThrow("A2 isn't at 100% speed.");
+      expect(f.posted).toEqual([]);
+      // A clip not chosen doesn't matter.
+      expect(await t.get_transcript.run({ clipIds: [A1] })).toMatchObject({ id: "j1" });
     });
 
     it("passes a job's error on", async () => {

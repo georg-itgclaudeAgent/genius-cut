@@ -45,9 +45,9 @@ const TOOLS = [
     name: "get_sequence",
     description:
       "Read the active Premiere sequence: sequenceId, name, fps, durationS, tracks [{kind, index, name, muted}], " +
-      "clips [{id, track, name, startS, endS, inS, source, selected, enabled, effects}], markers [{id, startS, endS, name, " +
+      "clips [{id, track, name, startS, endS, inS, source, selected, enabled, effects, speed}], markers [{id, startS, endS, name, " +
       "comments, colour}] and selection (ids of the selected clips). All times are seconds on the sequence timeline " +
-      "(inS is the clip's in point in its source; effects names the clip's added effects, which cut_ranges would remove). Track and clip numbering is 1-based, as Premiere shows it (V1, A2). " +
+      "(inS is the clip's in point in its source; effects names the clip's added effects, which cut_ranges would remove; speed is 1 at 100%, and get_transcript and cut_ranges refuse any other). Track and clip numbering is 1-based, as Premiere shows it (V1, A2). " +
       "Call this first, and again after every edit: clip ids change when clips are cut or moved. " +
       "Optional fromS/toS list only the clips and markers overlapping that stretch.",
     inputSchema: {

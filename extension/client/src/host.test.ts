@@ -2162,11 +2162,11 @@ describe("gcutToolGetSequence: the active sequence for Claude", () => {
       { kind: "audio", index: 1, name: "Audio 1", muted: false }, { kind: "audio", index: 2, name: "Audio 2", muted: true },
       { kind: "audio", index: 3, name: "Audio 3", muted: false }]);
     expect(r.clips).toEqual([
-      { id: idOf("V1", 100, "node-a"), track: "V1", name: "Camera A.mov", startS: 100, endS: 110, inS: 10, source: "D:/Footage/Camera A.mov", selected: true, enabled: true, effects: [] },
-      { id: idOf("V2", 100.24, "node-b"), track: "V2", name: "Camera B.mov", startS: 100.24, endS: 109.84, inS: 30, source: "D:/Footage/Camera B.mov", selected: true, enabled: false, effects: [] },
-      { id: idOf("V3", 100.28, "node-r"), track: "V3", name: "Restream.mov", startS: 100.28, endS: 110, inS: 5, source: "D:/Footage/Restream.mov", selected: true, enabled: true, effects: [] },
-      { id: idOf("V4", 112, "node-t"), track: "V4", name: "Title", startS: 112, endS: 115, inS: 0, source: "D:/Footage/Title", selected: false, enabled: true, effects: [] },
-      { id: idOf("A1", 99, "node-m"), track: "A1", name: "mic.wav", startS: 99, endS: 111, inS: 50, source: "D:/Footage/mic.wav", selected: true, enabled: true, effects: [] }]);
+      { id: idOf("V1", 100, "node-a"), track: "V1", name: "Camera A.mov", startS: 100, endS: 110, inS: 10, source: "D:/Footage/Camera A.mov", selected: true, enabled: true, effects: [], speed: 1 },
+      { id: idOf("V2", 100.24, "node-b"), track: "V2", name: "Camera B.mov", startS: 100.24, endS: 109.84, inS: 30, source: "D:/Footage/Camera B.mov", selected: true, enabled: false, effects: [], speed: 1 },
+      { id: idOf("V3", 100.28, "node-r"), track: "V3", name: "Restream.mov", startS: 100.28, endS: 110, inS: 5, source: "D:/Footage/Restream.mov", selected: true, enabled: true, effects: [], speed: 1 },
+      { id: idOf("V4", 112, "node-t"), track: "V4", name: "Title", startS: 112, endS: 115, inS: 0, source: "D:/Footage/Title", selected: false, enabled: true, effects: [], speed: 1 },
+      { id: idOf("A1", 99, "node-m"), track: "A1", name: "mic.wav", startS: 99, endS: 111, inS: 50, source: "D:/Footage/mic.wav", selected: true, enabled: true, effects: [], speed: 1 }]);
     expect(r.selection).toEqual([idOf("V1", 100, "node-a"), idOf("V2", 100.24, "node-b"), idOf("V3", 100.28, "node-r"), idOf("A1", 99, "node-m")]);
   });
 
@@ -2177,6 +2177,14 @@ describe("gcutToolGetSequence: the active sequence for Claude", () => {
     s.a1.addEffect("Lumetri Color");
     const fx = Object.fromEntries(getSeq(s).clips.map((c: any) => [c.track, c.effects]));
     expect(fx).toEqual({ V1: ["Lumetri Color"], V2: [], V3: [], V4: [], A1: ["DeNoise", "Lumetri Color"] });
+  });
+
+  it("gives each clip's speed as the Cut tab checks it (1 = 100%, negative = reversed)", () => {
+    const s = georgScene();
+    s.v2.speed = 2;
+    s.v3.speed = 0.5; s.v3.reversed = 1;
+    const speed = Object.fromEntries(getSeq(s).clips.map((c: any) => [c.track, c.speed]));
+    expect(speed).toEqual({ V1: 1, V2: 2, V3: -0.5, V4: 1, A1: 1 });
   });
 
   it("lists sequence markers with their guid as id, range, name, comments and colour", () => {

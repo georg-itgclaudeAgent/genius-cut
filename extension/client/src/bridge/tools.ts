@@ -30,7 +30,7 @@ const TICKS = 254016000000;
 const WAIT_S = 60;
 const STALE = "The timeline changed since you read it; call get_sequence again.";
 
-interface Clip { id: string; track: string; name: string; startS: number; endS: number; inS: number; source: string }
+interface Clip { id: string; track: string; name: string; startS: number; endS: number; inS: number; source: string; speed: number }
 
 /** A get_sequence clip as the snapshot item trimRequestFor reads (its start ticks are in its id). */
 function asItem(c: Clip): SnapshotItem {
@@ -84,6 +84,9 @@ export function createTools(deps: ToolDeps): ToolTable {
           if (!c) throw new Error(STALE);
           return c;
         });
+        // As the Cut tab refuses them: a retimed clip's source time isn't its timeline time.
+        const retimed = chosen.find((c) => Math.abs(c.speed - 1) > 1e-6);
+        if (retimed) throw new Error(`${retimed.track} isn't at 100% speed.`);
         // The chosen audio clips are the sources; with only video chosen, their own files' sound.
         const audio = chosen.filter((c) => c.id.startsWith("A"));
         const sources = (audio.length ? audio : chosen).map(asItem);

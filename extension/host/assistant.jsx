@@ -98,7 +98,8 @@ function gcutMarkerRecord(m) {
 /**
  * args: { fromS?, toS? } — limits the clips and markers to those overlapping that stretch.
  * Returns { sequenceId, name, fps, durationS, tracks: [{kind, index, name, muted}], clips: [{id, track,
- * name, startS, endS, inS (a loose clip's true one, gcutClipInS), source, selected, enabled, effects (gcutClipEffects)}], markers: [{id, startS, endS, name, comments,
+ * name, startS, endS, inS (a loose clip's true one, gcutClipInS), source, selected, enabled, effects (gcutClipEffects),
+ * speed (gcutSpeed: 1 = 100%, negative = reversed)}], markers: [{id, startS, endS, name, comments,
  * colour}], selection: [clip ids] }. Track index and clip track are 1-based, as Premiere shows them.
  */
 function gcutToolGetSequence(argsJson) {
@@ -120,7 +121,7 @@ function gcutToolGetSequence(argsJson) {
                 var id = gcutClipId(kind, tr.index, it), sel = typeof it.isSelected === "function" && !!it.isSelected();
                 out.clips.push({ id: id, track: tr.label, name: String(it.name), startS: s / GCUT_TICKS, endS: e / GCUT_TICKS,
                                  inS: gcutClipInS(kind, it, clock), source: gcutSource(it), selected: sel, enabled: it.disabled !== true,
-                                 effects: gcutClipEffects(kind, it) });
+                                 effects: gcutClipEffects(kind, it), speed: gcutSpeed(it) });
                 if (sel) out.selection.push(id);
             }
         }

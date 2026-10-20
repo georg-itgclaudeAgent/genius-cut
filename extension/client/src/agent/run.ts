@@ -5,8 +5,11 @@
  * them), so Undo and turns.json have one owner.
  *
  * Selection: the allowed clip ids start as the ones selected when the instruction was sent and are
- * swapped through each act result's idMap {oldId: [newIds]}; markers go inside the span the allowed
- * clips cover now. propose_filler_cuts is terminal: the backend closed the run, and the Cut tab runs
+ * swapped through each act result's idMap {oldId: [newIds]} (only an allowed clip's: close_gaps also
+ * re-ids clips it moved that weren't selected); markers go inside the span the allowed clips cover now.
+ * Every act tool's clipIds / clipId must be allowed, close_gaps and switch_angle too (they reach
+ * beyond the selection, which the plan must say); mute_track only on a track with an allowed clip.
+ * propose_filler_cuts is terminal: the backend closed the run, and the Cut tab runs
  * today's Analyse on the selection recorded at send, with Claude's instructions.
  */
 import type { Backend } from "../api/backend";
@@ -49,14 +52,13 @@ const PLAN_WORDS: Record<string, RegExp> = {
   delete_clips: /delet|remov/i,
   close_gaps: /gap|close up|ripple/i,
   split_at: /split|razor/i,
-  set_clip_label: /label|colou?r/i,
-  set_clip_enabled: /enabl|disabl/i,
-  move_clips: /\bmov/i,
-  switch_angle: /angle|camera|switch/i,
-  set_volume: /volume|louder|quieter|\bdb\b|gain/i,
+  set_clip_enabled: /enabl|disabl|(switch|turn)(ed|ing)?\b.*\b(off|on)\b/i,
+  move_clips: /\bmov|shift|nudge/i,
+  switch_angle: /angle|camera|switch|\bshow/i,
+  set_volume: /volume|louder|quieter|\blower|\braise|\bdb\b|gain|level/i,
   mute_track: /mute/i,
-  add_transition: /transition|dissolve|crossfade|cross fade/i,
-  set_speed: /speed|slow|fast/i,
+  add_transition: /transition|dissolve|crossfade|cross fade|fade/i,
+  set_speed: /speed|slow|fast|\d\s*%/i,
 };
 
 export function namedInPlan(tool: string, plan: string): boolean {
@@ -88,6 +90,13 @@ export function createAgent(deps: AgentDeps) {
     const ids: unknown[] = [...(Array.isArray(input?.clipIds) ? input.clipIds : []), ...(input?.clipId !== undefined ? [input.clipId] : [])];
     const out = ids.map(String).find((x) => !allowed.has(x));
     if (out) return `${out} isn't one of the selected clips (or a piece made from them in this run). Only the selected clips can be changed.`;
+    if (name === "mute_track") {
+      // It mutes the whole track: only one the selection is on (clip ids start with their track, "A2@…").
+      const label = `${input?.kind === "audio" ? "A" : "V"}${Number(input?.track)}`;
+      if (![...allowed].some((x) => x.startsWith(`${label}@`))) {
+        return `mute_track mutes the whole track, and ${label} has none of the selected clips. Only a track with a selected clip can be muted.`;
+      }
+    }
     if (name === "add_markers" && Array.isArray(input?.markers)) {
       const listing = await deps.callHost("gcutToolGetSequence", {});
       const mine = (listing.clips as any[]).filter((c) => allowed.has(String(c.id)));
@@ -119,7 +128,9 @@ export function createAgent(deps: AgentDeps) {
     try {
       const r: any = await tool.run(c.input ?? {});
       if (tool.kind === "act") {
+        // Only an allowed clip's new ids are allowed: close_gaps also moves (and re-ids) clips that weren't selected.
         for (const [old, made] of Object.entries((r?.idMap ?? {}) as Record<string, string[]>)) {
+          if (!allowed.has(old)) continue;
           allowed.delete(old);
           for (const x of made) allowed.add(String(x));
         }

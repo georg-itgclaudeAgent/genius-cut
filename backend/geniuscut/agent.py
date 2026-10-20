@@ -67,8 +67,8 @@ TOOLS: list[dict] = [
             "clips [{id, track, name, startS, endS, inS, source, selected, enabled, effects, speed}], markers [{id, "
             "startS, endS, name, comments, colour}] and selection (ids of the selected clips). All times are seconds "
             "on the sequence timeline (inS is the clip's in point in its source; effects names the clip's added "
-            "effects, which cut_ranges would remove; speed is 1 at 100%, and get_transcript and cut_ranges refuse any "
-            "other). Track and clip numbering is 1-based, as Premiere shows it (V1, A2). Call this first, and again "
+            "effects, which cut_ranges, move_clips and close_gaps would remove; speed is 1 at 100%, and get_transcript, "
+            "cut_ranges, move_clips, close_gaps and delete_clips refuse any other). Track and clip numbering is 1-based, as Premiere shows it (V1, A2). Call this first, and again "
             "after every edit: clip ids change when clips are cut or moved. Optional fromS/toS list only the clips "
             "and markers overlapping that stretch."),
         "input_schema": {
@@ -189,6 +189,210 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "delete_clips",
+        "description": (
+            "Delete the chosen clips from the timeline. Nothing slides: their place is left empty, and a linked "
+            "partner (a video clip's own sound) that isn't chosen stays. Refuses a locked track and a clip not at 100% "
+            "speed. The reply's warning names effects an undo couldn't bring back (an undo lays the clips back from "
+            "their source). " + _STALE + " " + _UNDO),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sequenceId": _SEQ_ID,
+                "clipIds": {"type": "array", "items": {"type": "string"}, "minItems": 1,
+                            "description": "The clips to delete, ids from get_sequence. " + _STALE},
+            },
+            "required": ["sequenceId", "clipIds"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "close_gaps",
+        "description": (
+            "Close the gaps between the chosen clips (the stretches inside their span none of them covers): every "
+            "clip on EVERY track that starts after a gap moves left by the gaps before it, so everything after stays "
+            "in step. This reaches beyond the selection: the plan must say so (\"this also moves everything after "
+            "2:10\"). Each moved clip is taken off and laid again from its source: its effects are removed (refused, "
+            "naming them, unless acceptEffectLoss is true) and its clip volume, Motion and Opacity settings are reset. "
+            "Refuses, moving nothing: no gap, a clip on any track sitting in a gap, a locked track, a clip not at 100% "
+            "speed. The reply's idMap maps each moved clip's old id to its new one. " + _STALE + " " + _UNDO),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sequenceId": _SEQ_ID,
+                "clipIds": {"type": "array", "items": {"type": "string"}, "minItems": 2,
+                            "description": "The selected clips whose gaps to close, ids from get_sequence. " + _STALE},
+                "acceptEffectLoss": {
+                    "type": "boolean",
+                    "description": "Set true only when the approved plan said the effects on the moved clips will be lost.",
+                },
+            },
+            "required": ["sequenceId", "clipIds"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "split_at",
+        "description": (
+            "Split each chosen clip in two at atS (to the nearest frame), as Premiere's razor does on that clip's own "
+            "track; a linked partner that isn't chosen stays whole. atS must fall inside every chosen clip. The reply's "
+            "idMap maps each split clip's id to its two pieces' ids. " + _SECONDS + " " + _STALE + " " + _UNDO),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sequenceId": _SEQ_ID,
+                "clipIds": {"type": "array", "items": {"type": "string"}, "minItems": 1,
+                            "description": "The clips to split, ids from get_sequence. " + _STALE},
+                "atS": {"type": "number", "minimum": 0, "description": "Where to split. " + _SECONDS},
+            },
+            "required": ["sequenceId", "clipIds", "atS"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "set_clip_enabled",
+        "description": (
+            "Switch the chosen clips off (enabled false: they stay on the timeline but don't play or show) or on "
+            "again, as the timeline's Enable does. " + _STALE + " " + _UNDO),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sequenceId": _SEQ_ID,
+                "clipIds": {"type": "array", "items": {"type": "string"}, "minItems": 1,
+                            "description": "The clips to switch, ids from get_sequence. " + _STALE},
+                "enabled": {"type": "boolean", "description": "true switches them on, false off."},
+            },
+            "required": ["sequenceId", "clipIds", "enabled"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "move_clips",
+        "description": (
+            "Move each chosen clip along its own track by byS seconds (to the nearest frame; negative moves left), all "
+            "or nothing. A linked partner moves only when it is chosen too (choose a clip's own sound with it to keep "
+            "them in sync). Refuses, moving nothing: landing on any clip that isn't moving with it, a move before the "
+            "sequence start or of less than a frame, a locked track, a clip not at 100% speed. Each moved clip is taken "
+            "off and laid again from its source: its effects are removed (refused, naming them, unless "
+            "acceptEffectLoss is true) and its clip volume, Motion and Opacity settings are reset. The reply's idMap "
+            "maps each moved clip's old id to its new one. " + _STALE + " " + _UNDO),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sequenceId": _SEQ_ID,
+                "clipIds": {"type": "array", "items": {"type": "string"}, "minItems": 1,
+                            "description": "The clips to move, ids from get_sequence. " + _STALE},
+                "byS": {"type": "number", "description": "How far to move them, in seconds; negative moves left."},
+                "acceptEffectLoss": {
+                    "type": "boolean",
+                    "description": "Set true only when the approved plan said the effects on these clips will be lost.",
+                },
+            },
+            "required": ["sequenceId", "clipIds", "byS"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "switch_angle",
+        "description": (
+            "Multi-camera angle choice: for the stretch fromS-toS, show the angle on video track showTrack. Every "
+            "chosen video clip overlapping the stretch is split at fromS and toS where they fall inside it; its piece "
+            "inside the stretch is switched off, except showTrack's, which is switched on. Audio isn't touched. "
+            "clipIds are the angles' video clips (one on showTrack must cover the whole stretch). This switches off "
+            "pieces on the other angle tracks: the plan must say so (\"V1 and V3 are switched off from 1:00 to "
+            "1:10\"). The reply's idMap maps each split clip's id to its pieces' ids. " + _SECONDS + " " + _STALE
+            + " " + _UNDO),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sequenceId": _SEQ_ID,
+                "clipIds": {"type": "array", "items": {"type": "string"}, "minItems": 1,
+                            "description": "The angles' video clips, ids from get_sequence. " + _STALE},
+                "fromS": {"type": "number", "minimum": 0, "description": "Start of the stretch. " + _SECONDS},
+                "toS": {"type": "number", "minimum": 0, "description": "End of the stretch. " + _SECONDS},
+                "showTrack": {"type": "integer", "minimum": 1,
+                              "description": "The video track to show (1 for V1)."},
+            },
+            "required": ["sequenceId", "clipIds", "fromS", "toS", "showTrack"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "set_volume",
+        "description": (
+            "Set the chosen audio clips' clip volume to db decibels (Effect Controls > Volume > Level; 0 is unchanged, "
+            "at most +15). Refuses a video clip, volume keyframes and a locked track. A later cut or move of the clip "
+            "resets this, so in one plan set volume after cutting or moving. " + _STALE + " " + _UNDO),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sequenceId": _SEQ_ID,
+                "clipIds": {"type": "array", "items": {"type": "string"}, "minItems": 1,
+                            "description": "The audio clips, ids from get_sequence. " + _STALE},
+                "db": {"type": "number", "maximum": 15, "description": "The clip volume in decibels (-6 is quieter)."},
+            },
+            "required": ["sequenceId", "clipIds", "db"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "mute_track",
+        "description": (
+            "Mute or unmute a whole track (the track's mute switch). It reaches beyond the selection: the plan must say "
+            "so (\"this mutes all of A2\"). Only a track that has a selected clip. " + _UNDO),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sequenceId": _SEQ_ID,
+                "kind": {"type": "string", "enum": ["audio", "video"], "description": "The track's kind."},
+                "track": {"type": "integer", "minimum": 1, "description": "The track number (1 for A1 or V1)."},
+                "muted": {"type": "boolean", "description": "true mutes, false unmutes."},
+            },
+            "required": ["sequenceId", "kind", "track", "muted"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "add_transition",
+        "description": (
+            "Add a transition at the chosen clip's start or end, seconds long (to the frame), centred on the edit: "
+            "Cross Dissolve on video, Constant Power on audio. Genius Cut's Undo can't remove it (Premiere has no "
+            "script call for that): the plan must say so; the user removes it by hand or with Premiere's Undo. "
+            + _STALE),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sequenceId": _SEQ_ID,
+                "clipId": {"type": "string", "description": "The clip, its id from get_sequence. " + _STALE},
+                "at": {"type": "string", "enum": ["start", "end"], "description": "Which edge of the clip."},
+                "seconds": {"type": "number", "exclusiveMinimum": 0,
+                            "description": "The transition's length in seconds (at least a frame)."},
+            },
+            "required": ["sequenceId", "clipId", "at", "seconds"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "set_speed",
+        "description": (
+            "Play the chosen clips at speed (1 = 100%, 2 = twice as fast, 0.5 = half). Each keeps its place and length "
+            "on the timeline, so nothing else moves; its content plays faster or slower. A clip whose own sound or "
+            "picture isn't chosen with it is refused (they would go out of sync), and so is a reversed clip. Afterwards "
+            "get_transcript, cut_ranges, move_clips and close_gaps refuse the clip. " + _STALE + " " + _UNDO),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sequenceId": _SEQ_ID,
+                "clipIds": {"type": "array", "items": {"type": "string"}, "minItems": 1,
+                            "description": "The clips, ids from get_sequence. " + _STALE},
+                "speed": {"type": "number", "exclusiveMinimum": 0, "maximum": 100,
+                          "description": "The speed: 1 is 100%."},
+            },
+            "required": ["sequenceId", "clipIds", "speed"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "propose_filler_cuts",
         "description": (
             "Hand a filler-word / pause trim of the selected clips to Genius Cut's own trim review: the panel runs "
@@ -210,7 +414,9 @@ TOOLS: list[dict] = [
 
 # read: any time; act: only after approval (the panel enforces); terminal: ends the run.
 TOOL_KINDS = {"get_sequence": "read", "get_transcript": "read", "wait_transcript": "read",
-              "add_markers": "act", "cut_ranges": "act", "propose_filler_cuts": "terminal"}
+              "add_markers": "act", "cut_ranges": "act", "delete_clips": "act", "close_gaps": "act", "split_at": "act",
+              "set_clip_enabled": "act", "move_clips": "act", "switch_angle": "act", "set_volume": "act",
+              "mute_track": "act", "add_transition": "act", "set_speed": "act", "propose_filler_cuts": "terminal"}
 
 SYSTEM = """You are the assistant inside Genius Cut, a Premiere Pro panel. The user typed an instruction about \
 the clips they selected on the timeline. You edit the active sequence only through the tools.
@@ -220,12 +426,18 @@ Selection rules
 return in this run. Markers go inside the selected clips' time span. Read tools may look at the whole sequence.
 - If something can only be done by touching material outside the selection, say so in plain words in the plan \
 ("this also moves everything after 2:10", "this mutes all of A2").
+- Three tools reach beyond the selection by nature, and the plan must say so in plain words each time: close_gaps \
+moves every clip on every track after each gap ("this also moves everything after 2:10"); switch_angle switches \
+off pieces on the other angle tracks ("V1 and V3 are switched off from 1:00 to 1:10"); mute_track mutes the whole \
+track ("this mutes all of A2"). Their clip ids must still be selected ones; use mute_track only on a track that has \
+a selected clip.
 - All times are seconds on the sequence timeline; in text to the user write them as m:ss.
 
 Two kinds of instruction
 1. A filler-word or pause trim ("trim the ums", "tighten the pauses"): call propose_filler_cuts with clear \
 instructions, as your only tool call. It needs no plan; it ends the run and opens Genius Cut's trim review.
-2. A timeline edit (markers, cuts, …): plan first, then act after approval.
+2. A timeline edit (markers, cuts, deletes, splits, moves, gaps, angles, on/off, volume, mutes, transitions, \
+speed): plan first, then act after approval.
 If an instruction mixes a trim with other edits, do the trim first: your plan says the trim runs now and asks \
 the user to send the other edits afterwards as a new instruction; after approval call propose_filler_cuts.
 
@@ -235,11 +447,16 @@ to work out exactly what to do, then reply with the plan and no tool call.
 - The plan is a short numbered list, one line per change, plain words, with times and clip/track names. \
 Name anything that reaches beyond the selection ("this also moves …"). Don't ask questions unless the \
 instruction can't be done.
-- Cutting rebuilds clips from their source and drops their effects. When you cut clips whose get_sequence \
-`effects` aren't empty, the plan must say "effects will be lost on <clips>" (naming them); only after the user \
-approved that plan, pass acceptEffectLoss: true to cut_ranges. Never pass it otherwise.
+- cut_ranges, move_clips and close_gaps rebuild clips from their source and drop their effects. When they \
+touch clips whose get_sequence `effects` aren't empty, the plan must say "effects will be lost on <clips>" \
+(naming them); only after the user approved that plan, pass acceptEffectLoss: true (cut_ranges, move_clips, \
+close_gaps). Never pass it otherwise.
+- Rebuilt that way, a clip's clip volume, Motion and Opacity settings are reset to the source's (keyframes too). \
+When the plan cuts or moves clips, the plan must say "volume, Motion and Opacity settings will be reset on <clips>". \
+If the same plan sets a volume, set it after the cuts and moves.
 - Genius Cut's Undo can't take a transition off (Premiere has no script call for it): when you add a \
 transition, the plan must say so ("Undo won't remove the transition; remove it by hand").
+- set_speed keeps each clip's place and length; choose a clip's own sound with its picture so they stay in sync.
 
 After "Approved: do exactly this plan."
 - Do exactly the plan: nothing more, nothing less. Call get_sequence again after each edit, because clip ids \

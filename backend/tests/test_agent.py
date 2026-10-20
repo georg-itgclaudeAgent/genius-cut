@@ -101,13 +101,46 @@ def ledger():
 
 # ── tools and request shape ────────────────────────────────────────
 
-def test_the_tools_offered_are_phase_1_plus_propose_filler_cuts_never_undo():
+PIECE_4 = ["delete_clips", "close_gaps", "split_at", "set_clip_enabled", "move_clips", "switch_angle", "set_volume",
+           "mute_track", "add_transition", "set_speed"]
+
+
+def test_the_tools_offered_are_the_whole_toolbox_plus_propose_filler_cuts_never_undo():
     names = [t["name"] for t in agent.TOOLS]
-    assert names == ["get_sequence", "get_transcript", "wait_transcript", "add_markers", "cut_ranges",
+    assert names == ["get_sequence", "get_transcript", "wait_transcript", "add_markers", "cut_ranges", *PIECE_4,
                      "propose_filler_cuts"]
     assert all(t["input_schema"]["type"] == "object" and t["description"] for t in agent.TOOLS)
+    assert all(t["input_schema"].get("additionalProperties") is False for t in agent.TOOLS)
     assert "undo_last_turn" not in json.dumps(agent.TOOLS)
+    assert "set_clip_label" not in json.dumps(agent.TOOLS) + agent.SYSTEM  # dropped: Premiere can't label one clip
     assert set(agent.TOOL_KINDS) == set(names)
+    assert all(agent.TOOL_KINDS[n] == "act" for n in PIECE_4)
+
+
+def _schema(name):
+    return next(t for t in agent.TOOLS if t["name"] == name)["input_schema"]
+
+
+def test_piece_4_schemas_take_the_host_tools_arguments():
+    args = {n: (sorted(_schema(n)["properties"]), sorted(_schema(n)["required"])) for n in PIECE_4}
+    assert args == {
+        "delete_clips": (["clipIds", "sequenceId"], ["clipIds", "sequenceId"]),
+        "close_gaps": (["acceptEffectLoss", "clipIds", "sequenceId"], ["clipIds", "sequenceId"]),
+        "split_at": (["atS", "clipIds", "sequenceId"], ["atS", "clipIds", "sequenceId"]),
+        "set_clip_enabled": (["clipIds", "enabled", "sequenceId"], ["clipIds", "enabled", "sequenceId"]),
+        "move_clips": (["acceptEffectLoss", "byS", "clipIds", "sequenceId"], ["byS", "clipIds", "sequenceId"]),
+        "switch_angle": (["clipIds", "fromS", "sequenceId", "showTrack", "toS"], ["clipIds", "fromS", "sequenceId", "showTrack", "toS"]),
+        "set_volume": (["clipIds", "db", "sequenceId"], ["clipIds", "db", "sequenceId"]),
+        "mute_track": (["kind", "muted", "sequenceId", "track"], ["kind", "muted", "sequenceId", "track"]),
+        "add_transition": (["at", "clipId", "seconds", "sequenceId"], ["at", "clipId", "seconds", "sequenceId"]),
+        "set_speed": (["clipIds", "sequenceId", "speed"], ["clipIds", "sequenceId", "speed"]),
+    }
+    assert _schema("set_volume")["properties"]["db"]["maximum"] == 15
+    assert _schema("mute_track")["properties"]["kind"]["enum"] == ["audio", "video"]
+    assert _schema("add_transition")["properties"]["at"]["enum"] == ["start", "end"]
+    assert _schema("set_speed")["properties"]["speed"]["maximum"] == 100
+    for n in ("close_gaps", "move_clips"):
+        assert _schema(n)["properties"]["acceptEffectLoss"]["type"] == "boolean"
 
 
 def test_first_step_request_shape(tmp_path):
@@ -401,4 +434,19 @@ def test_the_system_prompt_ties_effect_loss_to_the_approved_plan():
     s = " ".join(agent.SYSTEM.split())
     assert "whose get_sequence `effects` aren't empty" in s
     assert 'the plan must say "effects will be lost on <clips>"' in s
-    assert "only after the user approved that plan, pass acceptEffectLoss: true to cut_ranges" in s
+    assert "only after the user approved that plan, pass acceptEffectLoss: true (cut_ranges, move_clips, close_gaps)" in s
+
+
+def test_the_system_prompt_names_what_reaches_beyond_the_selection():
+    s = " ".join(agent.SYSTEM.split())
+    for tool in ("close_gaps", "switch_angle", "mute_track"):
+        assert tool in s
+    assert "the plan must say so in plain words" in s
+    assert "mute_track only on a track that has a selected clip" in s
+
+
+def test_the_system_prompt_says_moves_and_cuts_rebuild_clips_and_reset_their_settings():
+    s = " ".join(agent.SYSTEM.split())
+    assert "cut_ranges, move_clips and close_gaps rebuild clips from their source" in s
+    assert "clip volume, Motion and Opacity settings are reset" in s
+    assert 'the plan must say "volume, Motion and Opacity settings will be reset on <clips>"' in s

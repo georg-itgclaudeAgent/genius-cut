@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { createTools, undoTurn, type ToolDeps } from "./tools";
+import { createTools, undoTurn, TOOL_ARGS, type ToolDeps } from "./tools";
 import { createTurns, type TurnStore } from "./turns";
 import type { TranscriptJob, TranscriptRequest } from "../api/types";
 
@@ -46,10 +46,21 @@ function fakes(job: Partial<TranscriptJob> = {}) {
 }
 
 describe("the bridge's tool table", () => {
-  it("has the Phase 1 tools, read and act kinds", () => {
+  it("has the whole toolbox, read and act kinds, and declares each tool's arguments", () => {
     const t = createTools(fakes().deps);
-    expect(Object.fromEntries(Object.entries(t).map(([k, v]) => [k, v.kind]))).toMatchObject({
-      get_sequence: "read", get_transcript: "read", wait_transcript: "read", add_markers: "act", cut_ranges: "act", undo_last_turn: "act" });
+    expect(Object.fromEntries(Object.entries(t).map(([k, v]) => [k, v.kind]))).toEqual({
+      get_sequence: "read", get_transcript: "read", wait_transcript: "read", add_markers: "act", cut_ranges: "act",
+      delete_clips: "act", close_gaps: "act", split_at: "act", set_clip_enabled: "act", move_clips: "act", switch_angle: "act",
+      set_volume: "act", mute_track: "act", add_transition: "act", set_speed: "act", undo_last_turn: "act" });
+    expect(Object.keys(TOOL_ARGS).sort()).toEqual(Object.keys(t).sort());
+    expect(t.set_clip_label).toBeUndefined(); // dropped: Premiere can't label a single clip
+  });
+
+  it("refuses an argument the tool doesn't take, without calling the host", async () => {
+    const f = fakes(), t = createTools(f.deps);
+    await expect(t.split_at.run({ sequenceId: "seq-1", clipIds: [V1], atS: 102, at: 3 })).rejects.toThrow(
+      "split_at has no argument at. Its arguments are: sequenceId, clipIds, atS.");
+    expect(f.host).toEqual([]);
   });
 
   it("get_sequence is the host's listing, with Claude's arguments", async () => {
@@ -333,6 +344,57 @@ describe("the bridge's tool table", () => {
       } };
       await expect(createTools(failing).add_markers.run(MARGS)).rejects.toThrow("Marker 1 needs a name.");
       await expect(t.undo_last_turn.run({})).rejects.toThrow(/Nothing to undo/);
+    });
+  });
+
+  describe("the piece-4 act tools", () => {
+    const SEQ = "seq-1";
+    // Each: Claude's args, the host function, the host's reply (with its undo record), the line the run shows.
+    const cases: [string, any, string, any, string][] = [
+      ["delete_clips", { sequenceId: SEQ, clipIds: [V1, A1] }, "gcutToolDeleteClips",
+        { ok: true, deleted: [V1, A1], idMap: {}, undo: { kind: "delete", sequenceId: SEQ, items: [] } }, "Deleted 2 clips"],
+      ["close_gaps", { sequenceId: SEQ, clipIds: [V1, A2], acceptEffectLoss: true }, "gcutToolCloseGaps",
+        { ok: true, gapCount: 1, closedS: 2.5, movedCount: 3, idMap: { [V1]: ["V1@1#node-a"] }, undo: { kind: "moves", sequenceId: SEQ, moves: [] } },
+        "Closed 1 gap (2.5 s); 3 clips moved"],
+      ["split_at", { sequenceId: SEQ, clipIds: [V1], atS: 104 }, "gcutToolSplitAt",
+        { ok: true, splitCount: 1, idMap: { [V1]: [V1, "V1@2#node-a"] }, undo: { kind: "split", sequenceId: SEQ, clips: [] } }, "Split 1 clip at 104 s"],
+      ["set_clip_enabled", { sequenceId: SEQ, clipIds: [V1], enabled: false }, "gcutToolSetClipEnabled",
+        { ok: true, changed: 1, idMap: {}, undo: { kind: "enabled", sequenceId: SEQ, items: [] } }, "Switched 1 clip off"],
+      ["move_clips", { sequenceId: SEQ, clipIds: [V1, A1], byS: -1.5 }, "gcutToolMoveClips",
+        { ok: true, movedCount: 2, idMap: { [V1]: ["V1@3#node-a"] }, undo: { kind: "moves", sequenceId: SEQ, moves: [] } }, "Moved 2 clips by -1.5 s"],
+      ["switch_angle", { sequenceId: SEQ, clipIds: [V1], fromS: 101, toS: 103, showTrack: 2 }, "gcutToolSwitchAngle",
+        { ok: true, shown: "V2", hidden: ["V1"], splitCount: 2, idMap: {}, undo: { kind: "angle", sequenceId: SEQ, clips: [], states: [] } },
+        "Showed V2 from 101 to 103 s (V1 off)"],
+      ["set_volume", { sequenceId: SEQ, clipIds: [A1], db: -6 }, "gcutToolSetVolume",
+        { ok: true, db: -6, level: 0.1, changed: 1, idMap: {}, undo: { kind: "volume", sequenceId: SEQ, items: [] } }, "Set 1 clip's volume to -6 dB"],
+      ["mute_track", { sequenceId: SEQ, kind: "audio", track: 2, muted: true }, "gcutToolMuteTrack",
+        { ok: true, track: "A2", muted: true, changed: true, idMap: {}, undo: { kind: "mute", sequenceId: SEQ } }, "Muted A2"],
+      ["add_transition", { sequenceId: SEQ, clipId: V1, at: "end", seconds: 1 }, "gcutToolAddTransition",
+        { ok: true, transition: "Cross Dissolve", at: "end", seconds: 1, idMap: {}, undo: { kind: "transition", sequenceId: SEQ } },
+        "Added a 1 s Cross Dissolve at the end of V1's clip"],
+      ["set_speed", { sequenceId: SEQ, clipIds: [V1, A1], speed: 1.5 }, "gcutToolSetSpeed",
+        { ok: true, speed: 1.5, changed: 2, idMap: {}, undo: { kind: "speed", sequenceId: SEQ, items: [] } }, "Set 2 clips to 150% speed"],
+    ];
+
+    it.each(cases)("%s calls its host function with Claude's arguments, records the undo and passes the idMap on", async (name, args, fn, hostReply, line) => {
+      const f = fakes();
+      const deps: ToolDeps = { ...f.deps, callHost: async (h, a) => { f.host.push([h, a]); return structuredClone(hostReply); } };
+      const r: any = await createTools(deps)[name].run(args);
+      const { undo, ...reply } = hostReply;
+      expect(r).toEqual(reply);
+      expect(r.idMap).toEqual(hostReply.idMap);
+      expect(f.host).toEqual([[fn, args]]);
+      const turn = f.turns.latest(SEQ)!;
+      expect(turn.actions).toHaveLength(1);
+      expect(turn.actions[0]).toMatchObject({ tool: name, args, summary: line, undo });
+      if (Object.keys(hostReply.idMap).length) expect(turn.actions[0].idMap).toEqual(hostReply.idMap);
+    });
+
+    it("a refusal from the host is no turn", async () => {
+      const f = fakes();
+      const deps: ToolDeps = { ...f.deps, callHost: async () => { throw new Error("V1 is locked."); } };
+      await expect(createTools(deps).delete_clips.run({ sequenceId: SEQ, clipIds: [V1] })).rejects.toThrow("V1 is locked.");
+      expect(f.turns.latest(SEQ)).toBeUndefined();
     });
   });
 });

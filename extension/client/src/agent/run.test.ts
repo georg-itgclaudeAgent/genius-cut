@@ -28,6 +28,7 @@ function world(script: { start: AgentStep | (() => AgentStep); [k: string]: any 
   let listing: any = structuredClone(BASE);
   const host: [string, any][] = [];
   let undoReply: (record: any) => any = () => ({ ok: true });
+  const actReplies: Record<string, (args: any) => any> = {};
   let cutReply: (args: any) => any = () => ({ ok: true, cutCount: 1, clipCount: 1, removedS: 1, crossfades: 0, idMap: {}, undo: { kind: "cuts", sequenceId: "seq-1" } });
   const callHost = async (fn: string, args: any) => {
     host.push([fn, args]);
@@ -39,6 +40,7 @@ function world(script: { start: AgentStep | (() => AgentStep); [k: string]: any 
     }
     if (fn === "gcutToolCutRanges") return cutReply(args);
     if (fn === "gcutToolUndo") return undoReply(args.record);
+    if (actReplies[fn]) return actReplies[fn](args);
     throw new Error(`unexpected ${fn}`);
   };
   const turns = createTurns(memoryStore());
@@ -61,7 +63,8 @@ function world(script: { start: AgentStep | (() => AgentStep); [k: string]: any 
   const agent = createAgent({ api, tools, turns, callHost, snapshotTrim: async () => { snaps++; return SNAP; } });
   return { agent, api, host, posted, queue, turns, tools, snaps: () => snaps,
     setListing: (f: (l: any) => any) => { listing = f(listing); }, setCut: (f: (args: any) => any) => { cutReply = f; },
-    hostUndo: (f: (record: any) => any) => { undoReply = f; } };
+    hostUndo: (f: (record: any) => any) => { undoReply = f; },
+    onHost: (fn: string, f: (args: any) => any) => { actReplies[fn] = f; } };
 }
 const resultsOf = (w: ReturnType<typeof world>, i = 0) => w.posted.filter((p) => p.kind === "results")[i].body;
 const hostCalls = (w: ReturnType<typeof world>, fn: string) => w.host.filter(([f]) => f === fn).map(([, a]) => a);
@@ -207,6 +210,86 @@ describe("Go: the approved run", () => {
   });
 });
 
+describe("selection rules for the piece-4 tools", () => {
+  const ok = (kind: string, idMap: Record<string, string[]> = {}, extra: any = {}) => () => ({ ok: true, idMap, ...extra, undo: { kind, sequenceId: "seq-1" } });
+  async function going(w: ReturnType<typeof world>, plan: string, ...c: AgentToolCall[]) {
+    w.queue.push(step("plan", { text: plan }));
+    await w.agent.send("x");
+    w.queue.push(calls(...c), step("done"));
+    return w.agent.go();
+  }
+
+  it("mute_track is allowed on a track that has a selected clip, refused on any other", async () => {
+    const w = world({ start: calls(call("get_sequence", {})) });
+    w.onHost("gcutToolMuteTrack", (a) => ({ ok: true, track: `${a.kind === "audio" ? "A" : "V"}${a.track}`, muted: a.muted, changed: true, idMap: {},
+      undo: { kind: "mute", sequenceId: "seq-1" } }));
+    const out = await going(w, "1. Mute A1 (this mutes all of A1)",
+      call("mute_track", { sequenceId: "seq-1", kind: "audio", track: 1, muted: true }, "a1"),
+      call("mute_track", { sequenceId: "seq-1", kind: "video", track: 2, muted: true }, "v2"),
+      call("mute_track", { sequenceId: "seq-1", kind: "audio", track: 2, muted: true }, "a2"));
+    const [a1, v2, a2] = resultsOf(w, 1);
+    expect(a1.is_error).toBe(false);
+    expect(v2.is_error && v2.content).toMatch(/V2 has none of the selected clips/);
+    expect(a2.is_error && a2.content).toMatch(/A2 has none of the selected clips/);
+    expect(hostCalls(w, "gcutToolMuteTrack").map((a: any) => [a.kind, a.track])).toEqual([["audio", 1]]);
+    expect(out).toMatchObject({ lines: [{ text: "Muted A1", ok: true, notInPlan: false }, { ok: false }, { ok: false }] });
+  });
+
+  it("close_gaps and switch_angle take selected clips only, though they reach beyond them", async () => {
+    const w = world({ start: calls(call("get_sequence", {})) });
+    w.onHost("gcutToolCloseGaps", ok("moves", {}, { gapCount: 1, closedS: 1, movedCount: 1 }));
+    w.onHost("gcutToolSwitchAngle", ok("angle", {}, { shown: "V1", hidden: [], splitCount: 0 }));
+    await going(w, "1. Close the gap (this also moves everything after 1:50) 2. Switch to camera V1",
+      call("close_gaps", { sequenceId: "seq-1", clipIds: [V1, OTHER] }, "g"),
+      call("switch_angle", { sequenceId: "seq-1", clipIds: [V1, OTHER], fromS: 101, toS: 102, showTrack: 1 }, "s1"),
+      call("switch_angle", { sequenceId: "seq-1", clipIds: [V1], fromS: 101, toS: 102, showTrack: 1 }, "s2"));
+    const [g, s1, s2] = resultsOf(w, 1);
+    expect(g.is_error && g.content).toContain(`${OTHER} isn't one of the selected clips`);
+    expect(s1.is_error).toBe(true);
+    expect(s2.is_error).toBe(false);
+    expect(hostCalls(w, "gcutToolCloseGaps")).toEqual([]);
+  });
+
+  it("an unselected clip that close_gaps moved stays out of the allowed set; a moved selected clip is allowed by its new id", async () => {
+    const w = world({ start: calls(call("get_sequence", {})) });
+    const V1_MOVED = id("V1", 98, "a"), OTHER_MOVED = id("V2", 118, "z");
+    w.onHost("gcutToolCloseGaps", ok("moves", { [V1]: [V1_MOVED], [OTHER]: [OTHER_MOVED] }, { gapCount: 1, closedS: 2, movedCount: 2 }));
+    w.onHost("gcutToolSetClipEnabled", ok("enabled", {}, { changed: 1 }));
+    w.queue.push(step("plan", { text: "1. Close the gaps, this also moves V2; 2. switch V1 off (disable)" }));
+    await w.agent.send("x");
+    w.queue.push(calls(call("close_gaps", { sequenceId: "seq-1", clipIds: [V1, A1] })),
+      calls(call("set_clip_enabled", { sequenceId: "seq-1", clipIds: [V1_MOVED], enabled: false }, "moved"),
+        call("set_clip_enabled", { sequenceId: "seq-1", clipIds: [OTHER_MOVED], enabled: false }, "other"),
+        call("set_clip_enabled", { sequenceId: "seq-1", clipIds: [V1], enabled: false }, "old")), step("done"));
+    await w.agent.go();
+    expect(resultsOf(w, 1)[0].is_error).toBe(false);
+    const [moved, other, old] = resultsOf(w, 2);
+    expect(moved.is_error).toBe(false);
+    expect(other.is_error && other.content).toContain(`${OTHER_MOVED} isn't one of the selected clips`);
+    expect(old.is_error).toBe(true);
+    expect(hostCalls(w, "gcutToolSetClipEnabled").map((a: any) => a.clipIds)).toEqual([[V1_MOVED]]);
+  });
+
+  it("add_transition's single clipId must be selected; split_at's pieces join the allowed set", async () => {
+    const w = world({ start: calls(call("get_sequence", {})) });
+    const P = id("V1", 104, "a");
+    w.onHost("gcutToolSplitAt", ok("split", { [V1]: [V1, P] }, { splitCount: 1 }));
+    w.onHost("gcutToolAddTransition", (a) => ({ ok: true, transition: "Cross Dissolve", at: a.at, seconds: a.seconds, idMap: {},
+      undo: { kind: "transition", sequenceId: "seq-1" } }));
+    w.queue.push(step("plan", { text: "1. Split V1 at 1:44 2. Add a dissolve transition (Undo won't remove it)" }));
+    await w.agent.send("x");
+    w.queue.push(calls(call("split_at", { sequenceId: "seq-1", clipIds: [V1], atS: 104 })),
+      calls(call("add_transition", { sequenceId: "seq-1", clipId: P, at: "start", seconds: 1 }, "p"),
+        call("add_transition", { sequenceId: "seq-1", clipId: OTHER, at: "start", seconds: 1 }, "o")), step("done"));
+    const out = await w.agent.go();
+    const [p, o] = resultsOf(w, 2);
+    expect(p.is_error).toBe(false);
+    expect(o.is_error && o.content).toContain(`${OTHER} isn't one of the selected clips`);
+    expect(out).toMatchObject({ lines: [{ text: "Split 1 clip at 104 s", notInPlan: false },
+      { text: "Added a 1 s Cross Dissolve at the start of V1's clip", notInPlan: false }, { ok: false }] });
+  });
+});
+
 describe("terminal trim handoff", () => {
   it("propose_filler_cuts ends the run: no results posted; the trim gets Claude's instructions and the selection recorded at send", async () => {
     const w = world({ start: calls(call("propose_filler_cuts", { instructions: "remove ums; keep breaths" })) });
@@ -271,6 +354,17 @@ describe("namedInPlan", () => {
     expect(namedInPlan("cut_ranges", "1. Remove 1:42-1:45 from V1")).toBe(true);
     expect(namedInPlan("cut_ranges", "1. Add a marker")).toBe(false);
     expect(namedInPlan("some_new_tool", "1. some new tool on V1")).toBe(true);
+    expect(namedInPlan("set_clip_enabled", "1. Switch off V2 between 1:00 and 1:10")).toBe(true);
+    expect(namedInPlan("set_clip_enabled", "1. Turn V2 back on")).toBe(true);
+    expect(namedInPlan("close_gaps", "1. Close the gap at 2:10 (this also moves everything after 2:10)")).toBe(true);
+    expect(namedInPlan("move_clips", "1. Shift V1 2 s later")).toBe(true);
+    expect(namedInPlan("split_at", "1. Split V1 at 1:44")).toBe(true);
+    expect(namedInPlan("switch_angle", "1. Show Camera B (V2) from 1:00 to 1:20")).toBe(true);
+    expect(namedInPlan("set_volume", "1. Lower A1 by 6 dB")).toBe(true);
+    expect(namedInPlan("mute_track", "1. Mute A2 (this mutes all of A2)")).toBe(true);
+    expect(namedInPlan("add_transition", "1. Cross dissolve between the two clips")).toBe(true);
+    expect(namedInPlan("set_speed", "1. Play V1 at 150%")).toBe(true);
+    expect(namedInPlan("delete_clips", "1. Mute A2")).toBe(false);
   });
 });
 

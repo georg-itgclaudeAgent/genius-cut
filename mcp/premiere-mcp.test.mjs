@@ -99,11 +99,32 @@ test("initialize answers with the client's protocol version and a tools capabili
   assert.equal(r.result.serverInfo.name, "premiere");
 }));
 
-test("tools/list offers exactly the Phase 1 tools with schemas written for Claude", () => withSetup(async ({ mcp }) => {
+test("tools/list offers the whole toolbox: act tools are not read-only, transitions say Undo can't remove them", () => withSetup(async ({ mcp }) => {
+  const { tools } = (await mcp.request("tools/list", {})).result;
+  const byName = Object.fromEntries(tools.map((t) => [t.name, t]));
+  const piece4 = ["add_transition", "close_gaps", "delete_clips", "move_clips", "mute_track", "set_clip_enabled", "set_speed",
+    "set_volume", "split_at", "switch_angle"];
+  for (const n of piece4) {
+    assert.ok(byName[n], n);
+    assert.equal(byName[n].annotations.readOnlyHint, false, n);
+    assert.equal(byName[n].inputSchema.additionalProperties, false, n);
+    assert.ok(byName[n].inputSchema.required.includes("sequenceId"), n);
+  }
+  assert.equal(byName.set_clip_label, undefined);
+  assert.equal(byName.delete_clips.annotations.destructiveHint, true);
+  assert.match(byName.add_transition.description, /can't remove it/);
+  assert.doesNotMatch(byName.add_transition.description, /Undo with undo_last_turn/);
+  for (const n of ["close_gaps", "move_clips"]) assert.equal(byName[n].inputSchema.properties.acceptEffectLoss.type, "boolean");
+  assert.match(byName.close_gaps.description, /EVERY track/);
+  assert.match(byName.mute_track.description, /whole track/);
+}));
+
+test("tools/list offers exactly the toolbox with schemas written for Claude", () => withSetup(async ({ mcp }) => {
   const { tools } = (await mcp.request("tools/list", {})).result;
   const byName = Object.fromEntries(tools.map((t) => [t.name, t]));
   assert.deepEqual(Object.keys(byName).sort(),
-    ["add_markers", "cut_ranges", "get_sequence", "get_transcript", "undo_last_turn", "wait_transcript"]);
+    ["add_markers", "add_transition", "close_gaps", "cut_ranges", "delete_clips", "get_sequence", "get_transcript", "move_clips",
+     "mute_track", "set_clip_enabled", "set_speed", "set_volume", "split_at", "switch_angle", "undo_last_turn", "wait_transcript"]);
   for (const t of tools) {
     assert.equal(t.inputSchema.type, "object", t.name);
     assert.ok(t.description.length > 40, t.name);

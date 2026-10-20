@@ -1,7 +1,9 @@
 /**
  * The assistant's tool table: name → {kind, run(args)}. Host tools go to the gcutTool* functions in
  * extension/host/index.jsx through evalScript; transcripts go to the backend. Every time Claude sends or receives is in seconds
- * on the sequence.
+ * on the sequence. Every act call (add_markers, cut_ranges and the piece-4 tools) pushes its undo record and idMap on the
+ * turn stack. TOOL_ARGS is this table's copy of the schemas' arguments (schemas.test.ts checks it against the backend's and
+ * the MCP's).
  */
 import type { Snapshot, SnapshotItem, TranscriptJob, TranscriptRequest } from "../api/types";
 import { round3 } from "../lib/review";
@@ -57,6 +59,51 @@ function markersSummary(args: any): string {
 function cutSummary(r: any): string {
   return `Cut ${plural(r.cutCount, "range")} from ${plural(r.clipCount, "clip")} (${round3(r.removedS)} s removed)`;
 }
+
+const clipCount = (a: any) => (Array.isArray(a?.clipIds) ? a.clipIds.length : 0);
+/** A clip id's track label (ids are "V1@<start ticks>#<media>"). */
+const trackOf = (clipId: unknown) => String(clipId ?? "").split("@")[0];
+
+/**
+ * The arguments each tool takes: the same names as its schema in backend/geniuscut/agent.py and
+ * mcp/premiere-mcp.mjs (the schemas test checks all three). A call with any other argument is refused.
+ */
+export const TOOL_ARGS: Record<string, readonly string[]> = {
+  get_sequence: ["fromS", "toS"],
+  get_transcript: ["clipIds"],
+  wait_transcript: ["id"],
+  add_markers: ["sequenceId", "markers"],
+  cut_ranges: ["sequenceId", "clipIds", "ranges", "acceptEffectLoss"],
+  delete_clips: ["sequenceId", "clipIds"],
+  close_gaps: ["sequenceId", "clipIds", "acceptEffectLoss"],
+  split_at: ["sequenceId", "clipIds", "atS"],
+  set_clip_enabled: ["sequenceId", "clipIds", "enabled"],
+  move_clips: ["sequenceId", "clipIds", "byS", "acceptEffectLoss"],
+  switch_angle: ["sequenceId", "clipIds", "fromS", "toS", "showTrack"],
+  set_volume: ["sequenceId", "clipIds", "db"],
+  mute_track: ["sequenceId", "kind", "track", "muted"],
+  add_transition: ["sequenceId", "clipId", "at", "seconds"],
+  set_speed: ["sequenceId", "clipIds", "speed"],
+  undo_last_turn: [],
+};
+
+/**
+ * The piece-4 act tools: name → [host function (extension/host/index.jsx), the line the run shows].
+ * Each host function returns { ok, …, idMap, undo }; act() keeps the undo record on the stack.
+ */
+const ACTS: Record<string, [string, (a: any, r: any) => string]> = {
+  delete_clips: ["gcutToolDeleteClips", (a, r) => `Deleted ${plural(Array.isArray(r?.deleted) ? r.deleted.length : clipCount(a), "clip")}`],
+  close_gaps: ["gcutToolCloseGaps", (_a, r) => `Closed ${plural(r.gapCount, "gap")} (${round3(r.closedS)} s); ${plural(r.movedCount, "clip")} moved`],
+  split_at: ["gcutToolSplitAt", (a, r) => `Split ${plural(r.splitCount, "clip")} at ${round3(a.atS)} s`],
+  set_clip_enabled: ["gcutToolSetClipEnabled", (a) => `Switched ${plural(clipCount(a), "clip")} ${a.enabled ? "on" : "off"}`],
+  move_clips: ["gcutToolMoveClips", (a, r) => `Moved ${plural(r.movedCount, "clip")} by ${round3(a.byS)} s`],
+  switch_angle: ["gcutToolSwitchAngle", (a, r) =>
+    `Showed ${r.shown} from ${round3(a.fromS)} to ${round3(a.toS)} s` + (r.hidden?.length ? ` (${r.hidden.join(", ")} off)` : "")],
+  set_volume: ["gcutToolSetVolume", (a) => `Set ${clipCount(a) === 1 ? "1 clip's" : `${clipCount(a)} clips'`} volume to ${a.db} dB`],
+  mute_track: ["gcutToolMuteTrack", (_a, r) => `${r.muted ? "Muted" : "Unmuted"} ${r.track}`],
+  add_transition: ["gcutToolAddTransition", (a, r) => `Added a ${round3(r.seconds)} s ${r.transition} at the ${a.at} of ${trackOf(a.clipId)}'s clip`],
+  set_speed: ["gcutToolSetSpeed", (a) => `Set ${plural(clipCount(a), "clip")} to ${round3(a.speed * 100)}% speed`],
+};
 
 /**
  * What stands in the way of undoing this turn, read off the timeline before anything is reversed:
@@ -173,7 +220,7 @@ export function createTools(deps: ToolDeps): ToolTable {
   /** Where each job this panel started begins on the sequence: its words come back range-relative. */
   const jobStarts = new Map<string, number>();
 
-  return {
+  const table: ToolTable = {
     get_sequence: { kind: "read", run: (args) => deps.callHost("gcutToolGetSequence", args ?? {}) },
 
     get_transcript: {
@@ -219,4 +266,20 @@ export function createTools(deps: ToolDeps): ToolTable {
 
     undo_last_turn: { kind: "act", run: () => undoTurn(deps) },
   };
+  for (const [name, [fn, summary]] of Object.entries(ACTS)) {
+    table[name] = { kind: "act", run: (args) => act(name, fn, args, summary) };
+  }
+
+  // Every tool refuses an argument it doesn't take, before anything runs.
+  for (const [name, tool] of Object.entries(table)) {
+    const takes = TOOL_ARGS[name], run = tool.run;
+    tool.run = (args) => {
+      const bad = Object.keys(args ?? {}).find((k) => !takes.includes(k));
+      if (bad !== undefined) {
+        return Promise.reject(new Error(`${name} has no argument ${bad}. ` + (takes.length ? `Its arguments are: ${takes.join(", ")}.` : "It takes no arguments.")));
+      }
+      return run(args);
+    };
+  }
+  return table;
 }

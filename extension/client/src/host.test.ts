@@ -7,7 +7,8 @@
  *   - overwriteClip really overwrites: it trims, splits or removes whatever it lands on;
  *   - placements snap to the sequence frame grid;
  *   - behaviours the docs don't pin down are switches (setInPoint units, where linked audio
- *     lands, whether remove/move also act on linked partners, locked tracks, in > out).
+ *     lands, whether remove also acts on linked partners, locked tracks, in > out);
+ *   - TrackItem.move throws: it hung real Premiere, so the host must never call it.
  */
 import { describe, it, expect, beforeEach } from "vitest";
 import { readFileSync } from "fs";
@@ -142,12 +143,13 @@ class TrackItem {
     for (const it of all) it.track.items = it.track.items.filter((i) => i !== it);
     return 0;
   }
-  move(offset: Time) {
-    if (this.track.locked) throw new Error("Track is locked");
-    const all = this.track.seq.moveLinked ? [this, ...this.linked] : [this];
-    for (const it of all) { it.start = Time.k(it.start.t + offset.t); it.setEnd(it.end.t + offset.t); }
-    return 0;
+  /** Real Premiere 26.5.2 (2026-10-15) blocked forever inside trackItem.move(Time) (V3 Camera A by +3 s; a restart
+   *  was needed twice): the host must never call it. */
+  move(_offset: Time): never {
+    throw new Error("TrackItem.move was called: it hangs Premiere 26.5.2, and the host must never use it.");
   }
+  /** The user dragging this one clip along its track by hand (the simulator's own edit, not an API call). */
+  drag(offset: Time) { this.start = Time.k(this.start.t + offset.t); this.setEnd(this.end.t + offset.t); }
 }
 
 class Track {
@@ -237,7 +239,6 @@ class Seq {
   /** TrackItem.inPoint reads floored to this sequence's frames, as measured in Premiere 26.5.2. */
   inPointOnSeqGrid = false;
   removeLinked = false;
-  moveLinked = false;
   private placements = 0;
   constructor(nV = 2, nA = 3) {
     const v = Array.from({ length: nV }, (_, i) => new Track(this, "video", i));
@@ -675,11 +676,26 @@ describe("gcutCloseGapMulti: one clip", () => {
     expect(s.seq.audioTracks[2].clips[0].start.seconds).toBeCloseTo(110, 1);
   });
 
-  it("I5: moves linked audio once, even if Premiere's move also moves linked partners", () => {
-    s.seq.moveLinked = true;
+  it("lays each later clip again at its new place from its own source (never TrackItem.move): the b-roll keeps its own sound in sync", () => {
     expect(closeGap(s).ok).toBe(true);
-    const a = s.seq.audioTracks[0].clips;
-    expect(a[a.numItems - 1].start.seconds).toBeCloseTo(108, 1);
+    expect(span(s.seq.videoTracks[0]).at(-1)).toEqual([108, 113, 0]);
+    expect(span(s.seq.audioTracks[0]).at(-1)).toEqual([108, 113, 0]);
+    expect(span(s.seq.audioTracks[2])).toEqual([[110, 113, 0]]);
+  });
+
+  it("refuses, moving nothing, a later clip with effects (laying it again would remove them): close the gap by hand", () => {
+    s.seq.videoTracks[0].clips.at(-1).addEffect("Lumetri Color");
+    const before = s.seq.videoTracks[0].clips.map((i: TrackItem) => i.start.t);
+    expect(() => closeGap(s)).toThrow("Moving lays the clips again from their source, so these effects would be removed: V1 (b-roll.mp4): Lumetri Color. Nothing was moved; close the gap by hand.");
+    expect(s.seq.videoTracks[0].clips.map((i: TrackItem) => i.start.t)).toEqual(before);
+  });
+
+  it("when a clip doesn't land as expected, puts every clip back and Restore still works", () => {
+    const placed = (s.seq as any).placements;
+    s.seq.dropSpanIndex = placed + 1;
+    expect(() => closeGap(s)).toThrow(/didn't land where expected, so every clip was put back\. Nothing was changed\.$/);
+    expect(span(s.seq.audioTracks[2])).toEqual([[112, 115, 0]]);
+    expect(restore(s)).toEqual({ ok: true });
   });
 
   it("refuses, naming it, a clip on another track that crosses a cut, and moves nothing", () => {
@@ -1185,9 +1201,9 @@ describe("gcutCloseGapMulti", () => {
   it("slides a clip placed after the last cut since Apply by the total", () => {
     const s = multiScene({ music: false });
     applyCuts(s);
-    s.seq.audioTracks[2].add(wav("hit.wav", "node-h", 5), 108.5, 0, 1);
+    s.seq.audioTracks[2].add(wav("hit.wav", "node-h", 5), 108.52, 0, 1); // on the frame grid, where a lay lands
     expect(closeGapMulti(s)).toEqual({ ok: true, movedCount: 2 });
-    expect(layout(s.seq.audioTracks[2])).toEqual([[106.5, 107.5]]);
+    expect(layout(s.seq.audioTracks[2])).toEqual([[106.52, 107.52]]);
     expect(layout(s.seq.videoTracks[3])).toEqual([[103, 105]]); // the title (104–106) had one cut before it
   });
   it("refuses, naming it, a clip that crosses a cut, and moves nothing", () => {
@@ -2007,6 +2023,44 @@ describe("measured in Premiere 26.5.2: classify by EXACT frame rate, audio follo
         tracks(s).forEach((t, k) => expect(t.clips[0].trueIn.seconds, `cycle ${cycle} track ${k}`).toBeCloseTo(orig[k], 9));
       }
     });
+
+    describe("move_clips and close_gaps on the loose cameras (laid again, never TrackItem.move)", () => {
+      const at = (s: Scene) => tracks(s).map((t) => t.clips.map((i: TrackItem) => [i.start.t / TPF30, i.end.t / TPF30, +i.trueIn.seconds.toFixed(9)]));
+      it.each([["without", false], ["with", true]])("Camera A on V3 by +3 s (%s its own sound): exact at its new place, and its undo exact", (_, camerasSound) => {
+        const s = restreamScene({ camerasSound }), orig = at(s);
+        const r = s.host.call("gcutToolMoveClips", { sequenceId: "seq-1", clipIds: allIds(s).filter((x: string) => x.startsWith("V3")), byS: 3 });
+        expect(r).toMatchObject({ ok: true, movedCount: 1 });
+        const v3 = s.seq.videoTracks[2].clips;
+        expect([v3.numItems, v3[0].start.t, v3[0].end.t]).toEqual([1, 4 * 30 * TPF30, 124 * 30 * TPF30]);
+        expect(v3[0].trueIn.seconds).toBeCloseTo(A_IN, 9);
+        if (camerasSound) expect(s.seq.audioTracks[2].clips.numItems).toBe(0); // the sound Premiere dropped along is taken off
+        expect(s.host.call("gcutToolUndo", { record: JSON.parse(JSON.stringify(r.undo)) })).toEqual({ ok: true });
+        expect(at(s)).toEqual(orig);
+      });
+      it("Camera B and Camera A together, four moves and undos over: no clip drifts in its source", () => {
+        const s = restreamScene({ camerasSound: true }), orig = at(s);
+        for (let cycle = 0; cycle < 4; cycle++) {
+          const ids = allIds(s).filter((x: string) => x.startsWith("V2") || x.startsWith("V3"));
+          const r = s.host.call("gcutToolMoveClips", { sequenceId: "seq-1", clipIds: ids, byS: cycle % 2 ? -0.5 : 2 });
+          expect(r, `cycle ${cycle}`).toMatchObject({ ok: true, movedCount: 2 });
+          expect(s.host.call("gcutToolUndo", { record: JSON.parse(JSON.stringify(r.undo)) }), `cycle ${cycle}`).toEqual({ ok: true });
+          expect(at(s), `cycle ${cycle}`).toEqual(orig);
+        }
+      });
+      it("close_gaps slides a loose clip after a gap exactly, and its undo is exact", () => {
+        const s = restreamScene();
+        const camA = s.seq.videoTracks[2].clips[0] as TrackItem;
+        camA.drag(Time.k((130 - 1) * 30 * TPF30)); // Camera A now 130–250 s: a 10 s gap after Restream (0–120 s)
+        const orig = at(s), v1 = allIds(s).find((x: string) => x.startsWith("V1"))!, v3 = allIds(s).find((x: string) => x.startsWith("V3"))!;
+        const r = s.host.call("gcutToolCloseGaps", { sequenceId: "seq-1", clipIds: [v1, v3] });
+        expect(r).toMatchObject({ ok: true, gapCount: 1, movedCount: 1 });
+        const now = s.seq.videoTracks[2].clips[0];
+        expect([now.start.t, now.end.t]).toEqual([120 * 30 * TPF30, 240 * 30 * TPF30]);
+        expect(now.trueIn.seconds).toBeCloseTo(A_IN, 9);
+        expect(s.host.call("gcutToolUndo", { record: JSON.parse(JSON.stringify(r.undo)) })).toEqual({ ok: true });
+        expect(at(s)).toEqual(orig);
+      });
+    });
   });
 });
 
@@ -2663,7 +2717,7 @@ describe("gcutToolCutRanges: timeline ranges cut from chosen clips with Apply's 
 
     it("refuses, changing nothing, when a cut piece was moved since", () => {
       const { s, record, cut } = cutGeorg();
-      s.seq.videoTracks[0].clips[1].move(Time.s(0.2));
+      s.seq.videoTracks[0].clips[1].drag(Time.s(0.2));
       const now = allTracks(s.seq);
       expect(now).not.toEqual(cut);
       expect(() => undoTool(s, record)).toThrow(/changed since.*Nothing was undone/);
@@ -2736,7 +2790,7 @@ describe("gcutToolCutRanges: timeline ranges cut from chosen clips with Apply's 
 
       it.each([
         ["untouched", (_: Ctx) => {}],
-        ["a cut piece moved", ({ s }: Ctx) => { s.seq.videoTracks[0].clips[1].move(Time.s(0.2)); }],
+        ["a cut piece moved", ({ s }: Ctx) => { s.seq.videoTracks[0].clips[1].drag(Time.s(0.2)); }],
         ["a cut piece slip-edited", ({ s }: Ctx) => { const p = s.seq.videoTracks[0].clips[1]; p.trueIn = Time.s(p.trueIn.seconds + 0.4); }],
         ["something placed in the gap", ({ s }: Ctx) => { s.seq.videoTracks[0].add(s.a, 108.2, 40, 40.8); }],
         ["the original back (Premiere's Undo)", ({ s, saved }: Ctx) => { [...s.seq.videoTracks, ...s.seq.audioTracks].forEach((t: Track, k: number) => { t.items = saved[k]; }); }],
@@ -2897,10 +2951,17 @@ function gapScene() {
   return { seq, cam, mic, p1, p2, p3, title, lower, a1, host: load(seq) };
 }
 
-describe("gcutToolCloseGaps: close the gaps between chosen clips by moving everything after each gap, and its undo", () => {
-  const close = (s: any, clipIds: string[]) => act(s, "gcutToolCloseGaps", { clipIds });
+/** The clip on this track starting at startS now (a move lays a fresh TrackItem, so a scene's own references go stale). */
+const clipAt = (t: Track, startS: number): TrackItem => {
+  const it = (t.clips as TrackItem[]).find((i) => Math.abs(i.start.seconds - startS) < 1e-6);
+  if (!it) throw new Error(`no clip at ${startS} s on ${t.kind} ${t.index + 1}`);
+  return it;
+};
 
-  it("moves every clip after each gap left by the gaps before it, on every track (trackItem.move), and returns idMap for every moved clip", () => {
+describe("gcutToolCloseGaps: close the gaps between chosen clips by moving everything after each gap, and its undo", () => {
+  const close = (s: any, clipIds: string[], extra: object = {}) => act(s, "gcutToolCloseGaps", { clipIds, ...extra });
+
+  it("moves every clip after each gap left by the gaps before it, on every track (laid again from its source, never TrackItem.move), and returns idMap for every moved clip", () => {
     const s = gapScene();
     const r = close(s, idsOn(s, "V1"));
     expect(r).toMatchObject({ ok: true, gapCount: 2, movedCount: 4 });
@@ -2908,7 +2969,8 @@ describe("gcutToolCloseGaps: close the gaps between chosen clips by moving every
     expect(layout(s.seq.videoTracks[0])).toEqual([[100, 105], [105, 109], [109, 112]]);
     expect(layout(s.seq.videoTracks[1])).toEqual([[90, 95], [106, 107]]);
     expect(layout(s.seq.audioTracks[0])).toEqual([[105, 109]]);
-    expect(span(s.seq.audioTracks[0])[0][2]).toBe(30); // moved, not re-laid: same source in point
+    expect(span(s.seq.videoTracks[0]).map((x: number[]) => x[2])).toEqual([10, 30, 50]); // each from its own in point
+    expect(span(s.seq.audioTracks[0])[0][2]).toBe(30);
     expect(r.idMap).toEqual({
       [idOf("V1", 108, "node-c")]: [idOf("V1", 105, "node-c")],
       [idOf("V1", 115, "node-c")]: [idOf("V1", 109, "node-c")],
@@ -2918,9 +2980,10 @@ describe("gcutToolCloseGaps: close the gaps between chosen clips by moving every
     const now = getSeq(s).clips.map((c: any) => c.id);
     for (const ids of Object.values(r.idMap) as string[][]) for (const id of ids) expect(now).toContain(id);
     expect(now).toContain(idOf("V2", 90, "node-l"));
+    expect([s.cam.inS, s.cam.outS, s.mic.inS, s.mic.outS]).toEqual([0, 900, 0, 900]); // the bin marks as they were
   });
 
-  it("undo moves every clip back exactly, from the stored record (after a panel reload)", () => {
+  it("undo lays every clip back exactly, from the stored record (after a panel reload)", () => {
     const s = gapScene(), original = exact(s.seq);
     const r = close(s, idsOn(s, "V1"));
     expect(asStored(r.undo)).toEqual(r.undo);
@@ -2929,12 +2992,27 @@ describe("gcutToolCloseGaps: close the gaps between chosen clips by moving every
     expect(exact(s.seq)).toEqual(original);
   });
 
-  it("a linked partner moved along by Premiere is not moved twice", () => {
-    const s = gapScene(), original = exact(s.seq);
-    s.p2.linked = [s.a1]; s.a1.linked = [s.p2];
-    s.seq.moveLinked = true;
+  it("a clip that was switched off is laid off again, and comes back off", () => {
+    const s = gapScene();
+    s.title.disabled = true;
+    const original = exact(s.seq);
     const r = close(s, idsOn(s, "V1"));
-    expect(layout(s.seq.audioTracks[0])).toEqual([[105, 109]]);
+    expect(clipAt(s.seq.videoTracks[1], 106).disabled).toBe(true);
+    expect(undoTool(s, asStored(r.undo))).toEqual({ ok: true });
+    expect(exact(s.seq)).toEqual(original);
+  });
+
+  it("a camera's own sound moves with it, in sync, and comes back exactly", () => {
+    const s = gapScene();
+    const talk = new ProjectItem("Talk.mov", "node-k", 900); // picture and sound
+    s.seq.audioTracks[0].items = [];
+    const v = s.seq.videoTracks[1].add(talk, 120, 40, 44), a = s.seq.audioTracks[1].add(talk, 120, 40, 44);
+    v.linked = [a]; a.linked = [v];
+    const original = exact(s.seq);
+    const r = close(s, idsOn(s, "V1"));
+    expect(r.movedCount).toBe(5);
+    expect(span(s.seq.videoTracks[1]).at(-1)).toEqual([114, 118, 40]);
+    expect(span(s.seq.audioTracks[1])).toEqual([[114, 118, 40]]);
     expect(undoTool(s, asStored(r.undo))).toEqual({ ok: true });
     expect(exact(s.seq)).toEqual(original);
   });
@@ -2945,6 +3023,11 @@ describe("gcutToolCloseGaps: close the gaps between chosen clips by moving every
     ["a locked track with a clip to move", (s: any) => { s.seq.audioTracks[0].locked = true; }, "A1 is locked. Unlock it to close the gaps."],
     ["chosen clips with no gap between them", (s: any) => { s.seq.videoTracks[0].items = [s.p1]; s.seq.videoTracks[0].add(s.cam, 105, 0, 3); },
       "There's no gap between the chosen clips, so nothing was moved."],
+    ["a clip to move that isn't at 100% speed", (s: any) => { s.title.speed = 2; },
+      "V2's clip (Title) isn't at 100% speed, so laying it again would change it. Nothing was moved."],
+    ["a clip to move with effects (laying it again would remove them)", (s: any) => { s.title.addEffect("Gaussian Blur"); },
+      "Moving lays the clips again from their source, so these effects would be removed: V2 (Title): Gaussian Blur. Nothing was moved. " +
+      "Ask the user; only if they agree, call close_gaps again with acceptEffectLoss: true."],
   ])("refuses %s, changing nothing", (_, change, msg) => {
     const s = gapScene();
     change(s);
@@ -2953,12 +3036,17 @@ describe("gcutToolCloseGaps: close the gaps between chosen clips by moving every
     expect(exact(s.seq)).toEqual(before);
   });
 
-  it("a clip that doesn't move as expected puts every clip back, and says so", () => {
+  it("acceptEffectLoss: true moves a clip with effects (laid again from its source, without them)", () => {
+    const s = gapScene();
+    s.title.addEffect("Gaussian Blur");
+    expect(close(s, idsOn(s, "V1"), { acceptEffectLoss: true })).toMatchObject({ ok: true, movedCount: 4 });
+    expect(clipAt(s.seq.videoTracks[1], 106).components.map((c: any) => c.displayName)).toEqual(["Opacity", "Motion"]);
+  });
+
+  it("a clip that doesn't land as expected puts every clip back, and says so", () => {
     const s = gapScene(), original = exact(s.seq);
-    let n = 0;
-    s.title.move = () => { n++; return 0; };
-    expect(() => close(s, idsOn(s, "V1"))).toThrow("A clip on V2 didn't move as expected, so every clip was put back. Nothing was changed.");
-    expect(n).toBeGreaterThan(0);
+    s.seq.dropSpanIndex = 2; // Premiere silently doesn't lay the third clip
+    expect(() => close(s, idsOn(s, "V1"))).toThrow(/^A clip on .* didn't land where expected, so every clip was put back\. Nothing was changed\.$/);
     expect(exact(s.seq)).toEqual(original);
   });
 
@@ -2968,14 +3056,25 @@ describe("gcutToolCloseGaps: close the gaps between chosen clips by moving every
       const record = asStored(close(s, idsOn(s, "V1")).undo);
       return { s, original, record };
     }
+    const title = (s: ReturnType<typeof gapScene>) => clipAt(s.seq.videoTracks[1], 106);
     const allBack = (s: ReturnType<typeof gapScene>) => {
-      for (const [it, by] of [[s.p2, 3], [s.p3, 6], [s.title, 3], [s.a1, 3]] as [TrackItem, number][]) it.move(Time.s(by));
+      for (const [t, at, by] of [[s.seq.videoTracks[0], 109, 6], [s.seq.videoTracks[0], 105, 3], [s.seq.videoTracks[1], 106, 3], [s.seq.audioTracks[0], 105, 3]] as [Track, number, number][]) {
+        clipAt(t, at).drag(Time.s(by));
+      }
     };
     it("refuses, changing nothing, when a moved clip was moved again by hand", () => {
       const { s, record } = closed();
-      s.title.move(Time.s(0.4));
+      title(s).drag(Time.s(0.4));
       const now = exact(s.seq);
       expect(() => undoTool(s, record)).toThrow("Some of the moved clips were moved, trimmed or removed by hand since (3 of 4 are where the move left them). Nothing was undone; use Premiere's Undo instead.");
+      expect(exact(s.seq)).toEqual(now);
+    });
+    it("refuses, changing nothing, when a moved clip was slip-edited since", () => {
+      const { s, record } = closed();
+      const p = clipAt(s.seq.videoTracks[0], 105);
+      p.trueIn = Time.s(p.trueIn.seconds + 0.4);
+      const now = exact(s.seq);
+      expect(() => undoTool(s, record)).toThrow("V1's moved clip was slip-edited since (its source in point changed). Nothing was undone; use Premiere's Undo instead.");
       expect(exact(s.seq)).toEqual(now);
     });
     it("refuses, changing nothing, when something was placed where a clip would move back to", () => {
@@ -2990,6 +3089,23 @@ describe("gcutToolCloseGaps: close the gaps between chosen clips by moving every
       s.seq.audioTracks[0].locked = true;
       expect(() => undoTool(s, record)).toThrow("A1 is locked. Unlock it to undo.");
     });
+    it("refuses, changing nothing, when a source is no longer in the project", () => {
+      const { s, record } = closed();
+      s.seq.bin = s.seq.bin.filter((pi) => pi !== s.mic);
+      expect(() => undoTool(s, record)).toThrow(/A1's source isn't in the project any more, so the move can't be undone/);
+    });
+    it("refuses a record from before moves were laid again (it keeps too little), changing nothing", () => {
+      const { s, record } = closed();
+      const old = { ...record, moves: record.moves.map(({ kind, trackIndex, label, name, node, fromT, toT, durT }: any) => ({ kind, trackIndex, label, name, node, fromT, toT, durT })) };
+      expect(() => undoTool(s, old)).toThrow("This move was made by an earlier Genius Cut, which kept too little to lay it back. Nothing was undone; use Premiere's Undo instead.");
+    });
+    it("when laying back fails, every clip is put back where the move left it, and it says so", () => {
+      const { s, record } = closed();
+      const now = exact(s.seq);
+      s.seq.dropSpanIndex = (s.seq as any).placements + 1;
+      expect(() => undoTool(s, record)).toThrow(/didn't land where expected, so every clip was put back\. Nothing was undone\.$/);
+      expect(exact(s.seq)).toEqual(now);
+    });
     it("when every clip is back where it was (Premiere's Undo), says it is already undone", () => {
       const { s, record, original } = closed();
       allBack(s);
@@ -2999,7 +3115,7 @@ describe("gcutToolCloseGaps: close the gaps between chosen clips by moving every
     });
     it.each([
       ["untouched", (_: any) => {}],
-      ["one moved again", ({ s }: any) => { s.title.move(Time.s(0.4)); }],
+      ["one moved again", ({ s }: any) => { title(s).drag(Time.s(0.4)); }],
       ["something in the way", ({ s }: any) => { s.seq.videoTracks[1].add(new ProjectItem("Logo", "node-o", 30, "seconds", false), 109, 0, 0.5); }],
       ["all back", ({ s }: any) => { allBack(s); }],
     ])("check: true matches the real undo (%s)", (name, change) => {
@@ -3224,34 +3340,29 @@ describe("gcutToolDeleteClips: remove chosen clips (no ripple), and its undo", (
 });
 
 describe("gcutToolMoveClips: move chosen clips along their tracks, and its undo", () => {
-  const move = (s: any, clipIds: string[], byS: unknown) => act(s, "gcutToolMoveClips", { clipIds, byS });
+  const move = (s: any, clipIds: string[], byS: unknown, extra: object = {}) => act(s, "gcutToolMoveClips", { clipIds, byS, ...extra });
 
-  it("moves each chosen clip by byS (to the frame) with trackItem.move; a linked partner that isn't chosen stays (measured)", () => {
-    const s = scene();
-    const r = move(s, idsOn(s, "V1"), 2.01);
+  it("moves a chosen clip by byS (to the frame), laid again from its own source (never TrackItem.move); a linked partner that isn't chosen stays", () => {
+    const s = scene(), original = exact(s.seq);
+    const r = move(s, idsOn(s, "V1"), 30.01); // clear of its own sound, which Premiere drops on A1 with it
     expect(r).toMatchObject({ ok: true, movedCount: 1 });
-    expect(layout(s.seq.videoTracks[0])).toEqual([[102, 112]]);
-    expect(layout(s.seq.audioTracks[0])).toEqual([[100, 110]]);
-    expect(span(s.seq.videoTracks[0])[0][2]).toBe(10); // moved, not re-laid
-    expect(r.idMap).toEqual({ [idOf("V1", 100, "node-1")]: [idOf("V1", 102, "node-1")] });
+    expect(span(s.seq.videoTracks[0])).toEqual([[130, 140, 10]]);
+    expect(span(s.seq.audioTracks[0])).toEqual([[100, 110, 10]]); // the partner stays; the dropped sound is taken off
+    expect([s.pi.inS, s.pi.outS]).toEqual([2, 58]); // the bin marks as they were
+    expect(r.idMap).toEqual({ [idOf("V1", 100, "node-1")]: [idOf("V1", 130, "node-1")] });
+    expect(undoTool(s, asStored(r.undo))).toEqual({ ok: true });
+    expect(exact(s.seq)).toEqual(original);
   });
 
-  it("a linked pair given together moves together; undo moves both back exactly, from the stored record", () => {
+  it("a linked pair given together moves together; undo lays both back exactly, from the stored record", () => {
     const s = scene(), original = exact(s.seq);
     const r = move(s, idsOn(s, "V1", "A1"), -3);
-    expect(layout(s.seq.videoTracks[0])).toEqual([[97, 107]]);
-    expect(layout(s.seq.audioTracks[0])).toEqual([[97, 107]]);
+    expect(span(s.seq.videoTracks[0])).toEqual([[97, 107, 10]]);
+    expect(span(s.seq.audioTracks[0])).toEqual([[97, 107, 10]]);
     expect(Object.keys(r.idMap)).toHaveLength(2);
     expect(asStored(r.undo)).toEqual(r.undo);
     expect(r.undo).toMatchObject({ kind: "moves", sequenceId: "seq-1" });
     expect(undoTool({ host: load(s.seq) }, asStored(r.undo))).toEqual({ ok: true });
-    expect(exact(s.seq)).toEqual(original);
-  });
-
-  it("a partner Premiere moves along although it wasn't chosen puts everything back, and says so", () => {
-    const s = scene(), original = exact(s.seq);
-    s.seq.moveLinked = true;
-    expect(() => move(s, idsOn(s, "V1"), 2)).toThrow("A clip on A1 didn't move as expected, so every clip was put back. Nothing was changed.");
     expect(exact(s.seq)).toEqual(original);
   });
 
@@ -3262,6 +3373,14 @@ describe("gcutToolMoveClips: move chosen clips along their tracks, and its undo"
     ["a move of less than a frame", (_: any) => {}, 0.01, "byS rounds to less than a frame, so nothing would move."],
     ["no byS", (_: any) => {}, undefined, "byS must be a time in seconds (negative moves left)."],
     ["a locked track", (s: any) => { s.seq.videoTracks[0].locked = true; }, 2, "V1 is locked. Unlock it to move clips."],
+    ["its own sound landing on its partner that stays (choose both to move both)", (_: any) => {}, 2,
+      "Laying V1's clip again at its new place also drops its own sound onto A1, over interview_take3.mp4 there. " +
+      "Choose that clip too, so both move, or move the clip clear of it. Nothing was moved."],
+    ["a clip not at 100% speed", (s: any) => { s.v.speed = 2; }, 30,
+      "V1's clip (interview_take3.mp4) isn't at 100% speed, so laying it again would change it. Nothing was moved."],
+    ["a clip with effects (laying it again would remove them)", (s: any) => { s.v.addEffect("Lumetri Color"); }, 30,
+      "Moving lays the clips again from their source, so these effects would be removed: V1 (interview_take3.mp4): Lumetri Color. Nothing was moved. " +
+      "Ask the user; only if they agree, call move_clips again with acceptEffectLoss: true."],
   ])("refuses %s, changing nothing", (_, change, byS, msg) => {
     const s = scene(), ids = idsOn(s, "V1");
     change(s);
@@ -3270,10 +3389,42 @@ describe("gcutToolMoveClips: move chosen clips along their tracks, and its undo"
     expect(exact(s.seq)).toEqual(before);
   });
 
+  it("refuses audio from a video file whose picture would land on a clip that stays, changing nothing", () => {
+    const s = scene(), before = exact(s.seq);
+    expect(() => move(s, idsOn(s, "A1"), 2)).toThrow(
+      "Laying A1's clip again at its new place also drops its picture onto V1, over interview_take3.mp4 there. Choose that clip too, so both move, or move the clip clear of it. Nothing was moved.");
+    expect(exact(s.seq)).toEqual(before);
+  });
+
+  it("acceptEffectLoss: true moves a clip with effects (laid again without them)", () => {
+    const s = scene();
+    s.v.addEffect("Lumetri Color");
+    expect(move(s, idsOn(s, "V1", "A1"), 2, { acceptEffectLoss: true })).toMatchObject({ ok: true, movedCount: 2 });
+    expect(clipAt(s.seq.videoTracks[0], 102).components.map((c: any) => c.displayName)).toEqual(["Opacity", "Motion"]);
+  });
+
+  it("a clip that was switched off is laid off again, and comes back off", () => {
+    const s = scene();
+    s.v.disabled = true;
+    const original = exact(s.seq);
+    const r = move(s, idsOn(s, "V1", "A1"), 2);
+    expect(clipAt(s.seq.videoTracks[0], 102).disabled).toBe(true);
+    expect(undoTool(s, asStored(r.undo))).toEqual({ ok: true });
+    expect(exact(s.seq)).toEqual(original);
+  });
+
+  it("a clip that doesn't land as expected puts every clip back, and says so", () => {
+    const s = scene(), original = exact(s.seq);
+    s.seq.lateSpanIndex = 0; s.seq.lateInS = 0.4; // Premiere lays the clip from the wrong source time
+    expect(() => move(s, idsOn(s, "V1", "A1"), 2)).toThrow(/didn't land where expected, so every clip was put back\. Nothing was changed\.$/);
+    expect(exact(s.seq)).toEqual(original);
+  });
+
   it("chosen clips may move into each other's old places on the same track", () => {
     const s = gapScene(), original = exact(s.seq);
-    const r = move(s, idsOn(s, "V1"), -3);
+    const r = move(s, idsOn(s, "V1", "A1"), -3);
     expect(layout(s.seq.videoTracks[0])).toEqual([[97, 102], [105, 109], [112, 115]]);
+    expect(layout(s.seq.audioTracks[0])).toEqual([[105, 109]]);
     expect(undoTool(s, asStored(r.undo))).toEqual({ ok: true });
     expect(exact(s.seq)).toEqual(original);
   });
@@ -3284,9 +3435,10 @@ describe("gcutToolMoveClips: move chosen clips along their tracks, and its undo"
       const record = asStored(move(s, idsOn(s, "V1", "A1"), 2).undo);
       return { s, original, record };
     }
+    const v = (s: ReturnType<typeof scene>) => clipAt(s.seq.videoTracks[0], 102), a = (s: ReturnType<typeof scene>) => clipAt(s.seq.audioTracks[0], 102);
     it("refuses, changing nothing, when a moved clip was moved again by hand", () => {
       const { s, record } = moved();
-      s.v.move(Time.s(1));
+      v(s).drag(Time.s(1));
       const now = exact(s.seq);
       expect(() => undoTool(s, record)).toThrow("Some of the moved clips were moved, trimmed or removed by hand since (1 of 2 are where the move left them). Nothing was undone; use Premiere's Undo instead.");
       expect(exact(s.seq)).toEqual(now);
@@ -3300,15 +3452,16 @@ describe("gcutToolMoveClips: move chosen clips along their tracks, and its undo"
     });
     it("when both are back (Premiere's Undo), says it is already undone", () => {
       const { s, record, original } = moved();
-      s.v.move(Time.s(-2)); s.a.move(Time.s(-2));
+      const [x, y] = [v(s), a(s)];
+      x.drag(Time.s(-2)); y.drag(Time.s(-2));
       expect(undoTool(s, record)).toEqual({ ok: true, alreadyUndone: true });
       expect(exact(s.seq)).toEqual(original);
     });
     it.each([
       ["untouched", (_: any) => {}],
-      ["one moved again", ({ s }: any) => { s.v.move(Time.s(1)); }],
+      ["one moved again", ({ s }: any) => { v(s).drag(Time.s(1)); }],
       ["something in the way", ({ s }: any) => { s.seq.audioTracks[0].add(wav("sfx.wav", "node-x", 30), 100, 0, 1); }],
-      ["both back", ({ s }: any) => { s.v.move(Time.s(-2)); s.a.move(Time.s(-2)); }],
+      ["both back", ({ s }: any) => { const [x, y] = [v(s), a(s)]; x.drag(Time.s(-2)); y.drag(Time.s(-2)); }],
     ])("check: true matches the real undo (%s)", (name, change) => {
       const c = moved();
       change(c);
@@ -3503,7 +3656,7 @@ describe("gcutToolSetVolume: a clip-level volume in dB on chosen audio clips, an
     });
     it("refuses when the clip was moved since", () => {
       const { s, record } = set();
-      s.a.move(Time.s(1));
+      s.a.drag(Time.s(1));
       expect(() => undoTool(s, record)).toThrow(/A1's clip was moved, trimmed or removed/);
     });
     it("when the level is back (Premiere's Undo), says it is already undone", () => {

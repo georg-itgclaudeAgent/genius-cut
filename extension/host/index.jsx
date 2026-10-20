@@ -35,11 +35,11 @@
  *     around it, gcutDropsCheck refuses what it would overwrite, and every track is checked after;
  *   - TrackItem.end sets a clip's length either way (its reported outPoint goes stale), and leaves
  *     the linked partner as it was; remove() leaves the linked partner too.
+ *   - trackItem.move(Time) can block Premiere forever (2026-10-15): it is never called. Close gap and
+ *     the move tools take each clip off and lay it again from its source, checking every track after.
  * Unverified (docs silent or contradictory):
  *   - setInPoint/setOutPoint units (docs say ticks for one, seconds for the other): set,
- *     read back, fall back to the other unit, and remember which worked;
- *   - whether move() moves the linked partner: handled either way (Close gap moves each item
- *     and checks every track after).
+ *     read back, fall back to the other unit, and remember which worked.
  */
 
 var GCUT_TICKS = 254016000000; // Premiere ticks per second
@@ -945,9 +945,12 @@ function gcutRelayAll(seq, rec, clock, others) {
  * Clear everything of ours inside the items' span (keeping `others`), lay plan[i] for items[i], and
  * check. True if every piece verifiably landed and nothing stray is left; false (never throws) if not.
  */
-function gcutRelay(seq, items, plan, clock, others) {
+function gcutRelay(seq, items, plan, clock, others) { return gcutRelaySpan(seq, items, plan, gcutSpan(items), clock, others); }
+
+/** gcutRelay over an explicit span {fromT, toT} holding every piece of ours and every planned place (a move reaches past the items' own span). */
+function gcutRelaySpan(seq, items, plan, span, clock, others) {
     try {
-        var span = gcutSpan(items), i;
+        var i;
         gcutRemoveRange(seq, gcutNodes(items), span.fromT, span.toT, clock, others);
         gcutLayAll(seq, items, plan, span.fromT, span.toT, clock, others);
         for (i = 0; i < items.length; i++) if (gcutVerifyItems(seq, items[i], plan[i], clock)) return false;
@@ -1251,7 +1254,9 @@ function gcutOurs(ours, track, startT) {
  * are already in place and never move; clips starting before the range never move. Refuses,
  * before moving anything, a rebuilt piece edited since Apply (it would slide a second time), a
  * clip that crosses a cut (it would need cutting itself), a locked track with a clip to move, and
- * a slide that would land on a clip. Items already moved as a linked partner are not moved twice.
+ * a slide that would land on a clip. Each clip that slides is taken off and laid again at its new place from its
+ * own source (gcutRelocate; never trackItem.move, which hung Premiere), all or nothing, so a clip with effects, one
+ * not at 100% speed, and a drop over a clip that stays (gcutMoveDropsCheck) are refused too: close the gap by hand.
  * spec: { startTicks } — the range start recorded at Analyse.
  */
 function gcutCloseGapMulti(specJson) {
@@ -1285,7 +1290,7 @@ function gcutCloseGapMulti(specJson) {
                     shift = gcutRemovedBefore(rec.cutsT, s);
                 }
                 if (shift > clock.half) {
-                    movers.push({ item: it, startT: s, target: s - shift, label: tracks[t].label });
+                    movers.push({ kind: tracks[t].audio ? "audio" : "video", trackIndex: tracks[t].index, item: it, target: s - shift });
                     later = true;
                 } else shift = 0;
                 finals[t].push({ startT: s - shift, endT: e - shift, moves: shift > 0 });
@@ -1305,19 +1310,19 @@ function gcutCloseGapMulti(specJson) {
                 }
             }
         }
-        movers.sort(function (a, b) { return a.startT - b.startT; });
+        if (!movers.length) { rec.gapClosed = true; return gcutOk({ ok: true, movedCount: 0 }); }
+        var byHand = "Nothing was moved; close the gap by hand.";
+        var found = gcutMovers(seq, movers, clock, byHand);
+        gcutMoveEffects(found, false, byHand);
+        gcutMoveDropsCheck(seq, found, clock, "", byHand);
         rec.gapClosed = true; // from here on Restore must not run: later clips may have moved
-        for (i = 0; i < movers.length; i++) {
-            var now = gcutT(movers[i].item.start);
-            if (!gcutNear(now, movers[i].target, clock.half)) movers[i].item.move(gcutTimeFromTicks(movers[i].target - now));
+        try {
+            gcutRelocate(seq, clock, found, "Nothing was changed.");
+        } catch (moveErr) {
+            if (/every clip was put back/.test(moveErr.message)) rec.gapClosed = false; // nothing moved: Restore still matches
+            throw moveErr;
         }
-        for (i = 0; i < movers.length; i++) {
-            if (!gcutNear(gcutT(movers[i].item.start), movers[i].target, clock.half)) {
-                return gcutOk({ ok: false, movedCount: i,
-                    message: "A clip on " + movers[i].label + " didn't move as expected. Use Premiere's Undo." });
-            }
-        }
-        return gcutOk({ ok: true, movedCount: movers.length });
+        return gcutOk({ ok: true, movedCount: found.length });
     } catch (e) {
         return gcutFail(e);
     }
@@ -1802,7 +1807,8 @@ function gcutUndoCuts(seq, record, clock, check) {
  *   - qeTrack.razor("HH:MM:SS:FF") splits the clip under that frame on that one track (a linked partner
  *     on another track is not split);
  *   - TrackItem.disabled reads and sets a clip's on/off;
- *   - trackItem.move(offset) moves that item only (its linked partner stays);
+ *   - trackItem.move(offset) moved that item only (its linked partner stayed), but on 2026-10-15 it blocked
+ *     Premiere forever (V3 Camera A by +3 s): nothing calls it; close_gaps and move_clips lay clips again;
  *   - remove(false, false) deletes without shifting anything; a ripple remove respects other tracks, so
  *     close_gaps moves the clips itself.
  * Every act tool returns { ok, ..., idMap, undo }: idMap { oldId: [newIds] } for every clip whose id
@@ -1918,98 +1924,261 @@ function gcutToolSetClipEnabled(argsJson) {
 
 // ── moves: close_gaps and move_clips, and their undo ─────────────────────────────────
 
+/*
+ * Real Premiere 26.5.2 (2026-10-15) blocked forever inside trackItem.move(Time) (V3 Camera A moved by +3 s;
+ * +2 s had worked once; Premiere had to be restarted twice), so nothing here calls it. A move takes each clip
+ * off and lays it again at its new place from its own source, with Restore's machinery (gcutLayAll,
+ * gcutVerifyItems, gcutRelay): all or nothing, the bin items' own in/out marks always restored, a clip that
+ * was switched off laid off again. Laying again rebuilds from the source, so (as cut_ranges) a clip's effects
+ * refuse the move unless the caller accepts losing them (gcutMoveEffects), a retimed clip is refused, and
+ * what Premiere drops along with a lay (a video clip's sound, a video file's picture: gcutDropsCheck's
+ * rules) is refused where it would cover a clip that stays (gcutMoveDropsCheck).
+ */
+
 /**
- * Movers: [{item, kind, trackIndex, label, name, node, startT, endT, target}]. The first clip of a mover's
- * track (one that isn't itself moving) the mover's target would overlap, as { mover, hit (the item) }, or
- * null; two movers landing on each other count too.
+ * The clips to move ([{kind, trackIndex, item, target}]) as gcutRefind records them, each with its target
+ * start (ticks), name, on/off and id. Refuses, changing nothing, a clip with no source media or one that
+ * isn't at 100% speed: neither can be laid again as it was. `tail` ends each refusal.
+ */
+function gcutMovers(seq, list, clock, tail) {
+    var spec = { items: [] }, k;
+    for (k = 0; k < list.length; k++) {
+        var x = list[k], label = gcutLabel(x.kind, x.trackIndex);
+        if (!x.item.projectItem) throw new Error(label + "'s clip (" + x.item.name + ") has no source media, so Genius Cut can't lay it again at its new place. " + tail);
+        if (Math.abs(gcutSpeed(x.item) - 1) > 1e-6) throw new Error(label + "'s clip (" + x.item.name + ") isn't at 100% speed, so laying it again would change it. " + tail);
+        spec.items.push({ kind: x.kind, trackIndex: x.trackIndex, startTicks: x.item.start.ticks, endTicks: x.item.end.ticks });
+    }
+    var found = gcutRefind(seq, spec, clock);
+    for (k = 0; k < found.length; k++) {
+        found[k].target = list[k].target; found[k].name = String(list[k].item.name);
+        found[k].enabled = gcutEnabled(list[k].item); found[k].oldId = gcutClipId(found[k].kind, found[k].trackIndex, list[k].item);
+    }
+    return found;
+}
+
+/** Refuse, unless accept is true, movers with effects: laying them again from source removes those (as cut_ranges). */
+function gcutMoveEffects(found, accept, tail) {
+    if (accept === true) return;
+    var lost = [];
+    for (var k = 0; k < found.length; k++) {
+        var fx = gcutClipEffects(found[k].kind, found[k].item);
+        if (fx.length) lost.push(found[k].label + " (" + found[k].name + "): " + fx.join(", "));
+    }
+    if (lost.length) throw new Error("Moving lays the clips again from their source, so these effects would be removed: " + lost.join("; ") + ". " + tail);
+}
+
+/**
+ * The first clip of a mover's track (one that isn't itself moving) the mover's target would overlap, as
+ * { mover, hit (the item) }, or null; two movers landing on each other count too. Movers: [{item, kind,
+ * trackIndex, label, name, startT, endT, target}].
  */
 function gcutMoveCollision(seq, movers, clock) {
     for (var m = 0; m < movers.length; m++) {
-        var a = movers[m], dur = a.endT - a.startT, items = gcutItems(gcutKindTracks(seq, a.kind)[a.trackIndex]);
+        var a = movers[m], dur = gcutMoveDur(a), items = gcutItems(gcutKindTracks(seq, a.kind)[a.trackIndex]);
         for (var i = 0; i < items.length; i++) {
             var it = items[i], s = gcutT(it.start), e = gcutT(it.end), moving = null;
             for (var k = 0; k < movers.length; k++) {
                 if (movers[k].kind === a.kind && movers[k].trackIndex === a.trackIndex && movers[k].startT === s) moving = movers[k];
             }
             if (moving === a) continue;
-            if (moving) { s = moving.target; e = moving.target + (moving.endT - moving.startT); }
+            if (moving) { s = moving.target; e = moving.target + gcutMoveDur(moving); }
             if (gcutOverlaps(a.target, a.target + dur, s, e, clock)) return { mover: a, hit: it };
         }
     }
     return null;
 }
 
-/** Move each mover to its target (by target - where it is now: one Premiere already moved along as a linked partner isn't moved twice). Left moves go earliest first, right moves latest first. The first mover not at its target after, or null. */
-function gcutMoveEach(movers, clock) {
-    var order = movers.slice(0), i;
-    order.sort(function (a, b) { return (a.target < a.startT) ? a.startT - b.startT : b.startT - a.startT; });
-    for (i = 0; i < order.length; i++) {
-        var now = gcutT(order[i].item.start);
-        if (!gcutNear(now, order[i].target, clock.half)) order[i].item.move(gcutTimeFromTicks(order[i].target - now));
+/**
+ * gcutDropsCheck's rules at the movers' new places: laying a video clip again drops its sound on A(same number),
+ * laying audio from a video file (`av`) drops its picture on V(same number) (measured). Refuse, before anything
+ * changes, a drop over a clip that stays (where a mover lands, it counts at its new place): a video clip's sound
+ * may only land on clips that move too; audio from a video file's picture only on its own video, moving with it
+ * in sync (gcutOwnSound). The one exception: a clip that stays and is exactly what the drop lays (gcutDropIsSame).
+ * `advice` follows the reason; `tail` ends every refusal.
+ */
+function gcutMoveDropsCheck(seq, found, clock, advice, tail) {
+    for (var f = 0; f < found.length; f++) {
+        var x = found[f], other = x.kind === "audio" ? "video" : "audio";
+        if (x.kind === "audio" && !x.av) continue;
+        var fromT = x.target, toT = x.target + gcutMoveDur(x), tracks = gcutKindTracks(seq, other), there = gcutLabel(other, x.trackIndex);
+        if (x.trackIndex >= tracks.numTracks) {
+            if (x.kind === "video") continue;
+            throw new Error(x.label + "'s clip comes from a video file, and Premiere drops its picture onto " + there +
+                " whenever it's laid again, but this sequence has no " + there + ". " + tail);
+        }
+        var items = gcutItems(tracks[x.trackIndex]);
+        for (var i = 0; i < items.length; i++) {
+            var it = items[i], s = gcutT(it.start), e = gcutT(it.end), rec = gcutRecordedAt(found, other, x.trackIndex, s);
+            if (rec) { s = rec.target; e = rec.target + gcutMoveDur(rec); }
+            if (!gcutOverlaps(s, e, fromT, toT, clock)) continue;
+            if (!rec && gcutDropIsSame(x, it, other, clock)) continue;
+            if (x.kind === "video") {
+                if (rec) continue;
+                throw new Error("Laying " + x.label + "'s clip again at its new place also drops its own sound onto " + there + ", over " + it.name +
+                    " there. " + advice + tail);
+            }
+            if (!rec) {
+                throw new Error("Laying " + x.label + "'s clip again at its new place also drops its picture onto " + there + ", over " + it.name +
+                    " there. " + advice + tail);
+            }
+            if (rec.node !== x.node) {
+                throw new Error(x.label + "'s audio and " + there + "'s video come from different files, and laying the audio again drops its own picture onto " +
+                    there + " there. " + tail);
+            }
+            if (!gcutOwnSound(x, rec, clock)) {
+                throw new Error(x.label + "'s audio comes from the same file as " + there + "'s video but doesn't start with it in sync, so Genius Cut " +
+                    "can't lay both again on these tracks. " + tail);
+            }
+        }
     }
-    for (i = 0; i < order.length; i++) if (!gcutNear(gcutT(order[i].item.start), order[i].target, clock.half)) return order[i];
+}
+
+/** A mover's length once moved: its own, or (moveDurT) the length it had before an earlier move snapped it. */
+function gcutMoveDur(f) { return typeof f.moveDurT === "number" ? f.moveDurT : f.endT - f.startT; }
+
+/**
+ * True if clip `it` (of kind `kind`, staying where it is) is exactly what laying mover x at its target drops
+ * there: x's own sound or picture, same source, place and length, in sync, switched on and without effects.
+ * The drop replaces it with the same clip (undoing a move of a video clip without its own sound, back over
+ * that sound). Anything else under a drop is refused.
+ */
+function gcutDropIsSame(x, it, kind, clock) {
+    if (String(gcutNode(it) || "") !== String(x.node) || !gcutEnabled(it) || gcutClipEffects(kind, it).length) return false;
+    if (!gcutNear(gcutT(it.start), x.target, clock.half) || !gcutNear(gcutT(it.end), x.target + gcutMoveDur(x), clock.half)) return false;
+    return gcutNear(gcutClipInS(kind, it, clock), x.inS, clock.frameS / 2 + gcutSlackS(x));
+}
+
+/** Each mover's one piece: the whole clip, from its own in point (gcutWhole), at its target. */
+function gcutMovePlan(found) {
+    var plan = [];
+    for (var k = 0; k < found.length; k++) {
+        var f = found[k];
+        plan.push([{ fromT: f.startT, durT: gcutMoveDur(f), atT: f.target, srcIn: gcutWhole(f)[0].srcIn }]);
+    }
+    return plan;
+}
+
+/** The stretch the movers cover, before and after the move: { fromT, toT }. */
+function gcutMoveSpan(found) {
+    var span = gcutSpan(found);
+    for (var k = 0; k < found.length; k++) {
+        span.fromT = Math.min(span.fromT, found[k].target);
+        span.toT = Math.max(span.toT, found[k].target + gcutMoveDur(found[k]));
+    }
+    return span;
+}
+
+/** The bin items' own in/out marks for these items, once per source: [{pi, node, inS, outS}]. */
+function gcutMarks(items) {
+    var marks = [];
+    for (var k = 0; k < items.length; k++) {
+        var seen = false;
+        for (var m = 0; m < marks.length; m++) if (marks[m].node === items[k].node) seen = true;
+        if (!seen) marks.push({ pi: items[k].pi, node: items[k].node, inS: items[k].pi.getInPoint().seconds, outS: items[k].pi.getOutPoint().seconds });
+    }
+    return marks;
+}
+
+/** Set the bin items' own marks back (gcutMarks), best effort. */
+function gcutMarksBack(marks, clock) {
+    for (var k = 0; k < marks.length; k++) {
+        try { gcutSetRange(marks[k].pi, marks[k].inS, marks[k].outS, clock.frameS / 2); } catch (ignored) { /* best effort */ }
+    }
+}
+
+/** Switch each item laid by plan (one piece each) off again where it was off; the label of one Premiere didn't switch, or null. */
+function gcutOffAgain(seq, items, plan, clock) {
+    for (var k = 0; k < items.length; k++) {
+        if (items[k].enabled !== false) continue;
+        var it = gcutLaidAt(gcutKindTracks(seq, items[k].kind)[items[k].trackIndex], items[k], plan[k][0].atT, clock);
+        if (it) { try { it.disabled = true; } catch (ignored) { /* checked below */ } }
+        if (!it || gcutEnabled(it)) return items[k].label;
+    }
     return null;
 }
 
 /**
- * Move every mover, all or nothing: everything else on the timeline must stay where it was. On any failure
- * every mover goes back to where it started, and the error says whether that worked.
+ * Move every mover (gcutMovers, each with its target): take them off, lay each whole at its target from its
+ * own source, and check each landed exactly (place, length, in point), nothing stray is left and nothing else
+ * changed. All or nothing: any failure lays every mover back at its own place (gcutRelay over the move's
+ * span) and throws, saying whether that worked (`nothingWas` ends the message when it did). Returns the plan;
+ * each mover gets landedT and landedEndT, where it now is (its target, to within half a frame).
  */
-function gcutRunMoves(seq, clock, movers, nothingWas) {
-    var all = [], k;
-    for (k = 0; k < movers.length; k++) all.push({ kind: movers[k].kind, trackIndex: movers[k].trackIndex, startT: movers[k].startT });
-    var others = gcutOthers(seq, all, -Infinity, Infinity), bad = null, label = null;
-    try { bad = gcutMoveEach(movers, clock); } catch (e) { bad = movers[0]; }
-    if (bad) label = bad.label;
-    else { label = gcutSnapshotIntact(seq, others, clock); }
-    if (!label) return;
-    var back = [];
-    for (k = 0; k < movers.length; k++) {
-        back.push({ item: movers[k].item, startT: gcutT(movers[k].item.start), target: movers[k].startT, label: movers[k].label });
+function gcutRelocate(seq, clock, found, nothingWas) {
+    var plan = gcutMovePlan(found), span = gcutMoveSpan(found), k;
+    var others = gcutOthers(seq, found, span.fromT, span.toT), marks = gcutMarks(found);
+    try {
+        try {
+            for (k = 0; k < found.length; k++) found[k].item.remove(false, false);
+            gcutRemoveRange(seq, gcutNodes(found), span.fromT, span.toT, clock, others); // linked partners some builds leave behind
+            gcutLayAll(seq, found, plan, span.fromT, span.toT, clock, others);
+            for (k = 0; k < found.length; k++) {
+                if (gcutVerifyItems(seq, found[k], plan[k], clock)) throw new Error("A clip on " + found[k].label + " didn't land where expected");
+            }
+            var stray = gcutStrayLeft(seq, found, plan, span.fromT, span.toT, clock, others);
+            if (stray) throw new Error("Something Premiere dropped along with a clip couldn't be removed from " + stray.label);
+            var hit = gcutSnapshotIntact(seq, others, clock);
+            if (hit) throw new Error("Laying the clips again changed something on " + hit);
+            var on = gcutOffAgain(seq, found, plan, clock);
+            if (on) throw new Error("Premiere didn't switch " + on + "'s clip off again");
+            // Where each landed, read back: a lay snaps to the sequence's frames, which a clip off them wasn't on.
+            for (k = 0; k < found.length; k++) {
+                var laid = gcutLaidAt(gcutKindTracks(seq, found[k].kind)[found[k].trackIndex], found[k], found[k].target, clock);
+                found[k].landedT = gcutT(laid.start); found[k].landedEndT = gcutT(laid.end);
+            }
+            return plan;
+        } catch (inner) {
+            var back = false, whole = [];
+            for (k = 0; k < found.length; k++) whole.push(gcutWhole(found[k]));
+            try {
+                back = gcutRelaySpan(seq, found, whole, span, clock, others) && !gcutSnapshotIntact(seq, others, clock) && !gcutOffAgain(seq, found, whole, clock);
+            } catch (ignored) { back = false; }
+            throw new Error(inner.message + (back ? ", so every clip was put back. " + nothingWas : ", and not every clip could be put back. Use Premiere's Undo."));
+        }
+    } finally {
+        gcutMarksBack(marks, clock);
     }
-    var stuck = null;
-    try { stuck = gcutMoveEach(back, clock) || gcutSnapshotIntact(seq, others, clock); } catch (e2) { stuck = true; }
-    throw new Error("A clip on " + label + " didn't move as expected, " + (stuck ? "and not every clip could be put back. Use Premiere's Undo."
-        : "so every clip was put back. " + nothingWas));
 }
 
-/** The record of done movers: [{kind, trackIndex, label, name, node, fromT, toT, durT}]. */
-function gcutMoveRecord(movers) {
+/**
+ * The record of done movers (gcutRelocate), pure data: each as gcutCutRecord keeps an item, with its name,
+ * on/off, where it was ([fromT, fromT + durT]) and where it is now ([toT, toEndT]): [{kind, trackIndex, label,
+ * name, node, fromT, durT, toT, toEndT, inS, outS, srcFrameS, loose, mediaFrameS, av, enabled}].
+ */
+function gcutMoveRecord(found) {
     var out = [];
-    for (var k = 0; k < movers.length; k++) {
-        var m = movers[k];
-        out.push({ kind: m.kind, trackIndex: m.trackIndex, label: m.label, name: m.name, node: m.node, fromT: m.startT, toT: m.target, durT: m.endT - m.startT });
+    for (var k = 0; k < found.length; k++) {
+        var m = found[k];
+        out.push({ kind: m.kind, trackIndex: m.trackIndex, label: m.label, name: m.name, node: m.node, fromT: m.startT, durT: m.endT - m.startT,
+                   toT: m.landedT, toEndT: m.landedEndT, inS: m.inS, outS: m.outS, srcFrameS: m.srcFrameS, loose: m.loose, mediaFrameS: m.mediaFrameS,
+                   av: m.av, enabled: m.enabled });
     }
     return out;
 }
 
 /** { oldId: [newId] } for every done mover, the new id read from the timeline. */
-function gcutMoveIdMap(seq, movers) {
+function gcutMoveIdMap(seq, found) {
     var map = {};
-    for (var k = 0; k < movers.length; k++) {
-        var m = movers[k], it = gcutFindRef(seq, { kind: m.kind, trackIndex: m.trackIndex, node: m.node, startT: m.target, endT: m.target + m.endT - m.startT });
+    for (var k = 0; k < found.length; k++) {
+        var m = found[k], it = gcutFindRef(seq, { kind: m.kind, trackIndex: m.trackIndex, node: m.node, startT: m.landedT, endT: m.landedEndT });
         if (it) map[m.oldId] = [gcutClipId(m.kind, m.trackIndex, it)];
     }
     return map;
 }
 
-function gcutMover(kind, trackIndex, it, target) {
-    var s = gcutT(it.start);
-    return { item: it, kind: kind, trackIndex: trackIndex, label: gcutLabel(kind, trackIndex), name: String(it.name), node: String(gcutNode(it) || ""),
-             startT: s, endT: gcutT(it.end), target: target, oldId: gcutClipId(kind, trackIndex, it) };
-}
-
 /**
- * args: { sequenceId, clipIds } — close the gaps between the chosen clips: the stretches inside their span
- * that none of them covers. Every clip on EVERY track starting after a gap moves left by the gaps before it
- * (trackItem.move; Premiere's ripple delete respects other tracks, measured, so it isn't used), keeping
- * everything after in step. Refuses, moving nothing: no gap; a clip on any track sitting in a gap (it would
- * need cutting); a locked track with a clip to move; a move that would overlap a clip. Returns { ok,
- * gapCount, closedS, movedCount, idMap (every moved clip), undo: { kind: "moves", sequenceId, moves } }.
+ * args: { sequenceId, clipIds, acceptEffectLoss? } — close the gaps between the chosen clips: the stretches
+ * inside their span that none of them covers. Every clip on EVERY track starting after a gap moves left by the
+ * gaps before it, keeping everything after in step: each is taken off and laid again at its new place from its
+ * own source (gcutRelocate; never trackItem.move, which hung Premiere). Refuses, moving nothing: no gap; a clip
+ * on any track sitting in a gap (it would need cutting); a locked track with a clip to move; a move that would
+ * overlap a clip; a clip to move with no source or not at 100% speed; one with effects, unless acceptEffectLoss
+ * is true; a drop over a clip that stays (gcutMoveDropsCheck). Returns { ok, gapCount, closedS, movedCount,
+ * idMap (every moved clip), undo: { kind: "moves", sequenceId, moves (gcutMoveRecord) } }.
  */
 function gcutToolCloseGaps(argsJson) {
     try {
-        var args = gcutParse(argsJson) || {}, k, t, i;
+        var args = gcutParse(argsJson) || {}, k, t, i, tail = "Nothing was moved.";
         var seq = gcutSequence(), clock = gcutClock(seq);
         gcutSameSequence(seq, args.sequenceId);
         var chosen = gcutResolveIds(seq, args.clipIds), ivs = [], gaps = [], closedT = 0;
@@ -2021,7 +2190,7 @@ function gcutToolCloseGaps(argsJson) {
             cursor = Math.max(cursor, ivs[k].e);
         }
         if (!gaps.length) throw new Error("There's no gap between the chosen clips, so nothing was moved.");
-        var tracks = gcutTracks(seq), movers = [];
+        var tracks = gcutTracks(seq), list = [];
         for (t = 0; t < tracks.length; t++) {
             var items = gcutItems(tracks[t].track), kind = tracks[t].audio ? "audio" : "video";
             for (i = 0; i < items.length; i++) {
@@ -2033,49 +2202,73 @@ function gcutToolCloseGaps(argsJson) {
                     }
                 }
                 var shift = gcutRemovedBefore(gaps, s);
-                if (shift > clock.half) movers.push(gcutMover(kind, tracks[t].index, items[i], s - shift));
+                if (shift > clock.half) list.push({ kind: kind, trackIndex: tracks[t].index, item: items[i], target: s - shift });
             }
         }
-        gcutRefuseLocked(seq, movers, "close the gaps");
-        var hit = gcutMoveCollision(seq, movers, clock);
+        gcutRefuseLocked(seq, list, "close the gaps");
+        var found = gcutMovers(seq, list, clock, tail);
+        var hit = gcutMoveCollision(seq, found, clock);
         if (hit) throw new Error("Closing the gaps would land " + hit.mover.name + " on " + hit.hit.name + " on " + hit.mover.label + ", so nothing was moved.");
-        gcutRunMoves(seq, clock, movers, "Nothing was changed.");
-        return gcutOk({ ok: true, gapCount: gaps.length, closedS: closedT / GCUT_TICKS, movedCount: movers.length,
-                        idMap: gcutMoveIdMap(seq, movers), undo: { kind: "moves", sequenceId: gcutSeqId(seq), moves: gcutMoveRecord(movers) } });
+        gcutMoveEffects(found, args.acceptEffectLoss, tail + " Ask the user; only if they agree, call close_gaps again with acceptEffectLoss: true.");
+        gcutMoveDropsCheck(seq, found, clock, "", tail);
+        gcutRelocate(seq, clock, found, "Nothing was changed.");
+        return gcutOk({ ok: true, gapCount: gaps.length, closedS: closedT / GCUT_TICKS, movedCount: found.length,
+                        idMap: gcutMoveIdMap(seq, found), undo: { kind: "moves", sequenceId: gcutSeqId(seq), moves: gcutMoveRecord(found) } });
     } catch (e) {
         return gcutFail(e);
     }
 }
 
 /**
- * Undo a "moves" record (close_gaps, move_clips): every moved clip must still be exactly where the move
- * left it (none of them: already undone, when all are back where they were); moving back must not land on
- * anything nor touch a locked track. Then each goes back, all or nothing.
+ * Undo a "moves" record (close_gaps, move_clips): lay every moved clip again at its old place, from its own
+ * source (gcutRelocate), all or nothing. Every one must still be exactly where the move left it (place, length,
+ * source and in point; none of them: already undone, when all are back where they were); laying them back
+ * must not land on anything, drop anything over a clip that stays, nor touch a locked track; every source must
+ * still be in the project. check: every refusal, changing nothing.
  */
 function gcutUndoMoves(seq, record, clock, check) {
-    var moves = record.moves, movers = [], atOld = 0, k;
+    var moves = record.moves, live = [], atOld = 0, k, m, ref;
     if (!gcutIsArray(moves) || !moves.length) throw new Error("This undo record is incomplete.");
     for (k = 0; k < moves.length; k++) {
-        var m = moves[k], ref = { kind: m.kind, trackIndex: m.trackIndex, node: m.node, startT: m.toT, endT: m.toT + m.durT };
+        if (typeof moves[k].inS !== "number" || typeof moves[k].durT !== "number" || typeof moves[k].toEndT !== "number") {
+            throw new Error("This move was made by an earlier Genius Cut, which kept too little to lay it back. " + GCUT_BY_HAND);
+        }
+    }
+    for (k = 0; k < moves.length; k++) {
+        m = moves[k];
+        ref = { kind: m.kind, trackIndex: m.trackIndex, node: m.node, startT: m.toT, endT: m.toEndT };
         var it = gcutFindRef(seq, ref);
-        if (it) {
-            movers.push({ item: it, kind: m.kind, trackIndex: m.trackIndex, label: m.label, name: m.name, node: m.node,
-                          startT: m.toT, endT: m.toT + m.durT, target: m.fromT });
-        } else {
+        live.push(it);
+        if (!it) {
             ref.startT = m.fromT; ref.endT = m.fromT + m.durT;
             if (gcutFindRef(seq, ref)) atOld++;
         }
     }
     if (atOld === moves.length) return { ok: true, alreadyUndone: true };
-    if (movers.length !== moves.length) {
-        throw new Error("Some of the moved clips were moved, trimmed or removed by hand since (" + movers.length + " of " + moves.length +
+    var there = 0;
+    for (k = 0; k < live.length; k++) if (live[k]) there++;
+    if (there !== moves.length) {
+        throw new Error("Some of the moved clips were moved, trimmed or removed by hand since (" + there + " of " + moves.length +
             " are where the move left them). " + GCUT_BY_HAND);
     }
-    gcutRefuseLocked(seq, movers, "undo");
-    var hit = gcutMoveCollision(seq, movers, clock);
+    for (k = 0; k < moves.length; k++) {
+        if (!gcutInPointOk(live[k].inPoint.seconds, gcutWhole(moves[k])[0].srcIn, moves[k], clock)) {
+            throw new Error(moves[k].label + "'s moved clip was slip-edited since (its source in point changed). " + GCUT_BY_HAND);
+        }
+    }
+    var items = gcutRehydrateItems(moves, "the move"), found = [];
+    for (k = 0; k < items.length; k++) {
+        var f = items[k];
+        f.item = live[k]; f.startT = moves[k].toT; f.endT = moves[k].toEndT; f.target = moves[k].fromT; f.moveDurT = moves[k].durT;
+        f.name = moves[k].name; f.enabled = gcutEnabled(live[k]);
+        found.push(f);
+    }
+    gcutRefuseLocked(seq, found, "undo");
+    var hit = gcutMoveCollision(seq, found, clock);
     if (hit) throw new Error("Moving the clips back would land " + hit.mover.name + " on " + hit.hit.name + " on " + hit.mover.label + ". " + GCUT_BY_HAND);
+    gcutMoveDropsCheck(seq, found, clock, "", GCUT_BY_HAND);
     if (check) return { ok: true, wouldUndo: true };
-    gcutRunMoves(seq, clock, movers, "Nothing was undone.");
+    gcutRelocate(seq, clock, found, "Nothing was undone.");
     return { ok: true };
 }
 
@@ -2401,37 +2594,44 @@ function gcutUndoDelete(seq, record, clock, check) {
 // ── move_clips ────────────────────────────────────────────────────────────────────────
 
 /**
- * args: { sequenceId, clipIds, byS } — move each chosen clip along its own track by byS seconds (to the
- * nearest frame; negative moves left) with trackItem.move. A linked partner that isn't chosen stays where it
- * is (measured); one Premiere moves along anyway puts everything back. Refuses, moving nothing: a move of
- * less than a frame, one before the sequence's start, a locked track, and landing on any clip that isn't
- * moving with it. Returns { ok, movedCount, idMap (every moved clip), undo: { kind: "moves", sequenceId, moves } }.
+ * args: { sequenceId, clipIds, byS, acceptEffectLoss? } — move each chosen clip along its own track by byS
+ * seconds (to the nearest frame; negative moves left): each is taken off and laid again at its new place from
+ * its own source (gcutRelocate; never trackItem.move, which hung Premiere), all or nothing. A linked partner
+ * moves only when it is chosen too; one that isn't stays where it is, and a move whose drop (its sound, or its
+ * picture) would land on it is refused (gcutMoveDropsCheck). Refuses, moving nothing: a move of less than a
+ * frame, one before the sequence's start, a locked track, landing on any clip that isn't moving with it, a clip
+ * with no source or not at 100% speed, and one with effects unless acceptEffectLoss is true. Returns { ok,
+ * movedCount, idMap (every moved clip), undo: { kind: "moves", sequenceId, moves (gcutMoveRecord) } }.
  */
 function gcutToolMoveClips(argsJson) {
     try {
-        var args = gcutParse(argsJson) || {}, k;
+        var args = gcutParse(argsJson) || {}, k, tail = "Nothing was moved.";
         var seq = gcutSequence(), clock = gcutClock(seq);
         gcutSameSequence(seq, args.sequenceId);
         if (!gcutIsTime(args.byS)) throw new Error("byS must be a time in seconds (negative moves left).");
         var byT = gcutFrameT(args.byS, clock);
         if (!byT) throw new Error("byS rounds to less than a frame, so nothing would move.");
-        var chosen = gcutResolveIds(seq, args.clipIds), movers = [];
+        var chosen = gcutResolveIds(seq, args.clipIds), list = [];
         gcutRefuseLocked(seq, chosen, "move clips");
         for (k = 0; k < chosen.length; k++) {
-            var m = gcutMover(chosen[k].kind, chosen[k].trackIndex, chosen[k].item, gcutT(chosen[k].item.start) + byT);
-            if (m.target < 0) {
-                throw new Error("Moving " + m.label + "'s clip by " + gcutSecText(args.byS) + " s would put it before the sequence's start. Nothing was moved.");
+            var target = gcutT(chosen[k].item.start) + byT;
+            if (target < 0) {
+                throw new Error("Moving " + gcutLabel(chosen[k].kind, chosen[k].trackIndex) + "'s clip by " + gcutSecText(args.byS) +
+                    " s would put it before the sequence's start. Nothing was moved.");
             }
-            movers.push(m);
+            list.push({ kind: chosen[k].kind, trackIndex: chosen[k].trackIndex, item: chosen[k].item, target: target });
         }
-        var hit = gcutMoveCollision(seq, movers, clock);
+        var found = gcutMovers(seq, list, clock, tail);
+        var hit = gcutMoveCollision(seq, found, clock);
         if (hit) {
             throw new Error("Moving the clips by " + gcutSecText(byT / GCUT_TICKS) + " s would land " + hit.mover.name + " on " + hit.hit.name +
                 " on " + hit.mover.label + ". Nothing was moved.");
         }
-        gcutRunMoves(seq, clock, movers, "Nothing was changed.");
-        return gcutOk({ ok: true, movedCount: movers.length, idMap: gcutMoveIdMap(seq, movers),
-                        undo: { kind: "moves", sequenceId: gcutSeqId(seq), moves: gcutMoveRecord(movers) } });
+        gcutMoveEffects(found, args.acceptEffectLoss, tail + " Ask the user; only if they agree, call move_clips again with acceptEffectLoss: true.");
+        gcutMoveDropsCheck(seq, found, clock, "Choose that clip too, so both move, or move the clip clear of it. ", tail);
+        gcutRelocate(seq, clock, found, "Nothing was changed.");
+        return gcutOk({ ok: true, movedCount: found.length, idMap: gcutMoveIdMap(seq, found),
+                        undo: { kind: "moves", sequenceId: gcutSeqId(seq), moves: gcutMoveRecord(found) } });
     } catch (e) {
         return gcutFail(e);
     }

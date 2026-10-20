@@ -27,6 +27,7 @@ const calls = (...c: AgentToolCall[]) => step("tool_calls", { tool_calls: c });
 function world(script: { start: AgentStep | (() => AgentStep); [k: string]: any }) {
   let listing: any = structuredClone(BASE);
   const host: [string, any][] = [];
+  let undoReply: (record: any) => any = () => ({ ok: true });
   let cutReply: (args: any) => any = () => ({ ok: true, cutCount: 1, clipCount: 1, removedS: 1, crossfades: 0, idMap: {}, undo: { kind: "cuts", sequenceId: "seq-1" } });
   const callHost = async (fn: string, args: any) => {
     host.push([fn, args]);
@@ -37,7 +38,7 @@ function world(script: { start: AgentStep | (() => AgentStep); [k: string]: any 
       return { ok: true, created: markers.map((m: any) => m.id), undo: { kind: "markers", sequenceId: "seq-1", markers } };
     }
     if (fn === "gcutToolCutRanges") return cutReply(args);
-    if (fn === "gcutToolUndo") return { ok: true };
+    if (fn === "gcutToolUndo") return undoReply(args.record);
     throw new Error(`unexpected ${fn}`);
   };
   const turns = createTurns(memoryStore());
@@ -59,7 +60,8 @@ function world(script: { start: AgentStep | (() => AgentStep); [k: string]: any 
   let snaps = 0;
   const agent = createAgent({ api, tools, turns, callHost, snapshotTrim: async () => { snaps++; return SNAP; } });
   return { agent, api, host, posted, queue, turns, tools, snaps: () => snaps,
-    setListing: (f: (l: any) => any) => { listing = f(listing); }, setCut: (f: (args: any) => any) => { cutReply = f; } };
+    setListing: (f: (l: any) => any) => { listing = f(listing); }, setCut: (f: (args: any) => any) => { cutReply = f; },
+    hostUndo: (f: (record: any) => any) => { undoReply = f; } };
 }
 const resultsOf = (w: ReturnType<typeof world>, i = 0) => w.posted.filter((p) => p.kind === "results")[i].body;
 const hostCalls = (w: ReturnType<typeof world>, fn: string) => w.host.filter(([f]) => f === fn).map(([, a]) => a);
@@ -128,6 +130,16 @@ describe("Go: the approved run", () => {
     expect(undone).toBe("Undone: Added 1 marker: Intro; Cut 1 range from 1 clip (1 s removed)");
     expect(hostCalls(w, "gcutToolUndo").map((a: any) => [a.record.kind, a.check === true])).toEqual([["cuts", true], ["markers", true], ["cuts", false], ["markers", false]]);
     expect(w.turns.latest("seq-1")).toBeUndefined();
+  });
+
+  it("Undo passes on what the group undo says it couldn't take back (a transition stays)", async () => {
+    const w = world({ start: calls(call("get_sequence", {})) });
+    await planned(w);
+    w.queue.push(calls(call("add_markers", MARK)), step("done", { text: "Added the marker." }));
+    const out: any = await w.agent.go();
+    const note = "The transition stays: Premiere can't remove it from a script. Remove it by hand if needed.";
+    w.hostUndo(() => ({ ok: true, skipped: true, message: note })); // as the host answers a transition's record
+    expect(await w.agent.undo(out.undo)).toBe(`Undone: Added 1 marker: Intro. ${note}`);
   });
 
   it("refuses an act call on a clip that wasn't selected, without calling the host", async () => {

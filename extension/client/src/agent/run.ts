@@ -219,7 +219,8 @@ export function createAgent(deps: AgentDeps) {
     /** Undo a run's group (pre-checked; refused unless it is still the newest on its sequence). */
     async undo(target: UndoTarget): Promise<string> {
       const r = await undoTurn(deps, target.sequenceId, target.turnId);
-      return r.alreadyUndone ? `Already undone: ${r.undone}` : `Undone: ${r.undone}`;
+      if (r.alreadyUndone) return `Already undone: ${r.undone}`;
+      return r.message ? `Undone: ${r.undone}. ${r.message}` : `Undone: ${r.undone}`;
     },
   };
 }

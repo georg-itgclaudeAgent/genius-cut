@@ -118,6 +118,8 @@ function overlappedLater(turn: Turn, i: number): boolean {
  * changes nothing); any refusal undoes nothing and is the reply. A cut a later cut of the turn overlaps
  * can't be host-checked until that one is undone, so a refusal only the host can see there still stops
  * part-way: what was undone is dropped from the turn, the rest stays, and the error says so.
+ * A record the host skips ({ skipped, message }: a transition Premiere can't remove from a script) counts as
+ * undone; its message comes back in the reply's `message`.
  * `id`: undo that turn, refused unless it is still the newest on its sequence; none: the newest on
  * the active sequence.
  */
@@ -137,6 +139,7 @@ export async function undoTurn(deps: Pick<ToolDeps, "callHost" | "turns">, seque
     if (!overlappedLater(turn, i)) await deps.callHost("gcutToolUndo", { record: turn.actions[i].undo, check: true });
   }
   let already = 0;
+  const notes: string[] = [];
   for (let i = total - 1; i >= 0; i--) {
     const a = turn.actions[i];
     let r: any;
@@ -148,12 +151,13 @@ export async function undoTurn(deps: Pick<ToolDeps, "callHost" | "turns">, seque
       throw new Error(`Undid ${done.length} of ${total} changes (${done.join("; ")}); then stopped: ${e instanceof Error ? e.message : String(e)}`);
     }
     if (r && r.alreadyUndone) already++;
+    // A change the host can't take back (a transition) stays; it isn't a refusal, so the group goes on.
+    if (r && r.skipped && r.message && !notes.includes(String(r.message))) notes.push(String(r.message));
     deps.turns.dropNewest(turn.sequenceId, turn.id);
     done.push(a.summary);
   }
-  return already === total
-    ? { ok: true, alreadyUndone: true, undone: summary, message: "Already undone: nothing of it was left on the timeline." }
-    : { ok: true, undone: summary };
+  if (already === total) return { ok: true, alreadyUndone: true, undone: summary, message: "Already undone: nothing of it was left on the timeline." };
+  return notes.length ? { ok: true, undone: summary, message: notes.join(" ") } : { ok: true, undone: summary };
 }
 
 export function createTools(deps: ToolDeps): ToolTable {

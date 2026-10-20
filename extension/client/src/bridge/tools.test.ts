@@ -253,6 +253,20 @@ describe("the bridge's tool table", () => {
       expect(f.turns.latest("seq-1")!.summary).toBe("Added 1 marker: Intro");
     });
 
+    it("a transition the host skips (Premiere can't remove one from a script) doesn't block the group; the reply carries its note", async () => {
+      const f = fakes(), t = grouped(f);
+      f.setListing({ ...LISTING, markers: [MARKER] });
+      const note = "The transition stays: Premiere can't remove it from a script. Remove it by hand if needed.";
+      f.turns.begin();
+      await t.add_markers.run(MARGS);
+      f.turns.push({ sequenceId: "seq-1", tool: "add_transition", args: {}, summary: "Added a Cross Dissolve", undo: { kind: "transition", sequenceId: "seq-1" }, idMap: {} });
+      f.turns.end();
+      f.onUndo(() => { const last: any = f.host[f.host.length - 1][1]; return last.record.kind === "transition" ? { ok: true, skipped: true, message: note } : { ok: true }; });
+      expect(await t.undo_last_turn.run({})).toEqual({ ok: true, undone: "Added 1 marker: Intro; Added a Cross Dissolve", message: note });
+      expect(undoCalls(f)).toEqual(["transition", "markers"]);
+      expect(f.turns.latest("seq-1")).toBeUndefined();
+    });
+
     it("undoTurn undoes a chosen turn only while it is the newest on its sequence", async () => {
       const f = fakes(), t = grouped(f);
       f.setListing({ ...LISTING, markers: [MARKER] });

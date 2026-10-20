@@ -3784,7 +3784,7 @@ describe("gcutToolMuteTrack: mute or unmute a whole track, and its undo", () => 
 
 describe("gcutToolAddTransition: a cross dissolve or constant power fade at a clip's start or end (QE), and its undo", () => {
   const add = (s: any, clipId: string, at: unknown, seconds: unknown) => act(s, "gcutToolAddTransition", { clipId, at, seconds });
-  const NO_UNDO = "Genius Cut can't take a transition off: Premiere has no script call for it. Remove the transition by hand (Premiere's Undo).";
+  const SKIPPED = { ok: true, skipped: true, message: "The transition stays: Premiere can't remove it from a script. Remove it by hand if needed." };
 
   it("adds a video Cross Dissolve at the clip's start through QE (measured call), counted on the track", () => {
     const s = georgScene();
@@ -3802,11 +3802,11 @@ describe("gcutToolAddTransition: a cross dissolve or constant power fade at a cl
     expect(s.a1.transitions).toEqual([{ applyToStart: false, duration: "00:00:00:12", offset: "00:00:00:00", alignment: 0.5 }]);
   });
 
-  it("undo refuses, there being no measured call to remove one transition, in check mode too", () => {
+  it("undo skips the transition (no measured call removes one), saying so, in check mode too, and leaves it in place", () => {
     const s = georgScene();
     const r = add(s, idsOn(s, "V1")[0], "start", 1);
-    expect(() => undoCheck(s, asStored(r.undo))).toThrow(NO_UNDO);
-    expect(() => undoTool(s, asStored(r.undo))).toThrow(NO_UNDO);
+    expect(undoCheck(s, asStored(r.undo))).toEqual(SKIPPED);
+    expect(undoTool(s, asStored(r.undo))).toEqual(SKIPPED);
     expect(s.v1.transitions).toHaveLength(1);
   });
 

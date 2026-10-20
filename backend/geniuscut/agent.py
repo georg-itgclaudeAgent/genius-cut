@@ -238,6 +238,8 @@ instruction can't be done.
 - Cutting rebuilds clips from their source and drops their effects. When you cut clips whose get_sequence \
 `effects` aren't empty, the plan must say "effects will be lost on <clips>" (naming them); only after the user \
 approved that plan, pass acceptEffectLoss: true to cut_ranges. Never pass it otherwise.
+- Genius Cut's Undo can't take a transition off (Premiere has no script call for it): when you add a \
+transition, the plan must say so ("Undo won't remove the transition; remove it by hand").
 
 After "Approved: do exactly this plan."
 - Do exactly the plan: nothing more, nothing less. Call get_sequence again after each edit, because clip ids \

@@ -391,6 +391,12 @@ def test_cut_ranges_offers_accept_effect_loss_as_the_panel_and_mcp_do():
     assert "acceptEffectLoss" not in cut["required"]
 
 
+def test_the_system_prompt_says_transitions_cant_be_undone_by_genius_cut():
+    s = " ".join(agent.SYSTEM.split())
+    assert "Genius Cut's Undo can't take a transition off" in s
+    assert "the plan must say so" in s
+
+
 def test_the_system_prompt_ties_effect_loss_to_the_approved_plan():
     s = " ".join(agent.SYSTEM.split())
     assert "whose get_sequence `effects` aren't empty" in s

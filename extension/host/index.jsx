@@ -2859,8 +2859,9 @@ var GCUT_AUDIO_TRANSITION = "Constant Power";
  * `seconds` long (to the frame), centred on the edit: Cross Dissolve on video, Constant Power on audio,
  * through QE's addTransition on the clip (the measured call; it counts as added only if the track's
  * transition count went up). Returns { ok, transition, at, seconds, idMap: {}, undo: { kind: "transition",
- * sequenceId, clip: {kind, trackIndex, label, node, startT, endT}, at, transition } }. Its undo always
- * refuses: no script call to remove one transition was found (Premiere's Undo removes it).
+ * sequenceId, clip: {kind, trackIndex, label, node, startT, endT}, at, transition } }. Its undo, check or not,
+ * leaves the transition and says so ({ ok: true, skipped: true, message }): no script call to remove one
+ * transition was found (Premiere's Undo removes it), and a refusal would block the rest of a group undo.
  */
 function gcutToolAddTransition(argsJson) {
     try {
@@ -2976,7 +2977,8 @@ function gcutChosenFound(chosen) {
 /**
  * args: { record, check? } — the `undo` record an act tool returned, as it returned it (pure data, so it
  * survives a panel reload). Returns { ok: true }, or { ok: true, alreadyUndone: true } when nothing of
- * that change is left (Premiere's own Undo took it back); refuses, changing nothing, when what that
+ * that change is left (Premiere's own Undo took it back), or { ok: true, skipped: true, message } for a change
+ * Genius Cut can't take back (a transition), which stays; refuses, changing nothing, when what that
  * change made was changed by hand since. check: true runs the same refusals and changes nothing,
  * returning { ok: true, wouldUndo: true } or { ok: true, alreadyUndone: true }, or the same refusal.
  */
@@ -3011,7 +3013,8 @@ function gcutToolUndo(argsJson) {
         }
         if (record.kind === "mute") return gcutOk(gcutUndoMute(seq, record, check));
         if (record.kind === "transition") {
-            throw new Error("Genius Cut can't take a transition off: Premiere has no script call for it. Remove the transition by hand (Premiere's Undo).");
+            // No measured script call removes one transition; refusing would block a whole group undo.
+            return gcutOk({ ok: true, skipped: true, message: "The transition stays: Premiere can't remove it from a script. Remove it by hand if needed." });
         }
         throw new Error("Genius Cut can't undo a change of kind " + record.kind + ".");
     } catch (e) {

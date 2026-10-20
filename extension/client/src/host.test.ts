@@ -2024,6 +2024,41 @@ describe("measured in Premiere 26.5.2: classify by EXACT frame rate, audio follo
       }
     });
 
+    describe("split_at and switch_angle on the loose cameras: their in points are read as the cut verify reads them", () => {
+      const at = (s: Scene) => tracks(s).map((t) => t.clips.map((i: TrackItem) => [i.start.t, i.end.t, +i.trueIn.seconds.toFixed(9), i.disabled]));
+      it.each([["V3 (Camera A)", "V3"], ["V2 (Camera B)", "V2"], ["V1 + A1 (Restream)", "V1", "A1"]])("split_at %s, then undo: exact, and idMap names both pieces", (_, ...labels) => {
+        const s = restreamScene(), orig = at(s);
+        const ids = allIds(s).filter((x: string) => labels.some((l) => x.startsWith(l)));
+        const r = s.host.call("gcutToolSplitAt", { sequenceId: "seq-1", clipIds: ids, atS: 50.4 });
+        expect(r).toMatchObject({ ok: true, splitCount: ids.length });
+        for (const id of ids) expect(r.idMap[id], id).toHaveLength(2);
+        const record = JSON.parse(JSON.stringify(r.undo));
+        expect(s.host.call("gcutToolUndo", { record, check: true })).toEqual({ ok: true, wouldUndo: true });
+        expect(s.host.call("gcutToolUndo", { record })).toEqual({ ok: true });
+        expect(at(s)).toEqual(orig);
+        expect(s.host.call("gcutToolUndo", { record })).toEqual({ ok: true, alreadyUndone: true });
+      });
+      it("switch_angle across the three angles (showing V3, Camera A), then undo: exact", () => {
+        const s = restreamScene(), orig = at(s);
+        const ids = allIds(s).filter((x: string) => x.startsWith("V"));
+        const r = s.host.call("gcutToolSwitchAngle", { sequenceId: "seq-1", clipIds: ids, fromS: 40.2, toS: 47.7, showTrack: 3 });
+        expect(r).toMatchObject({ ok: true, shown: "V3", hidden: ["V1", "V2"], splitCount: 6 });
+        for (const id of ids) expect(r.idMap[id], id).toHaveLength(3);
+        const record = JSON.parse(JSON.stringify(r.undo));
+        expect(s.host.call("gcutToolUndo", { record, check: true })).toEqual({ ok: true, wouldUndo: true });
+        expect(s.host.call("gcutToolUndo", { record })).toEqual({ ok: true });
+        expect(at(s)).toEqual(orig);
+      });
+      it("a loose piece slip-edited by a whole own frame since is still refused", () => {
+        const s = restreamScene();
+        const ids = allIds(s).filter((x: string) => x.startsWith("V3"));
+        const r = s.host.call("gcutToolSplitAt", { sequenceId: "seq-1", clipIds: ids, atS: 50.4 });
+        const p = s.seq.videoTracks[2].clips[1];
+        p.trueIn = Time.s(p.trueIn.seconds + 2 / CAM_A);
+        expect(() => s.host.call("gcutToolUndo", { record: JSON.parse(JSON.stringify(r.undo)) })).toThrow(/V3's pieces were .*slip-edited since/);
+      });
+    });
+
     describe("move_clips and close_gaps on the loose cameras (laid again, never TrackItem.move)", () => {
       const at = (s: Scene) => tracks(s).map((t) => t.clips.map((i: TrackItem) => [i.start.t / TPF30, i.end.t / TPF30, +i.trueIn.seconds.toFixed(9)]));
       it.each([["without", false], ["with", true]])("Camera A on V3 by +3 s (%s its own sound): exact at its new place, and its undo exact", (_, camerasSound) => {

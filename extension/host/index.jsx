@@ -2299,21 +2299,38 @@ function gcutSplitPieces(c) {
     return out;
 }
 
+/**
+ * True if clip `it`'s source in point is wantS (a split clip's, or one of its pieces'), read as the cut verify
+ * reads a laid piece (gcutInPointOk): Premiere 26.5.2 reports it floored to the sequence's frames, and a loose
+ * clip (its own frames don't fit the sequence's, gcutRefind) can sit up to one of its own frames from it (a
+ * razored piece's in point isn't on its own frames). Any other clip's must be within half a sequence frame.
+ */
+function gcutInPointIs(kind, it, wantS, clock) {
+    var f = { loose: false, mediaFrameS: 0 };
+    if (it.projectItem) {
+        var srcFps = kind === "audio" ? gcutMediaFps(it.projectItem) : gcutSourceFps(it.projectItem, clock);
+        if (kind === "audio" && srcFps > GCUT_MAX_FRAME_RATE) srcFps = 0;
+        if (srcFps > 0 && !gcutFits(srcFps, clock)) f = { loose: true, mediaFrameS: 1 / srcFps };
+    }
+    if (!f.loose) return gcutNear(it.inPoint.seconds, wantS, clock.frameS / 2);
+    return gcutInPointOk(it.inPoint.seconds, wantS, f, clock);
+}
+
 /** The live pieces of split clip c, in order, if every one is exactly where the split left it (place, length, source and in point); else null. */
 function gcutLivePieces(seq, c, clock) {
     var pieces = gcutSplitPieces(c), live = [];
     for (var k = 0; k < pieces.length; k++) {
         var it = gcutFindRef(seq, pieces[k].ref);
-        if (!it || !gcutNear(gcutClipInS(c.kind, it, clock), pieces[k].inS, clock.frameS / 2)) return null;
+        if (!it || !gcutInPointIs(c.kind, it, pieces[k].inS, clock)) return null;
         live.push(it);
     }
     return live;
 }
 
-/** True if split clip c is whole again: one clip at its place, from its in point, on or off as it was. */
+/** True if split clip c is whole again: one clip at its place, from its in point (gcutInPointIs), on or off as it was. */
 function gcutWholeAgain(seq, c, clock) {
     var it = gcutFindRef(seq, c);
-    return !!it && gcutNear(gcutClipInS(c.kind, it, clock), c.inS, clock.frameS / 2) && gcutEnabled(it) === c.enabled;
+    return !!it && gcutInPointIs(c.kind, it, c.inS, clock) && gcutEnabled(it) === c.enabled;
 }
 
 /** Join split clip c's pieces back into one: the later pieces go, the first one's end is set back (TrackItem.end, measured). Throws if it isn't whole after. */

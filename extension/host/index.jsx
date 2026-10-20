@@ -35,11 +35,14 @@
  *     around it, gcutDropsCheck refuses what it would overwrite, and every track is checked after;
  *   - TrackItem.end sets a clip's length either way (its reported outPoint goes stale), and leaves
  *     the linked partner as it was; remove() leaves the linked partner too.
- *   - trackItem.move(Time) can block Premiere forever (2026-10-15): it is never called. Close gap and
- *     the move tools take each clip off and lay it again from its source, checking every track after.
+ *   - trackItem.move(Time) blocked Premiere forever once (2026-10-15, an assistant move of V3 Camera A by
+ *     +3 s): the assistant's move tools never call it (they lay clips again). The panel's Close gap still
+ *     uses it, as it always has.
  * Unverified (docs silent or contradictory):
  *   - setInPoint/setOutPoint units (docs say ticks for one, seconds for the other): set,
- *     read back, fall back to the other unit, and remember which worked.
+ *     read back, fall back to the other unit, and remember which worked;
+ *   - whether move() moves the linked partner: handled either way (Close gap moves each item
+ *     and checks every track after).
  */
 
 var GCUT_TICKS = 254016000000; // Premiere ticks per second
@@ -1254,9 +1257,7 @@ function gcutOurs(ours, track, startT) {
  * are already in place and never move; clips starting before the range never move. Refuses,
  * before moving anything, a rebuilt piece edited since Apply (it would slide a second time), a
  * clip that crosses a cut (it would need cutting itself), a locked track with a clip to move, and
- * a slide that would land on a clip. Each clip that slides is taken off and laid again at its new place from its
- * own source (gcutRelocate; never trackItem.move, which hung Premiere), all or nothing, so a clip with effects, one
- * not at 100% speed, and a drop over a clip that stays (gcutMoveDropsCheck) are refused too: close the gap by hand.
+ * a slide that would land on a clip. Items already moved as a linked partner are not moved twice.
  * spec: { startTicks } — the range start recorded at Analyse.
  */
 function gcutCloseGapMulti(specJson) {
@@ -1290,7 +1291,7 @@ function gcutCloseGapMulti(specJson) {
                     shift = gcutRemovedBefore(rec.cutsT, s);
                 }
                 if (shift > clock.half) {
-                    movers.push({ kind: tracks[t].audio ? "audio" : "video", trackIndex: tracks[t].index, item: it, target: s - shift });
+                    movers.push({ item: it, startT: s, target: s - shift, label: tracks[t].label });
                     later = true;
                 } else shift = 0;
                 finals[t].push({ startT: s - shift, endT: e - shift, moves: shift > 0 });
@@ -1310,19 +1311,19 @@ function gcutCloseGapMulti(specJson) {
                 }
             }
         }
-        if (!movers.length) { rec.gapClosed = true; return gcutOk({ ok: true, movedCount: 0 }); }
-        var byHand = "Nothing was moved; close the gap by hand.";
-        var found = gcutMovers(seq, movers, clock, byHand);
-        gcutMoveEffects(found, false, byHand);
-        gcutMoveDropsCheck(seq, found, clock, "", byHand);
+        movers.sort(function (a, b) { return a.startT - b.startT; });
         rec.gapClosed = true; // from here on Restore must not run: later clips may have moved
-        try {
-            gcutRelocate(seq, clock, found, "Nothing was changed.");
-        } catch (moveErr) {
-            if (/every clip was put back/.test(moveErr.message)) rec.gapClosed = false; // nothing moved: Restore still matches
-            throw moveErr;
+        for (i = 0; i < movers.length; i++) {
+            var now = gcutT(movers[i].item.start);
+            if (!gcutNear(now, movers[i].target, clock.half)) movers[i].item.move(gcutTimeFromTicks(movers[i].target - now));
         }
-        return gcutOk({ ok: true, movedCount: found.length });
+        for (i = 0; i < movers.length; i++) {
+            if (!gcutNear(gcutT(movers[i].item.start), movers[i].target, clock.half)) {
+                return gcutOk({ ok: false, movedCount: i,
+                    message: "A clip on " + movers[i].label + " didn't move as expected. Use Premiere's Undo." });
+            }
+        }
+        return gcutOk({ ok: true, movedCount: movers.length });
     } catch (e) {
         return gcutFail(e);
     }

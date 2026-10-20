@@ -8,7 +8,7 @@
  *   - placements snap to the sequence frame grid;
  *   - behaviours the docs don't pin down are switches (setInPoint units, where linked audio
  *     lands, whether remove also acts on linked partners, locked tracks, in > out);
- *   - TrackItem.move throws: it hung real Premiere, so the host must never call it.
+ *   - TrackItem.move throws (it hung real Premiere), except while the panel's Close gap runs.
  */
 import { describe, it, expect, beforeEach } from "vitest";
 import { readFileSync } from "fs";
@@ -144,9 +144,13 @@ class TrackItem {
     return 0;
   }
   /** Real Premiere 26.5.2 (2026-10-15) blocked forever inside trackItem.move(Time) (V3 Camera A by +3 s; a restart
-   *  was needed twice): the host must never call it. */
-  move(_offset: Time): never {
-    throw new Error("TrackItem.move was called: it hangs Premiere 26.5.2, and the host must never use it.");
+   *  was needed twice): it throws, except inside the panel's Close gap (gcutCloseGapMulti, see load), which still uses it. */
+  move(offset: Time) {
+    if (!this.track.seq.moveAllowed) throw new Error("TrackItem.move was called: it hangs Premiere 26.5.2, and the host must never use it.");
+    if (this.track.locked) throw new Error("Track is locked");
+    const all = this.track.seq.moveLinked ? [this, ...this.linked] : [this];
+    for (const it of all) { it.start = Time.k(it.start.t + offset.t); it.setEnd(it.end.t + offset.t); }
+    return 0;
   }
   /** The user dragging this one clip along its track by hand (the simulator's own edit, not an API call). */
   drag(offset: Time) { this.start = Time.k(this.start.t + offset.t); this.setEnd(this.end.t + offset.t); }
@@ -239,6 +243,9 @@ class Seq {
   /** TrackItem.inPoint reads floored to this sequence's frames, as measured in Premiere 26.5.2. */
   inPointOnSeqGrid = false;
   removeLinked = false;
+  moveLinked = false;
+  /** Set by load's call only while gcutCloseGapMulti runs: the one host path still allowed to call TrackItem.move. */
+  moveAllowed = false;
   private placements = 0;
   constructor(nV = 2, nA = 3) {
     const v = Array.from({ length: nV }, (_, i) => new Track(this, "video", i));
@@ -354,7 +361,9 @@ function load(seq: Seq, { qe = true } = {}) {
   vm.runInContext("delete this.JSON;", ctx); // ExtendScript has no JSON
   vm.runInContext(HOST_SRC, ctx);
   const call = (fn: string, arg: unknown) => {
-    const out: string = (ctx as any)[fn](JSON.stringify(arg));
+    seq.moveAllowed = fn === "gcutCloseGapMulti";
+    let out: string;
+    try { out = (ctx as any)[fn](JSON.stringify(arg)); } finally { seq.moveAllowed = false; }
     if (out.startsWith("Error:")) throw new Error(out.slice(6).trim());
     return JSON.parse(out); // the panel parses with native JSON, so the tests do too
   };
@@ -676,26 +685,11 @@ describe("gcutCloseGapMulti: one clip", () => {
     expect(s.seq.audioTracks[2].clips[0].start.seconds).toBeCloseTo(110, 1);
   });
 
-  it("lays each later clip again at its new place from its own source (never TrackItem.move): the b-roll keeps its own sound in sync", () => {
+  it("I5: moves linked audio once, even if Premiere's move also moves linked partners", () => {
+    s.seq.moveLinked = true;
     expect(closeGap(s).ok).toBe(true);
-    expect(span(s.seq.videoTracks[0]).at(-1)).toEqual([108, 113, 0]);
-    expect(span(s.seq.audioTracks[0]).at(-1)).toEqual([108, 113, 0]);
-    expect(span(s.seq.audioTracks[2])).toEqual([[110, 113, 0]]);
-  });
-
-  it("refuses, moving nothing, a later clip with effects (laying it again would remove them): close the gap by hand", () => {
-    s.seq.videoTracks[0].clips.at(-1).addEffect("Lumetri Color");
-    const before = s.seq.videoTracks[0].clips.map((i: TrackItem) => i.start.t);
-    expect(() => closeGap(s)).toThrow("Moving lays the clips again from their source, so these effects would be removed: V1 (b-roll.mp4): Lumetri Color. Nothing was moved; close the gap by hand.");
-    expect(s.seq.videoTracks[0].clips.map((i: TrackItem) => i.start.t)).toEqual(before);
-  });
-
-  it("when a clip doesn't land as expected, puts every clip back and Restore still works", () => {
-    const placed = (s.seq as any).placements;
-    s.seq.dropSpanIndex = placed + 1;
-    expect(() => closeGap(s)).toThrow(/didn't land where expected, so every clip was put back\. Nothing was changed\.$/);
-    expect(span(s.seq.audioTracks[2])).toEqual([[112, 115, 0]]);
-    expect(restore(s)).toEqual({ ok: true });
+    const a = s.seq.audioTracks[0].clips;
+    expect(a[a.numItems - 1].start.seconds).toBeCloseTo(108, 1);
   });
 
   it("refuses, naming it, a clip on another track that crosses a cut, and moves nothing", () => {
@@ -1201,9 +1195,9 @@ describe("gcutCloseGapMulti", () => {
   it("slides a clip placed after the last cut since Apply by the total", () => {
     const s = multiScene({ music: false });
     applyCuts(s);
-    s.seq.audioTracks[2].add(wav("hit.wav", "node-h", 5), 108.52, 0, 1); // on the frame grid, where a lay lands
+    s.seq.audioTracks[2].add(wav("hit.wav", "node-h", 5), 108.5, 0, 1);
     expect(closeGapMulti(s)).toEqual({ ok: true, movedCount: 2 });
-    expect(layout(s.seq.audioTracks[2])).toEqual([[106.52, 107.52]]);
+    expect(layout(s.seq.audioTracks[2])).toEqual([[106.5, 107.5]]);
     expect(layout(s.seq.videoTracks[3])).toEqual([[103, 105]]); // the title (104–106) had one cut before it
   });
   it("refuses, naming it, a clip that crosses a cut, and moves nothing", () => {

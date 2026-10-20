@@ -5,9 +5,9 @@
   ExtensionBundleVersion in sync with the release tag (vX.Y.Z); the installer reads it
   to detect the installed version.
 -->
-<ExtensionManifest Version="7.0" ExtensionBundleId="com.attract.genius-cut" ExtensionBundleVersion="0.1.0" ExtensionBundleName="Genius Cut">
+<ExtensionManifest Version="7.0" ExtensionBundleId="com.attract.genius-cut" ExtensionBundleVersion="0.2.0" ExtensionBundleName="Genius Cut">
   <ExtensionList>
-    <Extension Id="com.attract.genius-cut.panel" Version="0.1.0" />
+    <Extension Id="com.attract.genius-cut.panel" Version="0.2.0" />
   </ExtensionList>
 
   <ExecutionEnvironment>

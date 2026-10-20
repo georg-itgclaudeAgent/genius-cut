@@ -1,10 +1,13 @@
 # Genius Cut
 
-An Adobe Premiere Pro panel from itGenius. Tell it what to trim; it transcribes the clip
-locally on your GPU, proposes cuts in your editing style, and rebuilds the timeline once
-you approve. Client footage never leaves the machine.
+An Adobe Premiere Pro panel from itGenius. Select clips on the timeline and say what to do:
+"trim the ums" transcribes them locally on your GPU, proposes cuts in your editing style and
+rebuilds the timeline once you approve; any other instruction ("add a marker at every product
+mention", "switch to Camera A between 1:10 and 1:20") goes to Claude, which shows a plan, edits
+the selected clips after you press Go, and can be undone in one click. Footage never leaves the
+machine; only transcripts and timeline listings are sent to Claude.
 
-**Status:** design and front-end prototype done; backend not built yet.
+**Status:** 0.2.0 in testing (Claude Opus 5.5 assistant, setup, usage limits, full toolbox).
 
 - **Prototype:** [prototype/genius-cut-panel.html](prototype/genius-cut-panel.html). Download
   it and open it in a browser. It uses mock data only.
@@ -16,7 +19,26 @@ you approve. Client footage never leaves the machine.
   `ExtensionBundleId="com.attract.genius-cut"`. Until the first release, the installer shows
   Genius Cut as "Not released yet".
 
-## Claude assistant (personal builds only)
+## Setting up Genius Cut (every editor, once)
+
+Genius Cut's AI runs on **your own** Anthropic API key, kept in **your own** Google Cloud project's
+Secret Manager. The panel opens on a Setup page until this is done:
+
+1. **Google Cloud CLI** — install it from https://cloud.google.com/sdk/docs/install if the page says
+   it's missing, then click Check again (no Premiere restart needed).
+2. **Sign in** — Sign in with Google opens your browser; sign in yourself (Genius Cut never sees your
+   password).
+3. **Project** — pick the Google Cloud project that holds your key.
+4. **Secret** — the secret's name (default `ANTHROPIC_API_KEY`) and version (default latest).
+5. **Test** — reads the key and makes one free call to Anthropic.
+6. **Monthly limit** — $20 (default) or $100 (the most). Change it later in ⚙ Settings → Usage & limit.
+
+At the limit, Genius Cut stops calling Claude and says so: at $20 "Partial monthly limit reached…",
+at $100 "Your allowed monthly limit has been reached…" until the 1st of next month. Costs shown are
+estimates at list prices (Claude Opus 5.5: $4 / $20 per million input / output tokens); your
+Anthropic console is the bill of record.
+
+## Claude Code terminal door (personal builds only)
 
 Lets Claude Code read and edit the open Premiere sequence through the Genius Cut panel, using your own
 Claude Code login (no API key). It is never in builds for editors: `scripts/package.py` refuses a

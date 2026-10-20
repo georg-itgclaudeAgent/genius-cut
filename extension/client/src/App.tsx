@@ -15,7 +15,7 @@ import { SetupPage } from "./components/Setup";
 import { SettingsPage } from "./components/Settings";
 import { StyleLibrary, type LastTrim } from "./components/StyleLibrary";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 
 function BackendStatus({ state, onRetry }: { state: ReturnType<typeof useBackend>["state"]; onRetry: () => void }) {
   if (state.kind === "ready") return null;

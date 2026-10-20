@@ -4,7 +4,7 @@ import os
 import secrets
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 # Bumped whenever the panel <-> backend contract changes, so a panel can tell an outdated
 # backend left running from an earlier version and restart it.
 API_VERSION = 6  # 3: frame_s (clean cuts, 2026-10-08); 4: /transcript jobs (assistant, 2026-10-14);

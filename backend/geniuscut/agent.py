@@ -431,7 +431,8 @@ moves every clip on every track after each gap ("this also moves everything afte
 off pieces on the other angle tracks ("V1 and V3 are switched off from 1:00 to 1:10"); mute_track mutes the whole \
 track ("this mutes all of A2"). Their clip ids must still be selected ones; use mute_track only on a track that has \
 a selected clip.
-- All times are seconds on the sequence timeline; in text to the user write them as m:ss.
+- All times are seconds on the sequence timeline; in text to the user write them as m:ss, or h:mm:ss from \
+one hour on (1:02:05, not 62:05).
 
 Two kinds of instruction
 1. A filler-word or pause trim ("trim the ums", "tighten the pauses"): call propose_filler_cuts with clear \
@@ -453,7 +454,9 @@ touch clips whose get_sequence `effects` aren't empty, the plan must say "effect
 close_gaps). Never pass it otherwise.
 - Rebuilt that way, a clip's clip volume, Motion and Opacity settings are reset to the source's (keyframes too). \
 When the plan cuts or moves clips, the plan must say "volume, Motion and Opacity settings will be reset on <clips>". \
-If the same plan sets a volume, set it after the cuts and moves.
+If the same plan sets a volume, set it after the cuts and moves. cut_ranges also adds a short (2-frame) audio \
+crossfade at every cut in the audio by itself; say so in the plan line for the cut ("with a short crossfade at the \
+audio join").
 - Genius Cut's Undo can't take a transition off (Premiere has no script call for it): when you add a \
 transition, the plan must say so ("Undo won't remove the transition; remove it by hand").
 - set_speed keeps each clip's place and length; choose a clip's own sound with its picture so they stay in sync.

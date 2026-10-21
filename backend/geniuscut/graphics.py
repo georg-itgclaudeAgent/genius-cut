@@ -238,6 +238,19 @@ def set_root_attrs(html: str, attrs: dict[str, str]) -> str:
     return html[:m.start()] + tag + html[m.end():]
 
 
+def follow_length(html: str, duration: str) -> str:
+    """Give the composition the new length: the root's data-duration, and every element that ran the root's
+    whole old length (data-duration equal to it, e.g. a starter's one full-length clip) runs the new one."""
+    m = _ROOT_TAG.search(html)
+    if not m:
+        return html
+    old = re.search(r"\sdata-duration\s*=\s*[\"']?([\d.]+)", m.group(0))
+    if old:
+        html = re.sub(r"(\sdata-duration\s*=\s*)([\"'])" + re.escape(old.group(1)) + r"(?=\2)",
+                      lambda x: f'{x.group(1)}{x.group(2)}{duration}', html)
+    return set_root_attrs(html, {"data-duration": duration})
+
+
 def preview_time(duration_s: float, fps: float, at=None) -> float:
     """Default just after the entry animation: 40 % of the length, at most 1.5 s in. Kept inside the clip."""
     t = min(0.4 * duration_s, 1.5) if at is None else float(at)
@@ -421,8 +434,8 @@ class Engine:
             raise GraphicsError(f"html is too long (over {MAX_HTML_CHARS} characters).")
         if variables is not None and not isinstance(variables, dict):
             raise GraphicsError("variables must be an object of variable values keyed by id.")
-        html = set_root_attrs(html, {"data-width": str(w), "data-height": str(h), "data-fps": rate,
-                                     "data-duration": f"{duration:g}"})
+        html = follow_length(set_root_attrs(html, {"data-width": str(w), "data-height": str(h), "data-fps": rate}),
+                             f"{duration:g}")
         node = self.require_ready()
 
         folder = root / slug

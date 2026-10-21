@@ -1,0 +1,23 @@
+/* itGenius brand tokens (2024 brand guide) for Genius Cut graphics.
+   Linked as assets/tokens.css. The Outfit @font-face must stay in each composition's own inline <style>
+   (HyperFrames rewrites asset urls in inline styles, not inside this file). */
+:root {
+  --gc-navy: #112A33;      /* Deep Navy: panels, full-screen backgrounds */
+  --gc-blue: #009BD0;      /* Blue: the angled-edge wedge, primary accent */
+  --gc-coral: #FF7A51;     /* Coral: one highlight per frame (bars, key words) */
+  --gc-rose: #D06F9B;      /* Soft Rose: a second accent, sparingly */
+  --gc-white: #FFFFFF;
+  --gc-grey: #F8F9FB;      /* Light Grey: light cards */
+  --gc-safe: 120px;        /* safe margin from every frame edge */
+  --gc-ease-in: 0.5s;      /* entries 0.4-0.6 s, power3.out */
+  --gc-font: "Outfit";
+  --gc-light: 300;         /* body */
+  --gc-bold: 700;          /* headlines */
+}
+
+/* The angled edge: a panel whose right side leans in at the bottom. */
+.gc-angled { clip-path: polygon(0 0, 100% 0, calc(100% - 70px) 100%, 0 100%); }
+.gc-angled-left { clip-path: polygon(70px 0, 100% 0, 100% 100%, 0 100%); }
+
+.gc-headline { font-family: var(--gc-font); font-weight: var(--gc-bold); letter-spacing: -0.01em; }
+.gc-body { font-family: var(--gc-font); font-weight: var(--gc-light); }

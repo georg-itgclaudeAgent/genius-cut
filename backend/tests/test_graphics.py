@@ -196,6 +196,23 @@ def test_the_root_gets_the_sequence_size_rate_and_length(tmp_path, kit, project)
     assert root.count("data-duration") == 1
 
 
+def test_full_length_clips_follow_the_new_length():
+    html = ('<div id="root" data-composition-id="main" data-duration="4"><div class="clip" data-duration="4"></div>'
+            "<div class='clip' data-duration='4'></div><div class=\"clip\" data-duration=\"1.5\"></div>"
+            '<div data-duration="40"></div></div>')
+    out = graphics.follow_length(html, "6.5")
+    assert out == ('<div id="root" data-composition-id="main" data-duration="6.5"><div class="clip" '
+                   "data-duration=\"6.5\"></div><div class='clip' data-duration='6.5'></div><div class=\"clip\" "
+                   'data-duration="1.5"></div><div data-duration="40"></div></div>')
+    assert graphics.follow_length('<div data-composition-id="m">x</div>', "3") ==         '<div data-composition-id="m" data-duration="3">x</div>'
+
+
+def test_the_html_clip_follows_the_requested_length(tmp_path, kit, project):
+    make(engine(tmp_path, kit), project, duration_s=7)
+    html = (Path(project).parent / "Genius Cut Graphics" / "mfa-lower-third" / "v1" / "index.html").read_text()
+    assert html.count('data-duration="7"') == 2 and 'data-duration="3"' not in html
+
+
 def test_set_root_attrs_adds_missing_ones():
     out = graphics.set_root_attrs('<div id="root" data-composition-id="main">x</div>', {"data-fps": "25"})
     assert out == '<div id="root" data-composition-id="main" data-fps="25">x</div>'

@@ -65,7 +65,10 @@ class FakeClient:
             outer.calls.append({**kw, "messages": list(kw["messages"])})
             if not outer.replies:
                 raise AssertionError("no scripted reply left")
-            return Stream(outer.replies.pop(0))
+            nxt = outer.replies.pop(0)
+            if isinstance(nxt, Exception):  # a scripted API error
+                raise nxt
+            return Stream(nxt)
 
         self.beta = SimpleNamespace(messages=SimpleNamespace(stream=stream))
 
@@ -155,9 +158,10 @@ def test_first_step_request_shape(tmp_path):
     assert kw["model"] == "claude-opus-5-5" and kw["max_tokens"] == 16000
     assert kw["output_config"] == {"effort": "high"} and kw["tool_choice"] == {"type": "auto"}
     assert kw["cache_control"] == {"type": "ephemeral"}
-    assert kw["betas"] == [claude.FALLBACK_BETA] and kw["fallbacks"] == "default"
+    assert kw["betas"] == [claude.FALLBACK_BETA, claude.MCP_BETA] and kw["fallbacks"] == "default"
     assert "thinking" not in kw
-    assert [t["name"] for t in kw["tools"]] == [t["name"] for t in agent.TOOLS]
+    assert [t["name"] for t in kw["tools"][:-1]] == [t["name"] for t in agent.TOOLS]
+    assert kw["tools"][-1] == claude.ENVATO_TOOLSET and kw["mcp_servers"] == [claude.ENVATO_SERVER]
     assert "selected" in kw["system"].lower()
     first = kw["messages"][0]
     assert first["role"] == "user"

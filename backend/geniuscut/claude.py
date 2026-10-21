@@ -15,6 +15,13 @@
 - `agent_step` is one step of the panel's agent loop (agent.py): streamed, tools offered with
   `tool_choice` auto, effort high, adaptive thinking (the default: no `thinking` param), prompt
   caching on (`cache_control` auto), recorded under `response.model` with cache tokens.
+- Envato Elements search (B-roll): on the Anthropic API, `agent_step(envato=True)` adds Envato's MCP
+  server (https://mcp.envato.com/mcp, no auth) through Anthropic's MCP connector, with only
+  `search_stock_video` and `search_photos` allowlisted. Anthropic runs those calls: they come back as
+  mcp_tool_use / mcp_tool_result blocks, never as tool calls for the panel. GENIUSCUT_ENVATO=0 turns it
+  off (`envato_enabled`); Vertex never gets it. An API error naming the MCP server raises EnvatoUnavailable,
+  so the caller can retry the step without it. The ledger prices tokens only (MCP results arrive as input
+  tokens); `usage.server_tool_use` isn't priced.
 - Before every call the spend gate checks the worst case against the monthly limit, so a
   refused run never reaches the API; an unpriced model is refused. Usage is recorded in the
   spend ledger after every reply.
@@ -33,6 +40,11 @@ from geniuscut.errors import LLMError
 MODEL = os.environ.get("GENIUSCUT_CLAUDE_MODEL", "claude-opus-5-5")
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
 AGENT_MAX_TOKENS = 16000
+MCP_BETA = "mcp-client-2025-11-20"
+ENVATO_SERVER = {"type": "url", "url": "https://mcp.envato.com/mcp", "name": "envato"}
+# Search only: every other Envato tool (downloads, licences…) stays off.
+ENVATO_TOOLSET = {"type": "mcp_toolset", "mcp_server_name": "envato", "default_config": {"enabled": False},
+                  "configs": {"search_stock_video": {"enabled": True}, "search_photos": {"enabled": True}}}
 
 
 class ClaudeError(LLMError):
@@ -47,6 +59,21 @@ class KeyRejected(ClaudeError):
 
     def __init__(self):
         super().__init__(KEY_REJECTED)
+
+
+class EnvatoUnavailable(ClaudeError):
+    """The step failed because Anthropic couldn't use the Envato MCP server; retry it without Envato."""
+
+
+def envato_enabled() -> bool:
+    """Envato search rides along unless GENIUSCUT_ENVATO is 0/false/off/no, and only on the Anthropic API."""
+    off = (os.environ.get("GENIUSCUT_ENVATO") or "").strip().lower() in ("0", "false", "off", "no")
+    return not off and provider() == "anthropic"
+
+
+def _mcp_failure(e) -> bool:
+    msg = _api_message(e).lower()
+    return "mcp" in msg or ENVATO_SERVER["name"] in msg
 
 
 def provider() -> str:
@@ -138,11 +165,14 @@ def _tokens(usage, name: str) -> int:
     return int(getattr(usage, name, 0) or 0)
 
 
-def agent_step(messages: list, tools: list[dict], system: str, *, client, input_tokens: int):
+def agent_step(messages: list, tools: list[dict], system: str, *, client, input_tokens: int,
+               envato: bool = False):
     """One agent step: gate on `input_tokens` (the caller's estimate) plus AGENT_MAX_TOKENS,
     stream, return the final message. The caller handles stop_reason (refusal, max_tokens,
     tool_use, end_turn) and appends `response.content` whole. Spend is recorded under the model
-    that answered (an unpriced fallback is priced as MODEL), cache tokens included."""
+    that answered (an unpriced fallback is priced as MODEL), cache tokens included. `envato` adds the
+    Envato MCP server and its search toolset (Anthropic API only); an API error about it raises
+    EnvatoUnavailable."""
     if spend.price(MODEL) is None:
         raise ClaudeError(f"No price is known for Claude model '{MODEL}', so the monthly limit can't be "
                           f"enforced. Use one of: {', '.join(sorted(spend.PRICES))}.")
@@ -154,10 +184,17 @@ def agent_step(messages: list, tools: list[dict], system: str, *, client, input_
         stream = client.messages.stream
     else:
         kwargs.update(betas=[FALLBACK_BETA], fallbacks="default")
+        if envato:
+            kwargs.update(betas=[FALLBACK_BETA, MCP_BETA], mcp_servers=[ENVATO_SERVER], tools=[*tools, ENVATO_TOOLSET])
         stream = client.beta.messages.stream
     with _api_errors():
-        with stream(**kwargs) as s:
-            response = s.get_final_message()
+        try:
+            with stream(**kwargs) as s:
+                response = s.get_final_message()
+        except anthropic.APIStatusError as e:
+            if envato and "mcp_servers" in kwargs and e.status_code not in (401, 429) and _mcp_failure(e):
+                raise EnvatoUnavailable(f"Envato search is unavailable: {_api_message(e)}") from e
+            raise
     usage = getattr(response, "usage", None)
     if usage is not None:
         spend.record(getattr(response, "model", None) or MODEL, _tokens(usage, "input_tokens"),

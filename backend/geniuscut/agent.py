@@ -34,6 +34,13 @@ thinking included; never edited); a refusal or a reply cut off at max_tokens end
 appended or executed; at most 25 Claude steps per run; every step goes through the spend gate,
 estimated from the previous step's actual usage plus the new content; the Anthropic client (and so
 the key read) is made once per run. Runs live in memory: a backend restart loses them.
+
+B-roll markers: Envato Elements search rides along on every step (claude.agent_step(envato=True)) unless
+GENIUSCUT_ENVATO=0 or the provider is Vertex. Anthropic runs those searches server-side; their mcp_tool_use /
+mcp_tool_result blocks are appended with the rest of the reply and never sent to the panel. A step that
+fails because of the Envato server is retried once without it, and Envato stays off for the rest of the run;
+Claude is told (ENVATO_DOWN / ENVATO_OFF in the system prompt) to give search terms only. A `pause_turn`
+reply (a long server-side tool loop) is appended unchanged and continued as the next step.
 """
 
 import json
@@ -418,6 +425,14 @@ TOOL_KINDS = {"get_sequence": "read", "get_transcript": "read", "wait_transcript
               "set_clip_enabled": "act", "move_clips": "act", "switch_angle": "act", "set_volume": "act",
               "mute_track": "act", "add_transition": "act", "set_speed": "act", "propose_filler_cuts": "terminal"}
 
+BROLL_COLOUR = 7  # Premiere's marker colour index 7 (Cyan), reserved for B-roll markers
+
+ENVATO_OFF = ("Envato search is switched off in this run: for B-roll, give the search terms to use for each spot "
+              "instead of Envato clips, and put only the search terms in the marker comments.")
+ENVATO_DOWN = ("Envato search is unavailable right now (the Envato server couldn't be reached): for B-roll, give the "
+               "search terms to use for each spot instead of Envato clips, and put only the search terms in the "
+               "marker comments.")
+
 SYSTEM = """You are the assistant inside Genius Cut, a Premiere Pro panel. The user typed an instruction about \
 the clips they selected on the timeline. You edit the active sequence only through the tools.
 
@@ -437,7 +452,7 @@ one hour on (1:02:05, not 62:05).
 Two kinds of instruction
 1. A filler-word or pause trim ("trim the ums", "tighten the pauses"): call propose_filler_cuts with clear \
 instructions, as your only tool call. It needs no plan; it ends the run and opens Genius Cut's trim review.
-2. A timeline edit (markers, cuts, deletes, splits, moves, gaps, angles, on/off, volume, mutes, transitions, \
+2. A timeline edit (markers, B-roll markers, cuts, deletes, splits, moves, gaps, angles, on/off, volume, mutes, transitions, \
 speed): plan first, then act after approval.
 If an instruction mixes a trim with other edits, do the trim first: your plan says the trim runs now and asks \
 the user to send the other edits afterwards as a new instruction; after approval call propose_filler_cuts.
@@ -461,6 +476,23 @@ audio join").
 transition, the plan must say so ("Undo won't remove the transition; remove it by hand").
 - set_speed keeps each clip's place and length; choose a clip's own sound with its picture so they stay in sync.
 
+B-roll markers ("mark B-roll spots", "where do I need B-roll?")
+- A planned edit with add_markers. Read what is said in the selected clips (get_transcript, then wait_transcript \
+if needed) and pick the spots that need B-roll: where the speaker names or describes something the viewer could \
+see, lists things, or talks to camera for long. Each spot is a time range inside the selected clips.
+- For each spot, search Envato Elements with search_stock_video: 1-3 phrasings per spot, searchTerms short and \
+visual (what would be on screen, e.g. "typing on laptop close up", under 60 characters), perPage about 5, \
+filters orientation horizontal and categories "Stock Footage" unless the user asks for vertical or motion \
+graphics. Use search_photos only when the user asks for photos. Envato search is read-only and needs no \
+approval; Anthropic runs it for you.
+- The plan lists each spot: its time range (m:ss-m:ss), the short idea, and the best 2-3 Envato clips by title \
+with their item_url links.
+- After approval, one add_markers call with one range marker per spot: atS and endS = the spot, name "B-roll: \
+<short idea>", colour """ + str(BROLL_COLOUR) + """ (reserved for B-roll; don't use it for other markers), \
+comments = "Search: <the search terms used>" and then each chosen clip as "<title> - <item_url>", one per line.
+- Never download or place clips: B-roll is markers only. If an Envato search errors or Envato is unavailable, \
+the plan gives the search terms only and the comments hold just the search terms.
+
 After "Approved: do exactly this plan."
 - Do exactly the plan: nothing more, nothing less. Call get_sequence again after each edit, because clip ids \
 change. If a tool refuses, stop and say what happened.
@@ -483,6 +515,8 @@ class Run:
     steps: int = 0
     waiting: list[str] = field(default_factory=list)  # tool_use ids the panel must answer
     plan_ready: bool = False
+    envato: bool = False  # Envato search rides along on this run's steps
+    envato_note: str = ""  # what Claude is told when it doesn't (ENVATO_OFF / ENVATO_DOWN)
     last_usage: tuple[int, int] | None = None  # (all input incl. cache, output) of the last step
     meter: spend.Meter = field(default_factory=lambda: spend.Meter(kind="agent"))
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -511,7 +545,8 @@ class Runs:
             return self._stopped(Run(id=run_id, client=None), "key", str(e))
         except LLMError as e:
             return self._stopped(Run(id=run_id, client=None), "error", str(e))
-        run = Run(id=run_id, client=client)
+        envato = claude.envato_enabled()
+        run = Run(id=run_id, client=client, envato=envato, envato_note="" if envato else ENVATO_OFF)
         first = (f"Instruction: {instruction.strip()}\n\n"
                  f"Selected clips (snapshot taken when the instruction was sent):\n{json.dumps(selection)}\n\n"
                  f"Sequence summary:\n{json.dumps(sequence)}")
@@ -584,9 +619,11 @@ class Runs:
             return self._stopped(run, "step_cap", f"Stopped after {MAX_STEPS} Claude steps without finishing. "
                                                   "What ran so far can be undone; try a smaller instruction.")
         try:
-            with spend.meter(kind="agent", run=run.id, m=run.meter):
-                response = self.step(run.messages, TOOLS, SYSTEM, client=run.client,
-                                     input_tokens=self._estimate(run, new_chars))
+            try:
+                response = self._call(run, new_chars)
+            except claude.EnvatoUnavailable:  # once per run: Envato stays off from here on
+                run.envato, run.envato_note = False, ENVATO_DOWN
+                response = self._call(run, new_chars)
         except spend.BudgetExceeded as e:
             return self._stopped(run, "limit", str(e))
         except (secrets.MissingKeyError, claude.KeyRejected) as e:
@@ -607,6 +644,8 @@ class Runs:
             return self._stopped(run, "max_tokens", "Claude's reply was cut off, so nothing from it was run. "
                                                     "Try a smaller instruction.")
         run.messages.append({"role": "assistant", "content": response.content})  # whole, never edited
+        if stop == "pause_turn":  # a server-side tool loop paused (Envato searches): let Claude go on
+            return self._step(run, 0)
         text = "".join(getattr(b, "text", "") for b in response.content if getattr(b, "type", None) == "text")
         calls = [{"id": b.id, "name": b.name, "input": b.input}
                  for b in response.content if getattr(b, "type", None) == "tool_use"]
@@ -620,6 +659,12 @@ class Runs:
             return self._reply(run, "done", text=text)
         run.plan_ready = True
         return self._reply(run, "plan", text=text)
+
+    def _call(self, run: Run, new_chars: int):
+        system = SYSTEM + ("\n\n" + run.envato_note if run.envato_note else "")
+        with spend.meter(kind="agent", run=run.id, m=run.meter):
+            return self.step(run.messages, TOOLS, system, client=run.client,
+                             input_tokens=self._estimate(run, new_chars), envato=run.envato)
 
     def _stopped(self, run: Run, reason: str, message: str) -> dict:
         self.cancel(run.id)

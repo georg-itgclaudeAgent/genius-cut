@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en" data-composition-variables='[
+  {"id":"title","type":"string","label":"Title","default":"How an email gets authenticated"},
+  {"id":"steps","type":"string","label":"Steps","default":"mail=You send|server=Server signs|shield=Inbox checks"},
+  {"id":"accent","type":"color","label":"Accent","default":"#FF7A51"}
+]'>
+  <head>
+    <meta charset="UTF-8" />
+    <!-- itGenius explainer scene: a Deep Navy panel with a title, then 2-4 nodes (an icon in a circle + a label)
+         joined by arrows, appearing one after another across the length so each lands on its spoken words.
+         `steps` is "icon=Label|icon=Label|…"; icons are the files in assets/icons/ (check, cross, shield, lock, key,
+         mail, user, cloud, server, phone, globe, alert, chart, arrow-right, star, gear). Change `beats` below to
+         put each node on a transcript time (seconds from the graphic's start). The last node gets the accent
+         ring. Everything leaves before the end. Works at 1920x1080 and 1080x1920 (nodes stack). -->
+    <link rel="stylesheet" href="assets/tokens.css" />
+    <script src="assets/gsap.min.js"></script>
+    <style>
+      @font-face { font-family: "Outfit"; src: url("assets/fonts/Outfit-Variable.ttf") format("truetype");
+                   font-weight: 100 900; font-display: block; }
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body { background: transparent; overflow: hidden; }
+      #root { position: relative; width: 100%; height: 100%; overflow: hidden; font-family: "Outfit"; color: #FFFFFF; }
+      #panel { position: absolute; inset: 120px; background: #112A33;
+               clip-path: polygon(0 0, 100% 0, calc(100% - 90px) 100%, 0 100%); }
+      #content { position: absolute; inset: 120px; display: flex; flex-direction: column; justify-content: center;
+                 align-items: center; gap: 70px; padding: 60px 110px 60px 60px; }
+      #title { display: block; font-weight: 700; font-size: 68px; line-height: 80px; text-align: center;
+               letter-spacing: -0.01em; }
+      #flow { display: flex; align-items: center; justify-content: center; gap: 36px; }
+      .node { display: flex; flex-direction: column; align-items: center; gap: 24px; width: 300px; }
+      .ring { display: flex; align-items: center; justify-content: center; width: 168px; height: 168px;
+              border-radius: 50%; background: #009BD0; }
+      .node.last .ring { background: var(--accent, #FF7A51); }
+      .ring img { display: block; width: 92px; height: 92px; }
+      .label { font-weight: 300; font-size: 38px; line-height: 46px; text-align: center; }
+      .arrow { display: block; width: 90px; height: 10px; background: #FFFFFF; position: relative; }
+      .arrow::after { content: ""; position: absolute; right: -6px; top: -11px; border-left: 24px solid #FFFFFF;
+                      border-top: 16px solid transparent; border-bottom: 16px solid transparent; }
+      #root.tall #flow { flex-direction: column; gap: 28px; }
+      #root.tall .arrow { width: 10px; height: 60px; }
+      #root.tall .arrow::after { right: -11px; top: auto; bottom: -6px; border-left: 16px solid transparent;
+                                 border-right: 16px solid transparent; border-top: 24px solid #FFFFFF; border-bottom: 0; }
+    </style>
+  </head>
+  <body>
+    <div id="root" data-composition-id="main" data-start="0" data-duration="8" data-width="1920" data-height="1080"
+         data-fps="30">
+      <div id="scene" class="clip" data-start="0" data-duration="8" data-track-index="0">
+        <div id="panel"></div>
+        <div id="content">
+          <div id="title" data-var-text="title">How an email gets authenticated</div>
+          <div id="flow"></div>
+        </div>
+      </div>
+    </div>
+    <script>
+      const v = window.__hyperframes.getVariables();
+      const root = document.getElementById("root");
+      const D = Number(root.dataset.duration);
+      if (Number(root.dataset.height) > Number(root.dataset.width)) root.classList.add("tall");
+      const ICONS = ["check", "cross", "shield", "lock", "key", "mail", "user", "cloud", "server", "phone", "globe",
+                     "alert", "chart", "arrow-right", "star", "gear"];
+      const steps = String(v.steps).split("|").map(s => s.trim()).filter(Boolean).slice(0, 4).map(s => {
+        const i = s.indexOf("=");
+        const icon = i > 0 ? s.slice(0, i).trim() : "check";
+        return { icon: ICONS.includes(icon) ? icon : "check", label: i > 0 ? s.slice(i + 1).trim() : s };
+      });
+      const flow = document.getElementById("flow");
+      const nodes = [], arrows = [];
+      steps.forEach((step, i) => {
+        if (i) { const a = document.createElement("div"); a.className = "arrow"; a.id = "arrow" + i;
+                 flow.appendChild(a); arrows.push(a); }
+        const n = document.createElement("div");
+        n.className = "node" + (i === steps.length - 1 ? " last" : "");
+        n.id = "node" + i;
+        const ring = document.createElement("div");
+        ring.className = "ring";
+        const img = document.createElement("img");
+        img.src = "assets/icons/" + step.icon + ".svg";
+        img.alt = step.icon;
+        ring.appendChild(img);
+        const label = document.createElement("div");
+        label.className = "label";
+        label.textContent = step.label;
+        n.appendChild(ring);
+        n.appendChild(label);
+        flow.appendChild(n);
+        nodes.push(n);
+      });
+      // When each node appears (seconds from the start): spread evenly between 1.0 s and the exit.
+      const out = Math.max(2.5, D - 0.8);
+      const gap = (out - 1.6) / Math.max(1, nodes.length);
+      const beats = nodes.map((_, i) => 1.0 + i * gap);
+
+      const tl = gsap.timeline({ paused: true });
+      tl.fromTo("#panel", { clipPath: "polygon(0 0, 0 0, -90px 100%, 0 100%)" },
+                { clipPath: "polygon(0 0, 100% 0, calc(100% - 90px) 100%, 0 100%)", duration: 0.6, ease: "power3.out" }, 0)
+        .fromTo("#title", { opacity: 0, y: 24 }, { opacity: 1, y: 0, duration: 0.5, ease: "power3.out" }, 0.35);
+      nodes.forEach((n, i) => {
+        if (i) tl.fromTo(arrows[i - 1], { opacity: 0, scale: 0.4 }, { opacity: 1, scale: 1, duration: 0.35, ease: "power2.out" }, beats[i] - 0.25);
+        tl.fromTo(n.querySelector(".ring"), { scale: 0.3, opacity: 0 }, { scale: 1, opacity: 1, duration: 0.5, ease: "back.out(1.6)" }, beats[i])
+          .fromTo(n.querySelector(".label"), { opacity: 0, y: 16 }, { opacity: 1, y: 0, duration: 0.4, ease: "power3.out" }, beats[i] + 0.15);
+      });
+      tl.to("#content", { opacity: 0, duration: 0.3, ease: "power2.in" }, out)
+        .to("#panel", { clipPath: "polygon(0 0, 0 0, -90px 100%, 0 100%)", duration: 0.45, ease: "power3.in" }, out + 0.15);
+      window.__timelines["main"] = tl;
+    </script>
+  </body>
+</html>

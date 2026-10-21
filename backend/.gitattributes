@@ -1,0 +1,2 @@
+# The graphics brand kit is copied byte for byte into every render (the GSAP hash is checked): no line-ending changes.
+geniuscut/graphics_kit/** -text

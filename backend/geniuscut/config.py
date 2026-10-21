@@ -7,8 +7,9 @@ from pathlib import Path
 VERSION = "0.2.0"
 # Bumped whenever the panel <-> backend contract changes, so a panel can tell an outdated
 # backend left running from an earlier version and restart it.
-API_VERSION = 6  # 3: frame_s (clean cuts, 2026-10-08); 4: /transcript jobs (assistant, 2026-10-14);
-# 5: /settings + Claude Opus 5.5 default (2026-10-14); 6: /setup, /usage, /agent/runs (in-panel assistant, 2026-10-14)
+API_VERSION = 7  # 3: frame_s (clean cuts, 2026-10-08); 4: /transcript jobs (assistant, 2026-10-14);
+# 5: /settings + Claude Opus 5.5 default (2026-10-14); 6: /setup, /usage, /agent/runs (in-panel assistant, 2026-10-14);
+# 7: /graphics/status + /graphics/setup, graphics in agent runs (motion graphics, 2026-10-21)
 HOST = "127.0.0.1"
 PORT = 8791
 

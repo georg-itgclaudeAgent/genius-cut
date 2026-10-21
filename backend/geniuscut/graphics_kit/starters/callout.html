@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en" data-composition-variables='[
+  {"id":"text","type":"string","label":"Callout text","default":"3 steps to safer email"},
+  {"id":"x","type":"number","label":"Left edge, % of the width","default":55,"min":6,"max":70},
+  {"id":"y","type":"number","label":"Top edge, % of the height","default":22,"min":11,"max":80},
+  {"id":"accent","type":"color","label":"Accent","default":"#FF7A51"}
+]'>
+  <head>
+    <meta charset="UTF-8" />
+    <!-- itGenius callout / kinetic text: a navy tag with a coral accent edge; the words pop up one after another
+         (~0.08 s apart, 0.45 s each, power3.out) and drop away before the end. Place it with x / y (percent),
+         away from the speaker's face; time it to the spoken words. -->
+    <link rel="stylesheet" href="assets/tokens.css" />
+    <script src="assets/gsap.min.js"></script>
+    <style>
+      @font-face { font-family: "Outfit"; src: url("assets/fonts/Outfit-Variable.ttf") format("truetype");
+                   font-weight: 100 900; font-display: block; }
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body { background: transparent; overflow: hidden; }
+      #root { position: relative; width: 100%; height: 100%; overflow: hidden; font-family: "Outfit"; }
+      #tag { position: absolute; left: 55%; top: 22%; max-width: calc(45% - 120px); }
+      #box { position: relative; display: block; padding: 26px 64px 30px 44px; background: #112A33;
+             clip-path: polygon(0 0, 100% 0, calc(100% - 36px) 100%, 0 100%); }
+      #edge { position: absolute; left: 0; top: 0; bottom: 0; width: 12px; background: var(--accent, #FF7A51); }
+      #words { display: flex; flex-wrap: wrap; column-gap: 0.28em; row-gap: 4px; max-width: 760px; color: #FFFFFF;
+               font-weight: 700; font-size: 64px; line-height: 74px; letter-spacing: -0.01em; }
+      .w { display: inline-block; }
+    </style>
+  </head>
+  <body>
+    <div id="root" data-composition-id="main" data-start="0" data-duration="3" data-width="1920" data-height="1080"
+         data-fps="30">
+      <div id="tag" class="clip" data-start="0" data-duration="3" data-track-index="0">
+        <div id="box"><div id="edge"></div><div id="words"></div></div>
+      </div>
+    </div>
+    <script>
+      const v = window.__hyperframes.getVariables();
+      const root = document.getElementById("root");
+      const D = Number(root.dataset.duration);
+      const tag = document.getElementById("tag");
+      // Inside the 120 px safe margins whatever x / y say; the tag wraps instead of running off the right.
+      tag.style.left = "max(120px, " + v.x + "%)";
+      tag.style.top = "max(120px, " + v.y + "%)";
+      tag.style.maxWidth = "calc(" + (100 - v.x) + "% - 120px)";
+      const words = document.getElementById("words");
+      String(v.text).split(/\s+/).filter(Boolean).forEach((word, i) => {
+        const s = document.createElement("span");
+        s.className = "w";
+        s.id = "w" + i;
+        s.textContent = word;
+        words.appendChild(s);
+      });
+      const out = Math.max(1.2, D - 0.5);
+      const tl = gsap.timeline({ paused: true });
+      tl.fromTo("#box", { clipPath: "polygon(0 0, 0 0, -36px 100%, 0 100%)" },
+                { clipPath: "polygon(0 0, 100% 0, calc(100% - 36px) 100%, 0 100%)", duration: 0.45, ease: "power3.out" }, 0)
+        .fromTo(".w", { yPercent: 60, opacity: 0 }, { yPercent: 0, opacity: 1, duration: 0.45, ease: "power3.out",
+                stagger: 0.08 }, 0.15)
+        .to("#words", { opacity: 0, duration: 0.2, ease: "power2.in" }, out)
+        .to("#box", { clipPath: "polygon(0 0, 0 0, -36px 100%, 0 100%)", duration: 0.3, ease: "power3.in" }, out + 0.1);
+      window.__timelines["main"] = tl;
+    </script>
+  </body>
+</html>

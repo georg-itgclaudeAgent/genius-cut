@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { createTools, undoTurn, TOOL_ARGS, type ToolDeps } from "./tools";
+import { createTools, undoTurn, clock, TOOL_ARGS, type ToolDeps } from "./tools";
 import { createTurns, type TurnStore } from "./turns";
 import type { TranscriptJob, TranscriptRequest } from "../api/types";
 
@@ -382,6 +382,17 @@ describe("the bridge's tool table", () => {
         "gcutToolReplaceGraphic", { ok: true, track: "V3", startS: 72, endS: 77.5, idMap: { "V3@1#g": ["V3@1#h"] },
           undo: { kind: "graphic-replace", sequenceId: SEQ } }, "Swapped spf-title to v2"],
     ];
+
+    it("result lines name times as m:ss below an hour and h:mm:ss from one hour on", async () => {
+      expect([0, 5, 59.6, 72, 3599, 3599.6, 3600, 30006, 36000].map(clock)).toEqual(
+        ["0:00", "0:05", "1:00", "1:12", "59:59", "1:00:00", "1:00:00", "8:20:06", "10:00:00"]);
+      expect(clock(-3)).toBe("0:00");
+      const f = fakes();
+      const reply = { ok: true, track: "V3", startS: 30006, endS: 30012, newIds: ["V3@1#g"], idMap: {}, undo: { kind: "graphic-place", sequenceId: SEQ } };
+      const deps: ToolDeps = { ...f.deps, callHost: async () => structuredClone(reply) };
+      await createTools(deps).place_graphic.run({ sequenceId: SEQ, path: "D:/g/x/v1/x.mov", atS: 30006 });
+      expect(f.turns.latest(SEQ)!.actions[0].summary).toBe("Placed x on V3 at 8:20:06–8:20:12");
+    });
 
     it("place_graphic also takes the panel's own aboveTrack (the selection's highest video track), which Claude's schema hasn't", async () => {
       const f = fakes();

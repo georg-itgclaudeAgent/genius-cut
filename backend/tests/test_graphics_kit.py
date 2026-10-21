@@ -97,6 +97,20 @@ def test_each_starter_animates_in_on_brand_and_out_before_the_end(kind):
     assert "120px" in html  # safe margin
 
 
+@pytest.mark.parametrize("kind", ["card", "explainer-scene"])
+def test_full_screen_starters_fill_the_frame_with_legible_sizes(kind):
+    html = STARTERS[kind]
+    bg = re.search(r"#bg \{([^}]*)\}", html).group(1)
+    assert "inset: 0" in bg and "#112A33" in bg and "clip-path" not in bg  # edge to edge at rest
+    assert "#panel" not in html
+    sizes = {m.group(1).strip(): int(m.group(2)) for m in re.finditer(r"([#.][^{}]*?)\{[^}]*?font-size: (\d+)px", html)}
+    assert sizes["#title"] >= 64
+    assert all(px >= 34 for px in sizes.values()), sizes
+    if kind == "explainer-scene":
+        icon = re.search(r"\.ring img \{[^}]*width: (\d+)px; height: (\d+)px", html)
+        assert min(int(icon.group(1)), int(icon.group(2))) >= 96
+
+
 def test_the_card_covers_list_steps_comparison_and_chart():
     raw = re.search(r"data-composition-variables='(.*?)'>", STARTERS["card"], re.S).group(1)
     mode = next(v for v in json.loads(raw) if v["id"] == "mode")

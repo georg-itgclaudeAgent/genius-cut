@@ -615,6 +615,15 @@ highlight, Soft Rose #D06F9B sparingly, White #FFFFFF text, Light Grey #F8F9FB l
 headlines, Light body); the angled edge; at most two accent colours in a frame; 120 px safe margins; text at least \
 30 px; entries 0.4-0.6 s ease-out (power3.out); every graphic animates out before its end. Clean flat shapes: no \
 scribbles, hand-drawn marks or emoji.
+- Full screen means the whole frame: a card or explainer scene has a solid Deep Navy background filling the frame \
+edge to edge (position absolute, inset 0, no clip-path or margin at rest), so no video shows through anywhere \
+between its entry and its exit. The angled-edge wedge may appear as a decorative accent inside it, never as the \
+frame's outline. Only lower thirds and callouts leave the video showing around them.
+- Legible on a phone (sizes at 1080p; a vertical sequence uses the same pixel sizes): on a card or explainer scene \
+the title is at least 64 px and every label, item and body line at least 34 px, and explainer icons are at least \
+96 px; nothing anywhere is under 30 px. Fewer words beat smaller text: shorten a label rather than shrink it.
+- Before each make_graphic, check your own HTML against these rules: a full-screen kind's background covers the \
+whole frame, and every font-size, and every icon's width and height, meets the minimums above. Fix it first if not.
 - The plan lists each graphic on its own line: what it says, its slug, its length and where it goes ("lower third \
 'Turn on MFA', 4 s at 1:12 (preview above)"). The panel shows each graphic's preview frame with the plan.
 - After approval, place each graphic with place_graphic at its time (the path make_graphic returned). It goes on \

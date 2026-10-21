@@ -70,10 +70,11 @@ function graphicOf(path: unknown): { slug: string; version: string } {
   return { slug: (parts.at(-1) ?? "").replace(/\.[^.]*$/, ""), version: parts.at(-2) ?? "" };
 }
 
-/** Sequence seconds as m:ss ("1:12"). */
-function clock(s: number): string {
+/** Sequence seconds as m:ss below an hour ("1:12"), h:mm:ss from one hour on ("8:20:06"). */
+export function clock(s: number): string {
   const t = Math.round(Math.max(0, Number(s) || 0));
-  return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, "0")}`;
+  const h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), sec = String(t % 60).padStart(2, "0");
+  return h ? `${h}:${String(m).padStart(2, "0")}:${sec}` : `${m}:${sec}`;
 }
 
 /**

@@ -93,7 +93,9 @@ def test_the_system_prompt_covers_graphics():
     for phrase in ("read_graphic \"starter-<kind>\"", "One make_graphic per reply", "after 3 failures",
                    "Timing from the transcript", "#112A33", "120 px safe margins", "at least 30 px",
                    "every graphic animates out", "place_graphic", "replace_graphic", "the user selects the graphic clip",
-                   "(preview above)", "no scribbles"):
+                   "(preview above)", "no scribbles", "Full screen means the whole frame", "edge to edge",
+                   "never as the frame's outline", "at least 64 px", "at least 34 px", "at least 96 px",
+                   "Before each make_graphic, check your own HTML"):
         assert phrase in s, phrase
 
 

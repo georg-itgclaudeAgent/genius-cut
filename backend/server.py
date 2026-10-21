@@ -17,7 +17,8 @@ also stops DNS-rebinding tricks.
 the monthly limit; never a key), and `POST /settings/test-key` checks a key source (a pass saves it
 and marks setup complete). `/setup/*` and `/usage` serve the Setup and Settings screens; their
 request/response shapes are listed at the top of geniuscut/setup.py. `/agent/runs*` run Claude's
-side of an instruction (shapes at the top of geniuscut/agent.py).
+side of an instruction (shapes at the top of geniuscut/agent.py). `/graphics/*` report and run the one-time
+graphics setup (shapes at the top of geniuscut/graphics.py).
 
 AI errors: a missing key is 503, the monthly spend limit (`spend.BudgetExceeded`) is
 402, and any other provider error is 502. `/health` reports the AI provider, model and
@@ -45,7 +46,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field
 
-from geniuscut import agent, audio, claude, config, cuts, library, llm, secrets, settings, setup, spend, transcripts, trim
+from geniuscut import (agent, audio, claude, config, cuts, graphics, library, llm, secrets, settings, setup, spend,
+                       transcripts, trim)
 from geniuscut.llm import LLMError
 from geniuscut.models import StyleExample, TranscriptJob, TranscriptRequest, TrimRequest, TrimResponse, Word
 
@@ -113,6 +115,8 @@ def create_app(
     find_gcloud: Callable[[], str | None] = setup.find_gcloud,
     login: setup.Login | None = None,
     agent_runs: agent.Runs | None = None,
+    graphics_engine: graphics.Engine | None = None,
+    graphics_setup: graphics.Setup | None = None,
 ) -> FastAPI:
     llm_cost = globals()["llm"].run_cost  # the `llm` parameter shadows the module in here
     app = FastAPI(title="Genius Cut backend", version=config.VERSION)
@@ -294,6 +298,21 @@ def create_app(
     @app.get("/usage", dependencies=auth)
     def get_usage() -> dict:
         return spend.usage()
+
+    # ── graphics (shapes: geniuscut/graphics.py) ───────────────────────
+    engine = graphics_engine or graphics.Engine()
+    graphics_job = graphics_setup or graphics.Setup(engine)
+
+    @app.get("/graphics/status", dependencies=auth)
+    def get_graphics_status() -> dict:
+        return {**engine.status(), "setup": graphics_job.status()}
+
+    @app.post("/graphics/setup", dependencies=auth, status_code=202)
+    def post_graphics_setup() -> dict:
+        try:
+            return graphics_job.start()
+        except graphics.SetupBusy as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
 
     # ── agent runs (shapes: geniuscut/agent.py) ────────────────────────
     runs = agent_runs or agent.Runs()

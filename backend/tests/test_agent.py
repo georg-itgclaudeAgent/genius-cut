@@ -111,7 +111,7 @@ PIECE_4 = ["delete_clips", "close_gaps", "split_at", "set_clip_enabled", "move_c
 def test_the_tools_offered_are_the_whole_toolbox_plus_propose_filler_cuts_never_undo():
     names = [t["name"] for t in agent.TOOLS]
     assert names == ["get_sequence", "get_transcript", "wait_transcript", "add_markers", "cut_ranges", *PIECE_4,
-                     "propose_filler_cuts"]
+                     "make_graphic", "read_graphic", "place_graphic", "replace_graphic", "propose_filler_cuts"]
     assert all(t["input_schema"]["type"] == "object" and t["description"] for t in agent.TOOLS)
     assert all(t["input_schema"].get("additionalProperties") is False for t in agent.TOOLS)
     assert "undo_last_turn" not in json.dumps(agent.TOOLS)
@@ -155,7 +155,7 @@ def test_first_step_request_shape(tmp_path):
     assert body["state"] == "tool_calls" and body["run_id"]
     assert body["tool_calls"] == [{"id": "t1", "name": "get_sequence", "input": {}}]
     kw = fake.calls[0]
-    assert kw["model"] == "claude-opus-5-5" and kw["max_tokens"] == 16000
+    assert kw["model"] == "claude-opus-5-5" and kw["max_tokens"] == 32000
     assert kw["output_config"] == {"effort": "high"} and kw["tool_choice"] == {"type": "auto"}
     assert kw["cache_control"] == {"type": "ephemeral"}
     assert kw["betas"] == [claude.FALLBACK_BETA, claude.MCP_BETA] and kw["fallbacks"] == "default"

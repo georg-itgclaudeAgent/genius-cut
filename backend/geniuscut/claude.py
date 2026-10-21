@@ -39,7 +39,7 @@ from geniuscut.errors import LLMError
 
 MODEL = os.environ.get("GENIUSCUT_CLAUDE_MODEL", "claude-opus-5-5")
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
-AGENT_MAX_TOKENS = 16000
+AGENT_MAX_TOKENS = 32000  # a whole explainer composition plus thinking fits in one reply
 MCP_BETA = "mcp-client-2025-11-20"
 ENVATO_SERVER = {"type": "url", "url": "https://mcp.envato.com/mcp", "name": "envato"}
 # Search only: every other Envato tool (downloads, licences…) stays off.

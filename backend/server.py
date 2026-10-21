@@ -81,6 +81,13 @@ class AgentStart(BaseModel):
     instruction: str = Field(pattern=r"\S")
     selection: dict | list = {}
     sequence: dict = {}
+    # for graphics (all optional; make_graphic refuses without them): app.project.path, the sequence's
+    # timebase (ticks per frame) or fps, and its frame size
+    projectPath: str = ""
+    timebase: str | int | None = None
+    fps: float | str | None = None
+    width: int | None = None
+    height: int | None = None
 
 
 class ToolResult(BaseModel):
@@ -315,7 +322,7 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(e)) from e
 
     # ── agent runs (shapes: geniuscut/agent.py) ────────────────────────
-    runs = agent_runs or agent.Runs()
+    runs = agent_runs or agent.Runs(engine=engine)
 
     def agent_call(fn, *args) -> dict:
         try:
@@ -325,7 +332,8 @@ def create_app(
 
     @app.post("/agent/runs", dependencies=auth)
     def post_agent_run(body: AgentStart) -> dict:
-        return agent_call(runs.start, body.instruction, body.selection, body.sequence)
+        context = {k: getattr(body, k) for k in ("projectPath", "timebase", "fps", "width", "height")}
+        return agent_call(runs.start, body.instruction, body.selection, body.sequence, context)
 
     @app.post("/agent/runs/{run_id}/results", dependencies=auth)
     def post_agent_results(run_id: str, body: AgentResults) -> dict:

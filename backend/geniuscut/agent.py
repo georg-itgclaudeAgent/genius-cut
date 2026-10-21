@@ -1,9 +1,12 @@
 """The Claude side of an instruction run: the panel drives the tools, the backend owns Claude.
 
 HTTP routes (all need `Authorization: Bearer <token>`; errors are `{"detail": "..."}`):
-- `POST /agent/runs` `{"instruction": str (not blank), "selection": object, "sequence": object}`
+- `POST /agent/runs` `{"instruction": str (not blank), "selection": object, "sequence": object,
+  "projectPath"?: str, "timebase"?: str|int, "fps"?: number|str, "width"?: int, "height"?: int}`
   → step reply. `selection` is the selection snapshot taken when the instruction was sent (clip ids,
-  span…), `sequence` a summary of the active sequence; both are passed to Claude as JSON.
+  span…), `sequence` a summary of the active sequence; both are passed to Claude as JSON. The optional
+  graphics fields are `app.project.path` ("" = unsaved), the sequence's timebase (ticks per frame; or fps)
+  and frame size; only make_graphic uses them (it refuses an unsaved project or another size).
 - `POST /agent/runs/{run_id}/results` `{"results": [{"tool_use_id": str, "content": str, "is_error": bool}]}`
   → step reply. Exactly one result per tool call of the last reply (any order), else 422; 409 when the
   run isn't waiting for results.
@@ -19,12 +22,21 @@ Step reply (HTTP 200):
   "text": str,                                                  # Claude's text in this reply ("" if none)
   "message": str|null, "reason": "limit"|"key"|"error"|"refusal"|"max_tokens"|"step_cap"|null,  # "stopped" only
   "cost": {"model": str, "input_tokens": int, "output_tokens": int, "usd": float|null,
-           "month_usd": float, "limit_usd": float}}            # usd = this run's total so far
+           "month_usd": float, "limit_usd": float},            # usd = this run's total so far
+  "graphics": [{"slug": str, "version": int, "preview": str, "path": str, "duration_s": float}]}
+                                         # newest version of every graphic made in this run (preview = PNG path)
+  reason also "graphics" (a graphic failed 3 times) and "cancelled" (DELETE while a step was working).
 - `tool_calls`: run them (act tools before approval answer "Not approved yet: describe the plan
   instead" with is_error true) and post the results.
 - `plan`: Claude's plan (text) before approval; show Go / Cancel. Go = approve.
 - `done`: the approved run finished; text is Claude's summary. The run is closed.
 - `stopped`: the run is closed; show `message` (for `limit`, the exact limit message).
+- Backend tools (TOOL_KINDS "backend": make_graphic, read_graphic) run here, in order, before the reply;
+  they never appear in `tool_calls` and the panel never answers them. A reply with only backend tools
+  steps again at once (counted toward the cap); with panel tools too, `tool_calls` holds only the panel
+  ones and, when their results come, every result goes to Claude in the reply's tool_use order. One
+  make_graphic per reply (a second gets an error result); per slug, the third failed make_graphic stops
+  the run. DELETE sets the run's cancel event: a running render is killed and no Claude call follows.
 - `propose_filler_cuts` is terminal: a `tool_calls` reply containing it closes the run on the
   backend. The panel runs today's Analyse with its `instructions` and opens the review; it posts no
   results.
@@ -51,7 +63,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable
 
-from geniuscut import claude, llm, secrets, spend
+from geniuscut import claude, graphics, llm, secrets, spend
 from geniuscut.errors import LLMError
 
 MAX_STEPS = 25
@@ -400,6 +412,86 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "make_graphic",
+        "description": (
+            "Write and render a motion graphic (runs in the backend, no timeline change, allowed before and after "
+            "approval). html is a whole HyperFrames composition (start from read_graphic \"starter-<kind>\"); the "
+            "backend saves it as the next version <project folder>/Genius Cut Graphics/<slug>/v<N>/, sets the root's "
+            "size, frame rate and data-duration (elements that ran the old full length follow duration_s), runs "
+            "HyperFrames' check, renders a transparent MOV at the sequence's frame rate and size, and a preview frame "
+            "at previewAtS (default 40 % in, at most 1.5 s). Returns {slug, version, path, preview, duration_s, "
+            "renderSeconds, warnings}, or the check / render errors to fix. One make_graphic per reply. A rendered "
+            "graphic is placed only by place_graphic (or replace_graphic) after approval."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "slug": {"type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$", "maxLength": 40,
+                         "description": "Short lowercase name, hyphens between words (\"mfa-lower-third\"). The same "
+                                        "slug makes a new version of that graphic."},
+                "kind": {"type": "string", "enum": list(graphics.KINDS), "description": "Which kind of graphic."},
+                "duration_s": {"type": "number", "minimum": graphics.MIN_DURATION_S,
+                               "maximum": graphics.MAX_DURATION_S, "description": "Its length in seconds."},
+                "html": {"type": "string", "minLength": 1, "description": "The whole composition HTML."},
+                "variables": {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean"]},
+                              "description": "Optional values for the composition's declared variables, by id."},
+                "previewAtS": {"type": "number", "minimum": 0,
+                               "description": "Optional: where the preview frame is taken, seconds from the "
+                                              "graphic's start (pick the moment it reads best)."},
+            },
+            "required": ["slug", "kind", "duration_s", "html"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "read_graphic",
+        "description": (
+            "Read a graphic's newest version (runs in the backend): {slug, kind, version, versions, duration_s, "
+            "variables, path, preview, html}. \"starter-lower-third\", \"starter-callout\", \"starter-card\" and "
+            "\"starter-explainer-scene\" return the itGenius starter for that kind ({slug, starter, kind, html})."),
+        "input_schema": {
+            "type": "object",
+            "properties": {"slug": {"type": "string", "minLength": 1,
+                                    "description": "The graphic's slug, or starter-<kind>."}},
+            "required": ["slug"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "place_graphic",
+        "description": (
+            "Put a rendered graphic (the path make_graphic returned) on the timeline at atS: it is imported into the "
+            "\"Genius Cut Graphics\" bin and laid on the lowest video track above the selection's tracks that is "
+            "empty over its whole length. Refused if no such track is free (\"add a video track\") or atS is "
+            "outside the selected clips' span. Returns newIds: [the laid clip's id]. " + _SECONDS + " " + _UNDO),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sequenceId": _SEQ_ID,
+                "path": {"type": "string", "minLength": 1, "description": "The MOV path make_graphic returned."},
+                "atS": {"type": "number", "minimum": 0, "description": "Where the graphic starts. " + _SECONDS},
+            },
+            "required": ["sequenceId", "path", "atS"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "replace_graphic",
+        "description": (
+            "Swap a placed graphic clip for another version (the path make_graphic returned): the new version starts "
+            "at the same time on the same track with its own length; refused if anything is in the way of the new "
+            "length. Returns idMap {old id: [new id]}. " + _STALE + " " + _UNDO),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sequenceId": _SEQ_ID,
+                "clipId": {"type": "string", "description": "The placed graphic clip, its id from get_sequence. " + _STALE},
+                "path": {"type": "string", "minLength": 1, "description": "The new version's MOV path."},
+            },
+            "required": ["sequenceId", "clipId", "path"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "propose_filler_cuts",
         "description": (
             "Hand a filler-word / pause trim of the selected clips to Genius Cut's own trim review: the panel runs "
@@ -419,11 +511,17 @@ TOOLS: list[dict] = [
     },
 ]
 
-# read: any time; act: only after approval (the panel enforces); terminal: ends the run.
+# read: any time; act: only after approval (the panel enforces); terminal: ends the run; backend: run here, in
+# the agent loop (never sent to the panel), any time.
 TOOL_KINDS = {"get_sequence": "read", "get_transcript": "read", "wait_transcript": "read",
               "add_markers": "act", "cut_ranges": "act", "delete_clips": "act", "close_gaps": "act", "split_at": "act",
               "set_clip_enabled": "act", "move_clips": "act", "switch_angle": "act", "set_volume": "act",
-              "mute_track": "act", "add_transition": "act", "set_speed": "act", "propose_filler_cuts": "terminal"}
+              "mute_track": "act", "add_transition": "act", "set_speed": "act",
+              "make_graphic": "backend", "read_graphic": "backend", "place_graphic": "act", "replace_graphic": "act",
+              "propose_filler_cuts": "terminal"}
+
+MAX_GRAPHIC_FAILURES = 3  # per slug per run: the third failed make_graphic ends the run
+ONE_GRAPHIC = "One graphic per reply: make the next one after this result."
 
 BROLL_COLOUR = 7  # Premiere's marker colour index 7 (Cyan), reserved for B-roll markers
 
@@ -493,6 +591,40 @@ comments = "Search: <the search terms used>" and then each chosen clip as "<titl
 - Never download or place clips: B-roll is markers only. If an Envato search errors or Envato is unavailable, \
 the plan gives the search terms only and the comments hold just the search terms.
 
+Motion graphics ("lower third 'Turn on MFA' when I say MFA", "a card listing SPF, DKIM, DMARC for 6 seconds")
+- Four kinds: lower-third (name / title bar), callout (kinetic text popping up at a spot), card (full-screen \
+list, numbered steps, two-column comparison or a simple bar chart), explainer-scene (icons, shapes and labels \
+animating in sequence to the narration).
+- Graphics are made and rendered during the plan, before approval: read the starter for the kind \
+(read_graphic "starter-<kind>"), adapt it (text, variables, layout, timing) or go beyond it for explainer scenes, \
+then make_graphic. One make_graphic per reply: wait for its result before the next. If it returns check or \
+render errors, fix the HTML and call it again; after """ + str(MAX_GRAPHIC_FAILURES) + """ failures of one graphic \
+the run stops.
+- Timing from the transcript: get_transcript (then wait_transcript) for the selected clips, and use the word \
+times: a graphic starts (atS) just before its words are spoken and lasts until they are done (a lower third at \
+least 4 s). In callouts and explainer scenes, time each beat to its words (seconds from the graphic's start).
+- The composition contract: keep the starter's head (assets/tokens.css, assets/gsap.min.js, the inline @font-face \
+for assets/fonts/Outfit-Variable.ttf) and its root <div id="root" data-composition-id="main">; one paused GSAP \
+timeline registered as window.__timelines["main"]; timed elements carry class="clip", data-start and \
+data-duration; author at 1920x1080 (1080x1920 for a vertical sequence; a 4K sequence renders the same layout at \
+twice the pixels). Only files under assets/ (fonts, gsap.min.js, tokens.css, icons/*.svg): no web fonts, CDNs \
+or network, no Math.random or Date.now, no <audio> or <video>. Don't tween a .clip's visibility or autoAlpha; \
+animate its children.
+- itGenius style: Deep Navy #112A33 panels, Blue #009BD0 (the angled-edge wedge), Coral #FF7A51 for one \
+highlight, Soft Rose #D06F9B sparingly, White #FFFFFF text, Light Grey #F8F9FB light cards; Outfit only (Bold \
+headlines, Light body); the angled edge; at most two accent colours in a frame; 120 px safe margins; text at least \
+30 px; entries 0.4-0.6 s ease-out (power3.out); every graphic animates out before its end. Clean flat shapes: no \
+scribbles, hand-drawn marks or emoji.
+- The plan lists each graphic on its own line: what it says, its slug, its length and where it goes ("lower third \
+'Turn on MFA', 4 s at 1:12 (preview above)"). The panel shows each graphic's preview frame with the plan.
+- After approval, place each graphic with place_graphic at its time (the path make_graphic returned). It goes on \
+the lowest free video track above the selection; if it is refused because no track is free, stop and say "add a \
+video track above the clips".
+- Editing a placed graphic ("make it slower", "make the bar coral"): the user selects the graphic clip. Its \
+get_sequence source is ".../Genius Cut Graphics/<slug>/v<N>/<slug>.mov": read_graphic that slug, make_graphic \
+the same slug with the change (a new version; earlier ones are kept), plan "replace <slug> v<N> with v<N+1>", \
+and after approval replace_graphic with the selected clip's id and the new path.
+
 After "Approved: do exactly this plan."
 - Do exactly the plan: nothing more, nothing less. Call get_sequence again after each edit, because clip ids \
 change. If a tool refuses, stop and say what happened.
@@ -520,6 +652,22 @@ class Run:
     last_usage: tuple[int, int] | None = None  # (all input incl. cache, output) of the last step
     meter: spend.Meter = field(default_factory=lambda: spend.Meter(kind="agent"))
     lock: threading.Lock = field(default_factory=threading.Lock)
+    # graphics: the run's project and sequence (from the panel), what was made, failures per slug
+    project_path: str = ""
+    fps: float | str | None = None
+    timebase: str | None = None
+    width: int | None = None
+    height: int | None = None
+    graphics: dict = field(default_factory=dict)  # slug → {slug, version, preview, path, duration_s} (newest)
+    failures: dict = field(default_factory=dict)  # slug → failed make_graphic calls
+    order: list[str] = field(default_factory=list)  # every tool_use id of the last reply, in order
+    pending: dict = field(default_factory=dict)  # tool_use id → backend tool_result block, until the panel posts
+    cancelled: bool = False
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+
+
+class GraphicsStop(Exception):
+    """A graphic failed MAX_GRAPHIC_FAILURES times: the run ends with this message."""
 
 
 def _input_total(usage) -> int:
@@ -530,14 +678,18 @@ def _input_total(usage) -> int:
 class Runs:
     """Agent runs in memory, keyed by id."""
 
-    def __init__(self, make_client: Callable = claude.default_client, step: Callable = claude.agent_step):
+    def __init__(self, make_client: Callable = claude.default_client, step: Callable = claude.agent_step,
+                 engine: graphics.Engine | None = None):
         self.make_client, self.step = make_client, step
+        self.engine = engine or graphics.Engine()
         self._runs: dict[str, Run] = {}
         self._lock = threading.Lock()
 
     # ── public ─────────────────────────────────────────────────────
 
-    def start(self, instruction: str, selection, sequence) -> dict:
+    def start(self, instruction: str, selection, sequence, context: dict | None = None) -> dict:
+        """`context` (all optional): {projectPath, fps, timebase, width, height} of the open project and sequence,
+        used only by make_graphic."""
         run_id = uuid.uuid4().hex
         try:
             client = self.make_client()  # reads the key once for the whole run
@@ -546,10 +698,16 @@ class Runs:
         except LLMError as e:
             return self._stopped(Run(id=run_id, client=None), "error", str(e))
         envato = claude.envato_enabled()
-        run = Run(id=run_id, client=client, envato=envato, envato_note="" if envato else ENVATO_OFF)
+        ctx = context or {}
+        run = Run(id=run_id, client=client, envato=envato, envato_note="" if envato else ENVATO_OFF,
+                  project_path=str(ctx.get("projectPath") or ""), fps=ctx.get("fps"),
+                  timebase=str(ctx["timebase"]) if ctx.get("timebase") not in (None, "") else None,
+                  width=ctx.get("width"), height=ctx.get("height"))
         first = (f"Instruction: {instruction.strip()}\n\n"
                  f"Selected clips (snapshot taken when the instruction was sent):\n{json.dumps(selection)}\n\n"
                  f"Sequence summary:\n{json.dumps(sequence)}")
+        if any(ctx.get(k) not in (None, "") for k in ("projectPath", "fps", "timebase", "width", "height")):
+            first += "\n\nFor graphics: " + _graphics_context(run)
         run.messages.append({"role": "user", "content": first})
         with self._lock:
             self._runs[run_id] = run
@@ -571,10 +729,13 @@ class Runs:
                                                        f"unknown: {', '.join(extra)}" if extra else "",
                                                        f"repeated: {', '.join(dupes)}" if dupes else "") if p))
             by_id = {r["tool_use_id"]: r for r in results}
-            blocks = [{"type": "tool_result", "tool_use_id": i, "content": by_id[i]["content"],
-                       "is_error": bool(by_id[i].get("is_error", False))} for i in run.waiting]
+            panel = {i: {"type": "tool_result", "tool_use_id": i, "content": by_id[i]["content"],
+                         "is_error": bool(by_id[i].get("is_error", False))} for i in run.waiting}
+            # one user message with every result, in the reply's tool_use order (backend ones ran already)
+            done = {**run.pending, **panel}
+            blocks = [done[i] for i in run.order if i in done]
             run.messages.append({"role": "user", "content": blocks})
-            run.waiting = []
+            run.waiting, run.pending, run.order = [], {}, []
             return self._step(run, sum(len(b["content"]) for b in blocks))
 
     def approve(self, run_id: str) -> dict:
@@ -587,8 +748,13 @@ class Runs:
             return self._step(run, len(APPROVED))
 
     def cancel(self, run_id: str) -> None:
+        """Forget the run; a step still working sees `cancelled` (no further Claude call or render) and a
+        running render is killed through the run's cancel event."""
         with self._lock:
-            self._runs.pop(run_id, None)
+            run = self._runs.pop(run_id, None)
+        if run is not None:
+            run.cancelled = True
+            run.cancel_event.set()
 
     # ── internals ──────────────────────────────────────────────────
 
@@ -615,6 +781,8 @@ class Runs:
         return spend.estimate_step(run.last_usage[0], run.last_usage[1], new_chars)
 
     def _step(self, run: Run, new_chars: int) -> dict:
+        if run.cancelled:
+            return self._reply(run, "stopped", message="Cancelled.", reason="cancelled")
         if run.steps >= MAX_STEPS:
             return self._stopped(run, "step_cap", f"Stopped after {MAX_STEPS} Claude steps without finishing. "
                                                   "What ran so far can be undone; try a smaller instruction.")
@@ -650,15 +818,84 @@ class Runs:
         calls = [{"id": b.id, "name": b.name, "input": b.input}
                  for b in response.content if getattr(b, "type", None) == "tool_use"]
         if stop == "tool_use" and calls:
-            run.waiting = [c["id"] for c in calls]
-            if any(TOOL_KINDS.get(c["name"]) == "terminal" for c in calls):
+            backend = [c for c in calls if TOOL_KINDS.get(c["name"]) == "backend"]
+            panel = [c for c in calls if TOOL_KINDS.get(c["name"]) != "backend"]
+            if backend:
+                try:
+                    done = self._run_backend(run, backend)
+                except graphics.Cancelled:
+                    return self._reply(run, "stopped", message="Cancelled.", reason="cancelled")
+                except GraphicsStop as e:
+                    return self._stopped(run, "graphics", str(e))
+                if run.cancelled:
+                    return self._reply(run, "stopped", message="Cancelled.", reason="cancelled")
+                if not panel:  # only backend tools: step again, no panel round trip
+                    run.messages.append({"role": "user", "content": [done[c["id"]] for c in backend]})
+                    return self._step(run, sum(len(b["content"]) for b in done.values()))
+                run.pending = done
+            run.order = [c["id"] for c in calls]
+            run.waiting = [c["id"] for c in panel]
+            if any(TOOL_KINDS.get(c["name"]) == "terminal" for c in panel):
                 self.cancel(run.id)  # propose_filler_cuts ends the run; the panel opens the review
-            return self._reply(run, "tool_calls", text=text, tool_calls=calls)
+            return self._reply(run, "tool_calls", text=text, tool_calls=panel)
         if run.approved:
             self.cancel(run.id)
             return self._reply(run, "done", text=text)
         run.plan_ready = True
         return self._reply(run, "plan", text=text)
+
+    def _run_backend(self, run: Run, calls: list[dict]) -> dict:
+        """Run make_graphic / read_graphic in order; {tool_use id: tool_result block}."""
+        done, made = {}, False
+        for c in calls:
+            if run.cancelled:
+                raise graphics.Cancelled()
+            if c["name"] == "make_graphic":
+                if made:
+                    content, err = ONE_GRAPHIC, True
+                else:
+                    made = True
+                    content, err = self._make_graphic(run, c["input"] or {})
+            else:
+                content, err = self._read_graphic(run, c["input"] or {})
+            done[c["id"]] = {"type": "tool_result", "tool_use_id": c["id"], "content": content, "is_error": err}
+        return done
+
+    def _make_graphic(self, run: Run, inp: dict) -> tuple[str, bool]:
+        slug = str(inp.get("slug", ""))
+        try:
+            out = self.engine.make(project_path=run.project_path, slug=inp.get("slug"), kind=inp.get("kind"),
+                                   duration_s=inp.get("duration_s"), html=inp.get("html"),
+                                   variables=inp.get("variables"), preview_at_s=inp.get("previewAtS"),
+                                   width=run.width, height=run.height, fps=run.fps, timebase=run.timebase,
+                                   cancel=run.cancel_event)
+        except graphics.Cancelled:
+            raise
+        except graphics.GraphicsError as e:
+            failure = str(e)
+        else:
+            if out["ok"]:
+                run.graphics[out["slug"]] = {k: out[k] for k in ("slug", "version", "preview", "path", "duration_s")}
+                keep = ("slug", "version", "path", "preview", "duration_s", "renderSeconds", "warnings")
+                return json.dumps({k: out[k] for k in keep}), False
+            failure = f"HyperFrames {out['stage']} failed:\n" + "\n".join(out["errors"])
+            if out.get("warnings"):
+                failure += "\nWarnings:\n" + "\n".join(out["warnings"])
+        run.failures[slug] = run.failures.get(slug, 0) + 1
+        left = MAX_GRAPHIC_FAILURES - run.failures[slug]
+        if left <= 0:
+            raise GraphicsStop(f"The graphic \"{slug}\" failed {MAX_GRAPHIC_FAILURES} times, so the run stopped. "
+                               f"Last error: {failure[:800]}")
+        return (f"{failure}\n\nFix it and call make_graphic again; {left} more failure"
+                f"{'s' if left > 1 else ''} of this graphic will stop the run."), True
+
+    def _read_graphic(self, run: Run, inp: dict) -> tuple[str, bool]:
+        try:
+            return json.dumps(self.engine.read(run.project_path, inp.get("slug"))), False
+        except graphics.GraphicsError as e:
+            return str(e), True
+        except OSError as e:
+            return f"The graphic couldn't be read: {e}", True
 
     def _call(self, run: Run, new_chars: int):
         system = SYSTEM + ("\n\n" + run.envato_note if run.envato_note else "")
@@ -673,4 +910,18 @@ class Runs:
     def _reply(self, run: Run, state: str, *, text: str = "", tool_calls: list | None = None,
                message: str | None = None, reason: str | None = None) -> dict:
         return {"run_id": run.id, "state": state, "tool_calls": tool_calls or [], "text": text,
-                "message": message, "reason": reason, "cost": llm.run_cost(run.meter).model_dump()}
+                "message": message, "reason": reason, "cost": llm.run_cost(run.meter).model_dump(),
+                "graphics": list(run.graphics.values())}
+
+
+def _graphics_context(run: Run) -> str:
+    if not run.project_path:
+        where = "the project isn't saved (make_graphic will refuse: ask the user to save it first)"
+    else:
+        where = f"the project is {run.project_path}"
+    try:
+        rate = graphics.fps_arg(run.fps, run.timebase) + " fps"
+    except (graphics.GraphicsError, ValueError, ZeroDivisionError):
+        rate = "an unknown frame rate"
+    size = f"{run.width}x{run.height}" if run.width and run.height else "an unknown size"
+    return f"{where}; the sequence is {size} at {rate}."

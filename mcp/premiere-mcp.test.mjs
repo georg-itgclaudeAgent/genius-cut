@@ -119,12 +119,31 @@ test("tools/list offers the whole toolbox: act tools are not read-only, transiti
   assert.match(byName.mute_track.description, /whole track/);
 }));
 
+test("tools/list offers place_graphic and replace_graphic: act tools on a rendered graphic's path", () => withSetup(async ({ mcp }) => {
+  const { tools } = (await mcp.request("tools/list", {})).result;
+  const byName = Object.fromEntries(tools.map((t) => [t.name, t]));
+  const place = byName.place_graphic, swap = byName.replace_graphic;
+  for (const t of [place, swap]) {
+    assert.equal(t.annotations.readOnlyHint, false, t.name);
+    assert.equal(t.inputSchema.additionalProperties, false, t.name);
+  }
+  assert.deepEqual(Object.keys(place.inputSchema.properties).sort(), ["atS", "path", "sequenceId"]);
+  assert.deepEqual(place.inputSchema.required, ["sequenceId", "path", "atS"]);
+  assert.equal(place.inputSchema.properties.atS.minimum, 0);
+  assert.equal(place.inputSchema.properties.path.minLength, 1);
+  assert.deepEqual(Object.keys(swap.inputSchema.properties).sort(), ["clipId", "path", "sequenceId"]);
+  assert.deepEqual(swap.inputSchema.required, ["sequenceId", "clipId", "path"]);
+  assert.match(place.description, /add a video track/);
+  assert.match(swap.description, /idMap/);
+}));
+
 test("tools/list offers exactly the toolbox with schemas written for Claude", () => withSetup(async ({ mcp }) => {
   const { tools } = (await mcp.request("tools/list", {})).result;
   const byName = Object.fromEntries(tools.map((t) => [t.name, t]));
   assert.deepEqual(Object.keys(byName).sort(),
     ["add_markers", "add_transition", "close_gaps", "cut_ranges", "delete_clips", "get_sequence", "get_transcript", "move_clips",
-     "mute_track", "set_clip_enabled", "set_speed", "set_volume", "split_at", "switch_angle", "undo_last_turn", "wait_transcript"]);
+     "mute_track", "place_graphic", "replace_graphic", "set_clip_enabled", "set_speed", "set_volume", "split_at", "switch_angle",
+     "undo_last_turn", "wait_transcript"]);
   for (const t of tools) {
     assert.equal(t.inputSchema.type, "object", t.name);
     assert.ok(t.description.length > 40, t.name);

@@ -360,6 +360,43 @@ const TOOLS = [
     annotations: { title: "Set clip speed", ...ACT },
   },
   {
+    name: "place_graphic",
+    description:
+      "Put a rendered graphic (a transparent MOV from Genius Cut's make_graphic, \".../Genius Cut Graphics/<slug>/v<N>/<slug>.mov\") " +
+      "on the timeline at atS: it is imported into the \"Genius Cut Graphics\" bin and laid whole on the lowest video track " +
+      "above V1 that is empty over its whole length. Refused if no such track is free (add a video track in Premiere). " +
+      "Returns newIds: [the laid clip's id]. " + SECONDS + " " + UNDO,
+    inputSchema: {
+      type: "object",
+      properties: {
+        sequenceId: SEQ_ID,
+        path: { type: "string", minLength: 1, description: "The graphic's MOV path." },
+        atS: { type: "number", minimum: 0, description: "Where the graphic starts. " + SECONDS },
+      },
+      required: ["sequenceId", "path", "atS"],
+      additionalProperties: false,
+    },
+    annotations: { title: "Place a graphic", ...ACT },
+  },
+  {
+    name: "replace_graphic",
+    description:
+      "Swap a placed graphic clip for another version of it (another MOV path): the new version starts at the same time on " +
+      "the same track with its own length; refused if anything is in the way of the new length. Returns idMap {old id: [new id]}. " +
+      STALE + " " + UNDO,
+    inputSchema: {
+      type: "object",
+      properties: {
+        sequenceId: SEQ_ID,
+        clipId: { type: "string", description: "The placed graphic clip, its id from get_sequence. " + STALE },
+        path: { type: "string", minLength: 1, description: "The new version's MOV path." },
+      },
+      required: ["sequenceId", "clipId", "path"],
+      additionalProperties: false,
+    },
+    annotations: { title: "Swap a graphic's version", ...ACT },
+  },
+  {
     name: "undo_last_turn",
     description:
       "Undo the latest change made through these tools (one act call, or a whole Go of the panel's assistant) on the active sequence, " +

@@ -77,7 +77,7 @@ describe("send: the plan step", () => {
     const w = world({ start: calls(call("get_sequence", {}), call("add_markers", MARK)) });
     w.queue.push(step("plan", { text: "1. Add a marker Intro at 1:42" }));
     const out = await w.agent.send("add a marker at the intro");
-    expect(out).toEqual({ k: "plan", text: "1. Add a marker Intro at 1:42", cost: COST });
+    expect(out).toEqual({ k: "plan", text: "1. Add a marker Intro at 1:42", cost: COST, graphics: [] });
     const start = w.posted[0].body;
     expect(start.instruction).toBe("add a marker at the intro");
     expect(start.selection).toMatchObject({ clipIds: [V1, A1], fromS: 100, toS: 110 });
@@ -348,6 +348,75 @@ describe("cancel and lost runs", () => {
   });
 });
 
+describe("graphics", () => {
+  const G1 = { slug: "spf-title", version: 1, preview: "C:\\Users\\Georg M\\Ep 4\\Genius Cut Graphics\\spf-title\\v1\\preview.png",
+    path: "C:\\Users\\Georg M\\Ep 4\\Genius Cut Graphics\\spf-title\\v1\\spf-title.mov", duration_s: 4 };
+  const G2 = { ...G1, version: 2, preview: G1.preview.replace("v1", "v2"), path: G1.path.replace("v1", "v2"), duration_s: 5.5 };
+  const V2SEL = id("V2", 104, "b"), PLACED = id("V3", 103, "g"), SWAPPED = id("V3", 103, "h");
+
+  it("send adds the project path, timebase and frame size from gcutGraphicsContext to the run start", async () => {
+    const w = world({ start: step("plan", { text: "1. x" }) });
+    w.onHost("gcutGraphicsContext", () => ({ projectPath: "D:/Shows/Ep 4/ep4.prproj", width: 1920, height: 1080, timebase: "10160640000" }));
+    await w.agent.send("a lower third");
+    expect(w.posted[0].body).toMatchObject({ instruction: "a lower third", projectPath: "D:/Shows/Ep 4/ep4.prproj", timebase: "10160640000",
+      width: 1920, height: 1080 });
+  });
+
+  it("send still starts the run when gcutGraphicsContext fails, without the graphics fields", async () => {
+    const w = world({ start: step("plan", { text: "1. x" }) });
+    w.onHost("gcutGraphicsContext", () => { throw new Error("no sequence"); });
+    expect((await w.agent.send("x")).k).toBe("plan");
+    for (const k of ["projectPath", "timebase", "width", "height"]) expect(w.posted[0].body).not.toHaveProperty(k);
+  });
+
+  it("the plan and the finished outcome carry the step reply's graphics", async () => {
+    const w = world({ start: step("plan", { text: "1. Lower third spf-title, 4 s at 1:43", graphics: [G1] }) });
+    const plan = await w.agent.send("x");
+    expect(plan).toEqual({ k: "plan", text: "1. Lower third spf-title, 4 s at 1:43", cost: COST, graphics: [G1] });
+    w.queue.push(step("done", { text: "Placed.", graphics: [G2] }));
+    expect(await w.agent.go()).toMatchObject({ k: "finished", state: "done", graphics: [G2] });
+  });
+
+  it("place_graphic goes above the selection's highest video track, inside the selected span; its new id can be replaced", async () => {
+    const w = world({ start: step("plan", { text: "1. Lower third spf-title, 4 s at 1:43. 2. Replace spf-title v1 with v2" }) });
+    w.setListing((l) => ({ ...l, selection: [V1, A1, V2SEL], clips: [...l.clips, clip(V2SEL, "V2", 104, 108, true)] }));
+    w.onHost("gcutToolPlaceGraphic", (a) => ({ ok: true, track: "V3", startS: a.atS, endS: a.atS + 4, newIds: [PLACED], idMap: {},
+      undo: { kind: "graphic-place", sequenceId: "seq-1" } }));
+    w.onHost("gcutToolReplaceGraphic", () => ({ ok: true, track: "V3", startS: 103, endS: 108.5, idMap: { [PLACED]: [SWAPPED] },
+      undo: { kind: "graphic-replace", sequenceId: "seq-1" } }));
+    await w.agent.send("x");
+    w.queue.push(calls(
+      call("place_graphic", { sequenceId: "seq-1", path: G1.path, atS: 103 }, "in"),
+      call("place_graphic", { sequenceId: "seq-1", path: G1.path, atS: 115 }, "out"),
+      call("replace_graphic", { sequenceId: "seq-1", clipId: PLACED, path: G2.path }, "swap"),
+      call("replace_graphic", { sequenceId: "seq-1", clipId: OTHER, path: G2.path }, "other"),
+      call("replace_graphic", { sequenceId: "seq-1", clipId: SWAPPED, path: G2.path }, "again")), step("done"));
+    const out: any = await w.agent.go();
+    expect(hostCalls(w, "gcutToolPlaceGraphic")).toEqual([{ sequenceId: "seq-1", path: G1.path, atS: 103, aboveTrack: 2 }]);
+    expect(hostCalls(w, "gcutToolReplaceGraphic").map((a: any) => a.clipId)).toEqual([PLACED, SWAPPED]);
+    expect(resultsOf(w).map((r: any) => r.is_error)).toEqual([false, true, false, true, false]);
+    expect(resultsOf(w)[1].content).toMatch(/outside the selected clips \(100–110 s\)/);
+    expect(resultsOf(w)[3].content).toMatch(/isn't one of the selected clips/);
+    expect(out.lines.map((l: any) => [l.text, l.notInPlan])).toEqual([
+      ["Placed spf-title on V3 at 1:43–1:47", false],
+      [expect.stringMatching(/^Refused: /), false],
+      ["Swapped spf-title to v2", false],
+      [expect.stringMatching(/^Refused: /), false],
+      ["Swapped spf-title to v2", false]]);
+  });
+
+  it("place_graphic with no video clip selected leaves aboveTrack to the host", async () => {
+    const w = world({ start: step("plan", { text: "1. Lower third" }) });
+    w.setListing((l) => ({ ...l, selection: [A1] }));
+    w.onHost("gcutToolPlaceGraphic", (a) => ({ ok: true, track: "V2", startS: a.atS, endS: a.atS + 4, newIds: ["V2@9#g"], idMap: {},
+      undo: { kind: "graphic-place", sequenceId: "seq-1" } }));
+    await w.agent.send("x");
+    w.queue.push(calls(call("place_graphic", { sequenceId: "seq-1", path: G1.path, atS: 101 })), step("done"));
+    await w.agent.go();
+    expect(hostCalls(w, "gcutToolPlaceGraphic")).toEqual([{ sequenceId: "seq-1", path: G1.path, atS: 101 }]);
+  });
+});
+
 describe("namedInPlan", () => {
   it("knows each tool by the plain words a plan uses for it", () => {
     expect(namedInPlan("add_markers", "1. Add a marker at 1:42")).toBe(true);
@@ -365,6 +434,10 @@ describe("namedInPlan", () => {
     expect(namedInPlan("add_transition", "1. Cross dissolve between the two clips")).toBe(true);
     expect(namedInPlan("set_speed", "1. Play V1 at 150%")).toBe(true);
     expect(namedInPlan("delete_clips", "1. Mute A2")).toBe(false);
+    expect(namedInPlan("place_graphic", "1. Lower third 'Turn on MFA' (spf-title), 4 s at 1:12")).toBe(true);
+    expect(namedInPlan("place_graphic", "1. Card listing SPF, DKIM, DMARC for 6 s at 2:00")).toBe(true);
+    expect(namedInPlan("replace_graphic", "1. Replace spf-title v1 with v2")).toBe(true);
+    expect(namedInPlan("replace_graphic", "1. Mute A2")).toBe(false);
   });
 });
 

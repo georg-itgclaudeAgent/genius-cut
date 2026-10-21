@@ -236,3 +236,18 @@ select.field { appearance: auto; }
 .act-line.bad .mk, .act-line.bad .tx { color: var(--rose-text); }
 .act-line .tx { min-width: 0; overflow-wrap: anywhere; }
 .why.flag { margin-left: auto; flex: none; background: rgba(255, 122, 81, 0.16); color: var(--coral); }
+
+/* Graphic previews in the plan and the result: transparent PNGs on a dark checkered well */
+.gfx-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 9px; }
+.gfx { margin: 0; border: 1px solid var(--line-soft); border-radius: var(--r); overflow: hidden; background: var(--well); }
+.gfx-prev { aspect-ratio: 16 / 9; display: flex; align-items: center; justify-content: center;
+  background: repeating-conic-gradient(#1a3540 0% 25%, #0d232b 0% 50%) 0 0 / 16px 16px; }
+.gfx-prev img { max-width: 100%; max-height: 100%; display: block; }
+.gfx figcaption { display: flex; align-items: baseline; gap: 8px; padding: 5px 8px; font-size: 11.5px; }
+.gfx figcaption .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gfx figcaption .ct { margin-left: auto; font-family: var(--mono); font-size: 10px; color: var(--text-faint); white-space: nowrap; }
+
+/* Settings: graphics status lines */
+.gfx-status { display: flex; flex-direction: column; gap: 4px; margin: 6px 0 8px; }
+.gfx-status .row { display: flex; align-items: center; gap: 7px; font-size: 11.5px; color: var(--text-dim); }
+.gfx-status .row .det { margin-left: auto; font-family: var(--mono); font-size: 10px; color: var(--text-faint); overflow-wrap: anywhere; }

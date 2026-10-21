@@ -64,6 +64,18 @@ const clipCount = (a: any) => (Array.isArray(a?.clipIds) ? a.clipIds.length : 0)
 /** A clip id's track label (ids are "V1@<start ticks>#<media>"). */
 const trackOf = (clipId: unknown) => String(clipId ?? "").split("@")[0];
 
+/** A graphic's MOV path ".../Genius Cut Graphics/<slug>/v<N>/<slug>.mov" (either slash): its slug and version folder. */
+function graphicOf(path: unknown): { slug: string; version: string } {
+  const parts = String(path ?? "").split(/[\\/]/);
+  return { slug: (parts.at(-1) ?? "").replace(/\.[^.]*$/, ""), version: parts.at(-2) ?? "" };
+}
+
+/** Sequence seconds as m:ss ("1:12"). */
+function clock(s: number): string {
+  const t = Math.round(Math.max(0, Number(s) || 0));
+  return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, "0")}`;
+}
+
 /**
  * The arguments each tool takes: the same names as its schema in backend/geniuscut/agent.py and
  * mcp/premiere-mcp.mjs (the schemas test checks all three). A call with any other argument is refused.
@@ -84,8 +96,16 @@ export const TOOL_ARGS: Record<string, readonly string[]> = {
   mute_track: ["sequenceId", "kind", "track", "muted"],
   add_transition: ["sequenceId", "clipId", "at", "seconds"],
   set_speed: ["sequenceId", "clipIds", "speed"],
+  place_graphic: ["sequenceId", "path", "atS"],
+  replace_graphic: ["sequenceId", "clipId", "path"],
   undo_last_turn: [],
 };
+
+/**
+ * Arguments the panel itself adds, never in Claude's schema: place_graphic's aboveTrack (agent/run.ts passes the
+ * selection's highest video track, so the graphic goes above the selected clips).
+ */
+const PANEL_ARGS: Record<string, readonly string[]> = { place_graphic: ["aboveTrack"] };
 
 /**
  * The piece-4 act tools: name → [host function (extension/host/index.jsx), the line the run shows].
@@ -103,6 +123,8 @@ const ACTS: Record<string, [string, (a: any, r: any) => string]> = {
   mute_track: ["gcutToolMuteTrack", (_a, r) => `${r.muted ? "Muted" : "Unmuted"} ${r.track}`],
   add_transition: ["gcutToolAddTransition", (a, r) => `Added a ${round3(r.seconds)} s ${r.transition} at the ${a.at} of ${trackOf(a.clipId)}'s clip`],
   set_speed: ["gcutToolSetSpeed", (a) => `Set ${plural(clipCount(a), "clip")} to ${round3(a.speed * 100)}% speed`],
+  place_graphic: ["gcutToolPlaceGraphic", (a, r) => `Placed ${graphicOf(a.path).slug} on ${r.track} at ${clock(r.startS)}–${clock(r.endS)}`],
+  replace_graphic: ["gcutToolReplaceGraphic", (a) => `Swapped ${graphicOf(a.path).slug} to ${graphicOf(a.path).version}`],
 };
 
 /**
@@ -272,9 +294,9 @@ export function createTools(deps: ToolDeps): ToolTable {
 
   // Every tool refuses an argument it doesn't take, before anything runs.
   for (const [name, tool] of Object.entries(table)) {
-    const takes = TOOL_ARGS[name], run = tool.run;
+    const takes = TOOL_ARGS[name], extra = PANEL_ARGS[name] ?? [], run = tool.run;
     tool.run = (args) => {
-      const bad = Object.keys(args ?? {}).find((k) => !takes.includes(k));
+      const bad = Object.keys(args ?? {}).find((k) => !takes.includes(k) && !extra.includes(k));
       if (bad !== undefined) {
         return Promise.reject(new Error(`${name} has no argument ${bad}. ` + (takes.length ? `Its arguments are: ${takes.join(", ")}.` : "It takes no arguments.")));
       }

@@ -1,13 +1,37 @@
 /** The instruction run's screens in the Result area: Claude's plan (Go / Cancel) and the result (Undo). */
 import type { Outcome } from "../agent/run";
-import type { RunCost } from "../api/types";
+import type { AgentGraphic, RunCost } from "../api/types";
 import { RunCostLine } from "./Cost";
 
-export function PlanView({ text, cost, onGo, onCancel }: { text: string; cost: RunCost | null; onGo: () => void; onCancel: () => void }) {
+/** A local file as a file:/// URL, each path part URI-encoded (Windows paths have spaces, maybe # or ?); the drive stays "C:". */
+export function fileUrl(path: string): string {
+  const parts = path.replace(/\\/g, "/").replace(/^\/+/, "").split("/");
+  return "file:///" + parts.map((p, i) => (i === 0 && /^[A-Za-z]:$/.test(p) ? p : encodeURIComponent(p))).join("/");
+}
+
+/** Each graphic made in the run: its preview frame (a transparent PNG, so on a checkered well), slug, version, length. */
+function GraphicPreviews({ graphics }: { graphics: AgentGraphic[] }) {
+  if (!graphics.length) return null;
+  return (
+    <div className="gfx-list">
+      {graphics.map((g) => (
+        <figure className="gfx" key={g.slug}>
+          <div className="gfx-prev"><img src={fileUrl(g.preview)} loading="lazy" alt={`${g.slug} preview`} /></div>
+          <figcaption><span className="nm">{g.slug}</span><span className="ct">v{g.version} · {Math.round(g.duration_s * 10) / 10} s</span></figcaption>
+        </figure>
+      ))}
+    </div>
+  );
+}
+
+export function PlanView({ text, cost, graphics = [], onGo, onCancel }: {
+  text: string; cost: RunCost | null; graphics?: AgentGraphic[]; onGo: () => void; onCancel: () => void;
+}) {
   return (
     <>
       <div className="sec">
         <div className="sec-hd"><span className="lbl">Claude's plan</span></div>
+        <GraphicPreviews graphics={graphics} />
         <pre className="plan-text">{text}</pre>
         <div className="actions-row">
           <button className="btn btn-p" onClick={onGo}>Go</button>
@@ -34,6 +58,7 @@ export function RunResult({ out, undoing, undoMsg, undoBad, onUndo, onDone }: {
         </div>
         {out.message && <div className={`note ${bad ? "bad" : "warn"}`}>{out.message}</div>}
         {out.text && <div className="plan-text" style={{ marginTop: 6 }}>{out.text}</div>}
+        <GraphicPreviews graphics={out.graphics ?? []} />
         {out.lines.length > 0 && (
           <div className="act-lines" aria-label="What was done">
             {out.lines.map((l, i) => (

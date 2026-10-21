@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { runtime } from "../api/runtime";
 import { HostUnavailable, type ApplyResult } from "../api/host";
-import type { AiStatus, Health, RunCost, Snapshot, SnapshotItem, TrimResponse } from "../api/types";
+import type { AgentGraphic, AiStatus, Health, RunCost, Snapshot, SnapshotItem, TrimResponse } from "../api/types";
 import type { Agent, Outcome } from "../agent/run";
 import { afterTrimRefresh, watchAiStatus } from "../lib/aiStatus";
 import { addCosts, budgetEstimate } from "../lib/cost";
@@ -26,7 +26,7 @@ type Phase =
   | { k: "error"; message: string; snap?: Snapshot; notYet?: boolean; restorable?: boolean }
   // An instruction run (agent/run.ts): Claude reads and plans, Go, the result with Undo.
   | { k: "asking" }
-  | { k: "plan"; text: string; cost: RunCost | null }
+  | { k: "plan"; text: string; cost: RunCost | null; graphics: AgentGraphic[] }
   | { k: "acting"; cancelling: boolean }
   | { k: "ran"; out: Extract<Outcome, { k: "finished" }>; undoing: boolean; undoMsg: string | null; undoBad: boolean };
 
@@ -106,7 +106,7 @@ export function CutTab({ health, ready, agent, onTrimmed }: {
   }
 
   async function handle(out: Outcome) {
-    if (out.k === "plan") return go({ k: "plan", text: out.text, cost: out.cost });
+    if (out.k === "plan") return go({ k: "plan", text: out.text, cost: out.cost, graphics: out.graphics });
     if (out.k === "finished") return go({ k: "ran", out, undoing: false, undoMsg: null, undoBad: false });
     // propose_filler_cuts: today's Analyse on the selection recorded at send.
     const found = out.snapshot;
@@ -299,7 +299,7 @@ export function CutTab({ health, ready, agent, onTrimmed }: {
           </div>
         )}
 
-        {phase.k === "plan" && <PlanView text={phase.text} cost={phase.cost} onGo={approve} onCancel={cancelRun} />}
+        {phase.k === "plan" && <PlanView text={phase.text} cost={phase.cost} graphics={phase.graphics} onGo={approve} onCancel={cancelRun} />}
 
         {phase.k === "ran" && (
           <RunResult out={phase.out} undoing={phase.undoing} undoMsg={phase.undoMsg} undoBad={phase.undoBad}

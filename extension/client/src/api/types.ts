@@ -172,6 +172,9 @@ export interface AgentToolCall { id: string; name: string; input: any }
 
 export interface AgentToolResult { tool_use_id: string; content: string; is_error: boolean }
 
+/** A graphic made in the run, its newest version: the preview PNG and the MOV are absolute paths (spaces and all). */
+export interface AgentGraphic { slug: string; version: number; preview: string; path: string; duration_s: number }
+
 /** One Claude step. tool_calls: run them and post the results; plan: show Go / Cancel; done / stopped: the run is closed. */
 export interface AgentStep {
   run_id: string;
@@ -180,9 +183,27 @@ export interface AgentStep {
   text: string;
   /** "stopped" only; for "limit", the exact limit message. */
   message: string | null;
-  reason: "limit" | "key" | "error" | "refusal" | "max_tokens" | "step_cap" | null;
+  reason: "limit" | "key" | "error" | "refusal" | "max_tokens" | "step_cap" | "graphics" | "cancelled" | null;
   /** usd: this run's total so far. */
   cost: RunCost | null;
+  /** The newest version of every graphic made in this run (absent from backends before graphics). */
+  graphics?: AgentGraphic[];
 }
 
-export interface AgentStart { instruction: string; selection: unknown; sequence: unknown }
+/** The graphics fields are optional (make_graphic refuses without them): app.project.path, the sequence's timebase
+ *  (ticks per frame) and frame size, from the host's gcutGraphicsContext. */
+export interface AgentStart {
+  instruction: string; selection: unknown; sequence: unknown;
+  projectPath?: string; timebase?: string; width?: number; height?: number;
+}
+
+/** `GET /graphics/status` (backend/geniuscut/graphics.py): what a render needs, and the one-time setup job. */
+export interface GraphicsStatus {
+  ready: boolean;
+  message: string;
+  node: { ok: boolean; path: string | null; version: string | null };
+  cli: { ok: boolean; path: string | null; version: string | null };
+  chrome: { ok: boolean; path: string | null };
+  ffmpeg: { ok: boolean; path: string | null };
+  setup: LoginStatus;
+}

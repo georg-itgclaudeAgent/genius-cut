@@ -5,7 +5,8 @@
  * offers wait_transcript but never undo_last_turn (Undo is a button), and adds the terminal
  * propose_filler_cuts, which the panel's run handles itself. On the Anthropic API the backend also sends an
  * Envato mcp_toolset (B-roll search, run server-side by Anthropic): it is backend-only, never a panel or MCP
- * tool, so it is taken out of the comparison here, explicitly.
+ * tool, so it is taken out of the comparison here, explicitly. So are the backend-run tools (TOOL_KINDS "backend":
+ * make_graphic, read_graphic), which the agent loop runs itself and never sends to the panel.
  */
 import { describe, it, expect, beforeAll } from "vitest";
 import { execFileSync } from "node:child_process";
@@ -37,6 +38,7 @@ function shape(x: any): any {
 
 let backend: { tools: { name: string; input_schema: any }[]; kinds: Record<string, string> };
 let serverOnly: { type: string; mcp_server_name: string }[];
+let backendRun: string[];
 let mcp: { name: string; inputSchema: any; annotations: { readOnlyHint: boolean } }[];
 const panel = createTools({ callHost: async () => ({}), backend: { transcript: async () => ({}) as any, transcriptJob: async () => ({}) as any },
   turns: createTurns({ read: () => null, write: () => {} }) });
@@ -47,7 +49,9 @@ beforeAll(() => {
     + "print(json.dumps({'tools': agent.TOOLS + [claude.ENVATO_TOOLSET], 'kinds': agent.TOOL_KINDS}))";
   const all = JSON.parse(execFileSync(python(), ["-c", dump], { cwd: BACKEND, encoding: "utf8" }));
   serverOnly = all.tools.filter((t: any) => t.type === "mcp_toolset");
-  backend = { ...all, tools: all.tools.filter((t: any) => t.type !== "mcp_toolset") };
+  // The backend-run tools (kind "backend") are run in the agent loop, never by the panel or the MCP.
+  backendRun = all.tools.filter((t: any) => all.kinds[t.name] === "backend").map((t: any) => t.name).sort();
+  backend = { ...all, tools: all.tools.filter((t: any) => t.type !== "mcp_toolset" && all.kinds[t.name] !== "backend") };
   // premiere-mcp as Claude Code runs it, asked for its list (a temp APPDATA: no bridge is read for a list).
   const appData = mkdtempSync(join(tmpdir(), "gcut-schemas-"));
   try {
@@ -64,6 +68,14 @@ describe("the three schema copies", () => {
     expect(serverOnly.map((t) => t.mcp_server_name)).toEqual(["envato"]);
     expect(backend.tools.every((t) => typeof t.name === "string" && t.input_schema)).toBe(true);
     expect(Object.keys(backend.kinds)).not.toContain("envato");
+  });
+
+  it("leave out the backend-run tools (kind backend), which the agent loop runs and the panel never sees", () => {
+    expect(backendRun).toEqual(["make_graphic", "read_graphic"]);
+    for (const n of backendRun) {
+      expect(Object.keys(panel), n).not.toContain(n);
+      expect(mcp.map((t) => t.name), n).not.toContain(n);
+    }
   });
 
   it("have the same tool names: the backend has propose_filler_cuts and never undo_last_turn", () => {
@@ -90,6 +102,9 @@ describe("the three schema copies", () => {
     for (const t of mcp) {
       expect(t.annotations.readOnlyHint, t.name).toBe(panel[t.name].kind === "read");
       if (t.name !== "undo_last_turn") expect(backend.kinds[t.name], t.name).toBe(panel[t.name].kind);
+    }
+    for (const t of backend.tools) {
+      if (t.name !== "propose_filler_cuts") expect(panel[t.name]?.kind, t.name).toBe(backend.kinds[t.name]);
     }
   });
 });

@@ -1,9 +1,10 @@
 import { describe, it, expect } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import { SetupView } from "./Setup";
-import { KeyTab, UsageView, resetLine, runLine } from "./Settings";
+import { GraphicsView, KeyTab, UsageView, resetLine, runGraphicsSetup, runLine } from "./Settings";
 import { initialSetup, INSTALL_URL, type Setup, type SetupState } from "../lib/setup";
-import type { Usage } from "../api/types";
+import type { GraphicsStatus, Usage } from "../api/types";
+import { BackendError } from "../api/backend";
 
 const noop = async () => {};
 const actions = (): Setup => ({
@@ -103,6 +104,66 @@ describe("Settings: AI key tab", () => {
   });
 });
 
+describe("Settings: Graphics (AI key tab)", () => {
+  const READY: GraphicsStatus = { ready: true, message: "Graphics are set up (HyperFrames 0.8.181).",
+    node: { ok: true, path: "C:/Program Files/nodejs/node.exe", version: "24.1.0" },
+    cli: { ok: true, path: "C:/x/hyperframes.mjs", version: "0.8.181" }, chrome: { ok: true, path: "C:/x/chrome.exe" },
+    ffmpeg: { ok: true, path: "C:/ffmpeg/bin/ffmpeg.exe" }, setup: { state: "idle", message: "" } };
+  const NOT_SET: GraphicsStatus = { ...READY, ready: false, message: "Graphics aren't set up yet.",
+    cli: { ok: false, path: null, version: null }, chrome: { ok: false, path: null } };
+  const view = (status: GraphicsStatus | null, o: { busy?: boolean; error?: string | null } = {}) => renderToStaticMarkup(
+    <GraphicsView status={status} busy={o.busy ?? false} error={o.error ?? null} onSetup={() => {}} />);
+
+  it("shows a status line for Node.js, HyperFrames, Chrome and FFmpeg, and the backend's message", () => {
+    const html = view(READY);
+    expect(html).toContain("Graphics");
+    expect(html).toContain("Graphics are set up (HyperFrames 0.8.181).");
+    for (const t of ["Node.js", "24.1.0", "HyperFrames", "0.8.181", "Chrome", "FFmpeg"]) expect(html).toContain(t);
+    expect(html.match(/class="pip ok"/g)).toHaveLength(4);
+    expect(html).not.toMatch(/<button[^>]*>Set up graphics<\/button>/);
+  });
+
+  it("not set up: the missing parts are marked and Set up graphics is offered", () => {
+    const html = view(NOT_SET);
+    expect(html.match(/class="pip bad"/g)).toHaveLength(2);
+    expect(html).toMatch(/<button[^>]*>Set up graphics<\/button>/);
+  });
+
+  it("while the setup runs: its progress, and the button is disabled", () => {
+    const html = view({ ...NOT_SET, setup: { state: "running", message: "Installing HyperFrames…" } }, { busy: true });
+    expect(html).toContain("Installing HyperFrames…");
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Setting up…<\/button>/);
+  });
+
+  it("a failed setup or status read shows its message", () => {
+    expect(view({ ...NOT_SET, setup: { state: "failed", message: "npm install failed" } })).toMatch(/class="note bad"[^>]*>npm install failed/);
+    expect(view(null, { error: "Backend unreachable" })).toMatch(/class="note bad"[^>]*>Backend unreachable/);
+  });
+
+  it("Set up graphics POSTs the setup, then polls the status every 2 s until the setup is no longer running", async () => {
+    const seen: string[] = [], slept: number[] = [], shown: GraphicsStatus[] = [];
+    const states = ["running", "running", "done"] as const;
+    const api = {
+      graphicsSetup: async () => { seen.push("setup"); return { state: "running", message: "Starting" }; },
+      graphicsStatus: async () => { seen.push("status"); const st = states[Math.min(seen.length - 2, 2)];
+        return { ...(st === "done" ? READY : NOT_SET), setup: { state: st, message: st } }; },
+    };
+    const last = await runGraphicsSetup(api, (st) => shown.push(st), async (ms) => { slept.push(ms); });
+    expect(seen).toEqual(["setup", "status", "status", "status"]);
+    expect(slept).toEqual([2000, 2000, 2000]);
+    expect(shown.map((x) => x.setup.state)).toEqual(["running", "running", "done"]);
+    expect(last.ready).toBe(true);
+  });
+
+  it("a setup already running (409) is polled, not an error", async () => {
+    const api = {
+      graphicsSetup: async (): Promise<{ state: string; message: string }> => { throw new BackendError("Graphics setup is already running.", 409); },
+      graphicsStatus: async () => ({ ...READY, setup: { state: "done" as const, message: "" } }),
+    };
+    expect((await runGraphicsSetup(api, () => {}, async () => {})).ready).toBe(true);
+  });
+});
+
 describe("Settings: Usage & limit tab", () => {
   const USAGE: Usage = { month_usd: 4.5, limit_usd: 20, limit_tier: 20, resets_on: "2026-11-01", run_count: 12, runs: [
     { at: "2026-10-14T05:00:00+00:00", kind: "agent", model: "claude-opus-5-5", usd: 0.42 },
@@ -147,5 +208,7 @@ describe("sample data (preview / browser)", () => {
     const saved = await api.saveSettings({ ...(await api.settings()), monthly_limit_usd: 100 });
     expect((await api.usage()).limit_usd).toBe(100);
     await api.saveSettings({ ...saved, monthly_limit_usd: 20 });
+    expect((await api.graphicsStatus()).ready).toBe(false);
+    expect((await api.graphicsSetup()).state).toBe("running");
   });
 });

@@ -154,7 +154,7 @@ describe("agent runs (the in-panel assistant)", () => {
   const STEP = { run_id: "r1", state: "plan", tool_calls: [], text: "1. Add a marker", message: null, reason: null,
     cost: { model: "claude-opus-5-5", input_tokens: 1, output_tokens: 1, usd: 0.01, month_usd: 1, limit_usd: 20 } };
 
-  it("starts, posts results, approves and cancels a run, each step allowed 5 minutes", async () => {
+  it("starts, posts results, approves and cancels a run, each step allowed 15 minutes (graphics render inside steps)", async () => {
     const f = fake(200, STEP);
     const api = createBackend({ transport: f.transport, token: () => "tok" });
     expect(await api.agentStart({ instruction: "add a marker", selection: { clipIds: ["V1@0#n"] }, sequence: { sequenceId: "s" } })).toEqual(STEP);
@@ -165,7 +165,24 @@ describe("agent runs (the in-panel assistant)", () => {
       "POST /agent/runs", "POST /agent/runs/r1/results", "POST /agent/runs/r1/approve", "DELETE /agent/runs/r%2F1"]);
     expect(JSON.parse(f.seen[0].body!)).toEqual({ instruction: "add a marker", selection: { clipIds: ["V1@0#n"] }, sequence: { sequenceId: "s" } });
     expect(JSON.parse(f.seen[1].body!)).toEqual({ results: [{ tool_use_id: "t1", content: "{}", is_error: false }] });
-    expect(f.seen.slice(0, 3).every((r) => r.timeoutMs === 5 * 60_000)).toBe(true);
+    expect(f.seen.slice(0, 3).every((r) => r.timeoutMs === 15 * 60_000)).toBe(true);
+    expect(f.seen.every((r) => r.headers.Authorization === "Bearer tok")).toBe(true);
+  });
+
+  it("passes the run start's graphics fields through", async () => {
+    const f = fake(200, STEP);
+    const api = createBackend({ transport: f.transport, token: () => "tok" });
+    const body = { instruction: "a lower third", selection: {}, sequence: {}, projectPath: "D:/Ep 4/ep4.prproj", timebase: "10160640000", width: 1920, height: 1080 };
+    await api.agentStart(body);
+    expect(JSON.parse(f.seen[0].body!)).toEqual(body);
+  });
+
+  it("reads the graphics status and starts the one-time graphics setup", async () => {
+    const f = fake(200, { state: "running", message: "Starting the graphics setup…" });
+    const api = createBackend({ transport: f.transport, token: () => "tok" });
+    await api.graphicsStatus();
+    expect(await api.graphicsSetup()).toEqual({ state: "running", message: "Starting the graphics setup…" });
+    expect(f.seen.map((r) => `${r.method} ${r.path}`)).toEqual(["GET /graphics/status", "POST /graphics/setup"]);
     expect(f.seen.every((r) => r.headers.Authorization === "Bearer tok")).toBe(true);
   });
 

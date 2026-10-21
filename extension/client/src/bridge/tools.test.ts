@@ -51,7 +51,8 @@ describe("the bridge's tool table", () => {
     expect(Object.fromEntries(Object.entries(t).map(([k, v]) => [k, v.kind]))).toEqual({
       get_sequence: "read", get_transcript: "read", wait_transcript: "read", add_markers: "act", cut_ranges: "act",
       delete_clips: "act", close_gaps: "act", split_at: "act", set_clip_enabled: "act", move_clips: "act", switch_angle: "act",
-      set_volume: "act", mute_track: "act", add_transition: "act", set_speed: "act", undo_last_turn: "act" });
+      set_volume: "act", mute_track: "act", add_transition: "act", set_speed: "act", place_graphic: "act", replace_graphic: "act",
+      undo_last_turn: "act" });
     expect(Object.keys(TOOL_ARGS).sort()).toEqual(Object.keys(t).sort());
     expect(t.set_clip_label).toBeUndefined(); // dropped: Premiere can't label a single clip
   });
@@ -374,7 +375,26 @@ describe("the bridge's tool table", () => {
         "Added a 1 s Cross Dissolve at the end of V1's clip"],
       ["set_speed", { sequenceId: SEQ, clipIds: [V1, A1], speed: 1.5 }, "gcutToolSetSpeed",
         { ok: true, speed: 1.5, changed: 2, idMap: {}, undo: { kind: "speed", sequenceId: SEQ, items: [] } }, "Set 2 clips to 150% speed"],
+      ["place_graphic", { sequenceId: SEQ, path: "C:\\Users\\Georg M\\Videos\\Genius Cut Graphics\\spf-title\\v1\\spf-title.mov", atS: 72 },
+        "gcutToolPlaceGraphic", { ok: true, track: "V3", startS: 72, endS: 76, newIds: ["V3@1#g"], idMap: {}, undo: { kind: "graphic-place", sequenceId: SEQ } },
+        "Placed spf-title on V3 at 1:12–1:16"],
+      ["replace_graphic", { sequenceId: SEQ, clipId: "V3@1#g", path: "D:/Shows/Ep 4/Genius Cut Graphics/spf-title/v2/spf-title.mov" },
+        "gcutToolReplaceGraphic", { ok: true, track: "V3", startS: 72, endS: 77.5, idMap: { "V3@1#g": ["V3@1#h"] },
+          undo: { kind: "graphic-replace", sequenceId: SEQ } }, "Swapped spf-title to v2"],
     ];
+
+    it("place_graphic also takes the panel's own aboveTrack (the selection's highest video track), which Claude's schema hasn't", async () => {
+      const f = fakes();
+      const reply = { ok: true, track: "V4", startS: 5, endS: 9.4, newIds: ["V4@1#g"], idMap: {}, undo: { kind: "graphic-place", sequenceId: SEQ } };
+      const deps: ToolDeps = { ...f.deps, callHost: async (h, a) => { f.host.push([h, a]); return structuredClone(reply); } };
+      const args = { sequenceId: SEQ, path: "D:/g/x/v1/x.mov", atS: 5, aboveTrack: 3 };
+      await createTools(deps).place_graphic.run(args);
+      expect(f.host).toEqual([["gcutToolPlaceGraphic", args]]);
+      expect(f.turns.latest(SEQ)!.actions[0].summary).toBe("Placed x on V4 at 0:05–0:09");
+      expect(TOOL_ARGS.place_graphic).toEqual(["sequenceId", "path", "atS"]);
+      await expect(createTools(deps).replace_graphic.run({ sequenceId: SEQ, clipId: "c", path: "p", aboveTrack: 1 })).rejects.toThrow(
+        "replace_graphic has no argument aboveTrack.");
+    });
 
     it.each(cases)("%s calls its host function with Claude's arguments, records the undo and passes the idMap on", async (name, args, fn, hostReply, line) => {
       const f = fakes();

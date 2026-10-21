@@ -9,11 +9,15 @@
  * re-ids clips it moved that weren't selected); markers go inside the span the allowed clips cover now.
  * Every act tool's clipIds / clipId must be allowed, close_gaps and switch_angle too (they reach
  * beyond the selection, which the plan must say); mute_track only on a track with an allowed clip.
+ * Graphics: a placed graphic's newIds join the allowed set (replace_graphic needs an allowed clip, as all do);
+ * place_graphic's atS goes inside the allowed span like markers, and the panel adds aboveTrack (the selection's
+ * highest video track at send) so the graphic lands above the selected clips. Every step reply's `graphics`
+ * (the run's newest versions, with preview PNGs) is carried on the plan and the finished outcome.
  * propose_filler_cuts is terminal: the backend closed the run, and the Cut tab runs
  * today's Analyse on the selection recorded at send, with Claude's instructions.
  */
 import type { Backend } from "../api/backend";
-import type { AgentStep, AgentToolCall, AgentToolResult, NotFound, RunCost, Snapshot } from "../api/types";
+import type { AgentGraphic, AgentStep, AgentToolCall, AgentToolResult, NotFound, RunCost, Snapshot } from "../api/types";
 import { undoTurn, type ToolDeps, type ToolTable } from "../bridge/tools";
 import type { Turns } from "../bridge/turns";
 
@@ -38,12 +42,12 @@ export interface ActionLine { tool: string; text: string; ok: boolean; notInPlan
 export interface UndoTarget { sequenceId: string; turnId: string }
 
 export type Outcome =
-  | { k: "plan"; text: string; cost: RunCost | null }
+  | { k: "plan"; text: string; cost: RunCost | null; graphics: AgentGraphic[] }
   | { k: "trim"; instructions: string; snapshot: Snapshot | NotFound | null; snapshotError: string | null; cost: RunCost | null;
       /** The closed run's id: the trim's spend rows carry it, so Usage shows the run and its trim as one. */
       runId: string }
   | { k: "finished"; state: "done" | "stopped" | "cancelled" | "lost" | "error"; text: string; message: string | null;
-      lines: ActionLine[]; cost: RunCost | null; undo: UndoTarget | null };
+      lines: ActionLine[]; cost: RunCost | null; undo: UndoTarget | null; graphics: AgentGraphic[] };
 
 // The words a plan uses for each tool (spec: calls not named in the plan are flagged, not blocked).
 const PLAN_WORDS: Record<string, RegExp> = {
@@ -59,6 +63,8 @@ const PLAN_WORDS: Record<string, RegExp> = {
   mute_track: /mute/i,
   add_transition: /transition|dissolve|crossfade|cross fade|fade/i,
   set_speed: /speed|slow|fast|\d\s*%/i,
+  place_graphic: /graphic|lower.?third|callout|\bcard|explainer|\btitle|overlay/i,
+  replace_graphic: /replac|swap|\bv\d+\b|version/i,
 };
 
 export function namedInPlan(tool: string, plan: string): boolean {
@@ -75,14 +81,16 @@ export type Agent = ReturnType<typeof createAgent>;
 export function createAgent(deps: AgentDeps) {
   let open = false, approved = false, cancelled = false, driving = false;
   let runId = "", plan = "", cost: RunCost | null = null;
-  let allowed = new Set<string>(), lines: ActionLine[] = [];
+  let allowed = new Set<string>(), lines: ActionLine[] = [], graphics: AgentGraphic[] = [];
+  /** The selection's highest video track at send (1-based), for place_graphic's aboveTrack; null: no video selected. */
+  let topVideo: number | null = null;
   let trimSnap: Snapshot | NotFound | null = null, trimError: string | null = null;
 
   /** Close the run on the panel side: the group ends with whatever ran. */
   function finish(state: Extract<Outcome, { k: "finished" }>["state"], text: string, message: string | null): Outcome {
     open = false; driving = false;
     const g = deps.turns.end();
-    return { k: "finished", state, text, message, lines, cost, undo: g ? { sequenceId: g.sequenceId, turnId: g.id } : null };
+    return { k: "finished", state, text, message, lines, cost, undo: g ? { sequenceId: g.sequenceId, turnId: g.id } : null, graphics };
   }
 
   /** Why this act call may not run on the selection, or null. */
@@ -97,12 +105,20 @@ export function createAgent(deps: AgentDeps) {
         return `mute_track mutes the whole track, and ${label} has none of the selected clips. Only a track with a selected clip can be muted.`;
       }
     }
-    if (name === "add_markers" && Array.isArray(input?.markers)) {
+    if ((name === "add_markers" && Array.isArray(input?.markers)) || name === "place_graphic") {
       const listing = await deps.callHost("gcutToolGetSequence", {});
       const mine = (listing.clips as any[]).filter((c) => allowed.has(String(c.id)));
-      if (!mine.length) return "None of the selected clips is on the timeline any more, so the markers have nowhere to go.";
+      const what = name === "place_graphic" ? "the graphic has" : "the markers have";
+      if (!mine.length) return `None of the selected clips is on the timeline any more, so ${what} nowhere to go.`;
       const from = Math.min(...mine.map((c) => c.startS)), to = Math.max(...mine.map((c) => c.endS));
       const r = (x: number) => Math.round(x * 1000) / 1000;
+      if (name === "place_graphic") {
+        const at = Number(input?.atS);
+        if (!(at >= from - EPS && at <= to + EPS)) {
+          return `The graphic's start (${r(at)} s) is outside the selected clips (${r(from)}–${r(to)} s). Graphics go inside the selection.`;
+        }
+        return null;
+      }
       for (const m of input.markers) {
         const at = Number(m?.atS), end = m?.endS === undefined || m?.endS === null ? at : Number(m.endS);
         if (!(at >= from - EPS && end <= to + EPS)) {
@@ -126,7 +142,9 @@ export function createAgent(deps: AgentDeps) {
       }
     }
     try {
-      const r: any = await tool.run(c.input ?? {});
+      // place_graphic: the panel adds the selection's highest video track (not in Claude's schema).
+      const input = c.name === "place_graphic" && topVideo !== null ? { ...(c.input ?? {}), aboveTrack: topVideo } : c.input ?? {};
+      const r: any = await tool.run(input);
       if (tool.kind === "act") {
         // Only an allowed clip's new ids are allowed: close_gaps also moves (and re-ids) clips that weren't selected.
         for (const [old, made] of Object.entries((r?.idMap ?? {}) as Record<string, string[]>)) {
@@ -134,6 +152,8 @@ export function createAgent(deps: AgentDeps) {
           allowed.delete(old);
           for (const x of made) allowed.add(String(x));
         }
+        // A placed graphic is the run's own clip: it may be changed (replace_graphic) later in the run.
+        for (const x of (Array.isArray(r?.newIds) ? r.newIds : [])) allowed.add(String(x));
         const seq = String(c.input?.sequenceId ?? "");
         const text = deps.turns.latest(seq)?.actions.at(-1)?.summary ?? c.name;
         lines.push({ tool: c.name, text, ok: true, notInPlan: !namedInPlan(c.name, plan) });
@@ -155,7 +175,8 @@ export function createAgent(deps: AgentDeps) {
         runId = reply.run_id || runId;
         if (cancelled) return finish("cancelled", "", null);
         cost = reply.cost ?? cost;
-        if (reply.state === "plan") { driving = false; plan = reply.text; return { k: "plan", text: reply.text, cost }; }
+        graphics = reply.graphics ?? graphics;
+        if (reply.state === "plan") { driving = false; plan = reply.text; return { k: "plan", text: reply.text, cost, graphics }; }
         if (reply.state === "done") return finish("done", reply.text, null);
         if (reply.state === "stopped") return finish("stopped", reply.text, reply.message);
         const trim = reply.tool_calls.find((c) => c.name === TERMINAL);
@@ -187,7 +208,7 @@ export function createAgent(deps: AgentDeps) {
     /** Take the selection now, then ask Claude. */
     async send(instruction: string): Promise<Outcome> {
       open = true; approved = false; cancelled = false; driving = false;
-      runId = ""; plan = ""; cost = null; lines = []; trimSnap = null; trimError = null;
+      runId = ""; plan = ""; cost = null; lines = []; graphics = []; topVideo = null; trimSnap = null; trimError = null;
       let listing: any;
       try {
         listing = await deps.tools.get_sequence.run({});
@@ -205,7 +226,15 @@ export function createAgent(deps: AgentDeps) {
         toS: Math.max(...chosen.map((c) => c.endS)),
       };
       const sequence = { sequenceId: listing.sequenceId, name: listing.name, fps: listing.fps, durationS: listing.durationS, tracks: listing.tracks };
-      return drive(() => deps.api.agentStart({ instruction, selection, sequence }));
+      const videoTracks = [...allowed].filter((x) => x.startsWith("V")).map((x) => Number(x.split("@")[0].slice(1))).filter((n) => n >= 1);
+      topVideo = videoTracks.length ? Math.max(...videoTracks) : null;
+      // For graphics (all optional): the project's path, the sequence's timebase and frame size. A failure leaves them out.
+      let context: { projectPath?: string; timebase?: string; width?: number; height?: number } = {};
+      try {
+        const g = await deps.callHost("gcutGraphicsContext", {});
+        if (g && typeof g === "object") context = { projectPath: g.projectPath, timebase: g.timebase, width: g.width, height: g.height };
+      } catch { /* not needed unless Claude makes a graphic */ }
+      return drive(() => deps.api.agentStart({ instruction, selection, sequence, ...context }));
     },
 
     /** Go: Claude does exactly the plan; every act call is one undo group. */

@@ -7,7 +7,7 @@ import { API_VERSION } from "../lib/lifecycle";
 import type { Transport } from "./backend";
 import type { Host } from "./host";
 import type {
-  AiStatus, Health, Library, RunCost, SequenceCut, Settings, Snapshot, SnapshotItem, Span, StyleExample, TrimResponse, Usage, Word,
+  AiStatus, GraphicsStatus, Health, Library, RunCost, SequenceCut, Settings, Snapshot, SnapshotItem, Span, StyleExample, TrimResponse, Usage, Word,
 } from "./types";
 
 const W = (w: string, start: number, end: number): Word => ({ w, start, end });
@@ -105,11 +105,19 @@ export const mockTransport: Transport = async (req) => {
   if (path === "/agent/runs" && req.method === "POST") {
     await delay(700);
     const b = JSON.parse(req.body || "{}");
-    return ok({ run_id: "sample-run", state: "tool_calls", text: "", message: null, reason: null, cost: sampleCost(1800, 120),
+    return ok({ run_id: "sample-run", state: "tool_calls", text: "", message: null, reason: null, cost: sampleCost(1800, 120), graphics: [],
       tool_calls: [{ id: "tu-sample", name: "propose_filler_cuts", input: { instructions: String(b.instruction || "trim the fillers") } }] });
   }
   if (path.startsWith("/agent/runs/") && req.method === "DELETE") return ok({ ok: true });
   if (path.startsWith("/agent/runs/")) return { status: 404, body: JSON.stringify({ detail: "This run was lost; send the instruction again." }) };
+  // Graphics: never set up on sample data; "Set up graphics" finishes at once without installing anything.
+  if (path === "/graphics/setup" && req.method === "POST") { graphicsSetupRan = true; return { status: 202, body: JSON.stringify({ state: "running", message: "Starting" }) }; }
+  if (path === "/graphics/status") {
+    const status: GraphicsStatus = { ready: false, message: "Sample data: graphics aren't set up.",
+      node: { ok: false, path: null, version: null }, cli: { ok: false, path: null, version: null }, chrome: { ok: false, path: null },
+      ffmpeg: { ok: false, path: null }, setup: graphicsSetupRan ? { state: "done", message: "Sample data: nothing was installed." } : { state: "idle", message: "" } };
+    return ok(status);
+  }
   if (path === "/settings" && req.method === "PUT") { settings = JSON.parse(req.body || "{}"); return ok(settings); }
   if (path === "/settings") return ok(settings);
   if (path === "/settings/test-key") { await delay(600); return ok({ ok: true, message: "Sample data: no key was read." }); }
@@ -126,6 +134,8 @@ export const mockTransport: Transport = async (req) => {
   }
   return { status: 404, body: JSON.stringify({ detail: `No mock for ${req.path}` }) };
 };
+
+let graphicsSetupRan = false;
 
 let settings: Settings = { anthropic_key: { project: "sample-project", secret: "ANTHROPIC_API_KEY", version: "latest" },
   monthly_limit_usd: 20, setup_complete: true };

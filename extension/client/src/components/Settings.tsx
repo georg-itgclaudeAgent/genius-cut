@@ -1,11 +1,11 @@
 /**
- * Settings (the gear): "AI key" (the same fields as Setup, re-test, and a notice when the cached key
- * is in use) and "Usage & limit" (this month against the limit, the runs, the $20 / $100 choice and
+ * Settings (the gear): "AI key" (the same fields as Setup, re-test, a notice when the cached key
+ * is in use, and Graphics: what a render needs and the one-time "Set up graphics") and "Usage & limit" (this month against the limit, the runs, the $20 / $100 choice and
  * the reset date). Costs are estimates from token usage at list prices.
  */
 import { useCallback, useEffect, useState } from "react";
-import type { Backend } from "../api/backend";
-import type { Settings as SettingsData, Usage, UsageRun } from "../api/types";
+import { BackendError, type Backend } from "../api/backend";
+import type { GraphicsStatus, Settings as SettingsData, Usage, UsageRun } from "../api/types";
 import { formatUsd, METER_HOT, meterFraction, modelLabel } from "../lib/cost";
 import type { Setup, SetupState } from "../lib/setup";
 import { KeyFields, LimitChoice, SignIn, TestRow, useSetup } from "./Setup";
@@ -118,10 +118,91 @@ function UsageTab({ api }: { api: Backend }) {
   return <UsageView usage={usage} tier={settings?.monthly_limit_usd ?? usage.limit_tier} saving={saving} error={error} onTier={onTier} />;
 }
 
+const POLL_MS = 2000;
+
+/**
+ * "Set up graphics": start the one-time setup (a setup already running, 409, is just watched), then read the status
+ * every 2 s, showing each, until the setup is no longer running. Returns the last status.
+ */
+export async function runGraphicsSetup(api: Pick<Backend, "graphicsSetup" | "graphicsStatus">, onStatus: (s: GraphicsStatus) => void,
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms))): Promise<GraphicsStatus> {
+  try {
+    await api.graphicsSetup();
+  } catch (e) {
+    if (!(e instanceof BackendError && e.status === 409)) throw e;
+  }
+  for (;;) {
+    await sleep(POLL_MS);
+    const st = await api.graphicsStatus();
+    onStatus(st);
+    if (st.setup.state !== "running") return st;
+  }
+}
+
+/** One status line: a pip, what it is, and its version or path. */
+function Part({ ok, name, det }: { ok: boolean; name: string; det: string | null }) {
+  return <div className="row"><span className={`pip ${ok ? "ok" : "bad"}`} /><span>{name}</span><span className="det">{det ?? "not found"}</span></div>;
+}
+
+export function GraphicsView({ status, busy, error, onSetup }: {
+  status: GraphicsStatus | null; busy: boolean; error: string | null; onSetup: () => void;
+}) {
+  const running = busy || status?.setup.state === "running";
+  return (
+    <div className="sec">
+      <div className="sec-hd"><span className="lbl">Graphics</span></div>
+      {status && (
+        <>
+          <div className="muted">{status.message}</div>
+          <div className="gfx-status" aria-label="What graphics need">
+            <Part ok={status.node.ok} name="Node.js" det={status.node.version} />
+            <Part ok={status.cli.ok} name="HyperFrames" det={status.cli.version} />
+            <Part ok={status.chrome.ok} name="Chrome" det={status.chrome.ok ? "ready" : null} />
+            <Part ok={status.ffmpeg.ok} name="FFmpeg" det={status.ffmpeg.ok ? "ready" : null} />
+          </div>
+          {status.setup.state === "running" && status.setup.message && <div className="step-line">{status.setup.message}</div>}
+          {status.setup.state === "failed" && <div className="note bad">{status.setup.message}</div>}
+        </>
+      )}
+      {!status && !error && <div className="muted">Loading…</div>}
+      {error && <div className="note bad">{error}</div>}
+      {(!status || !status.ready) && (
+        <div className="actions-row" style={{ marginTop: 8 }}>
+          <button className="btn btn-p" onClick={onSetup} disabled={running}>{running ? "Setting up…" : "Set up graphics"}</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function GraphicsSection({ api }: { api: Backend }) {
+  const [status, setStatus] = useState<GraphicsStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    let live = true;
+    api.graphicsStatus().then((st) => { if (live) { setStatus(st); setError(null); } },
+      (e) => { if (live) setError(e instanceof Error ? e.message : String(e)); });
+    return () => { live = false; };
+  }, [api]);
+
+  async function onSetup() {
+    setBusy(true); setError(null);
+    try {
+      await runGraphicsSetup(api, setStatus);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return <GraphicsView status={status} busy={busy} error={error} onSetup={() => void onSetup()} />;
+}
+
 function AiKeyTab({ api, keyFromCache }: { api: Backend; keyFromCache: boolean }) {
   const [s, setup] = useSetup(api);
   if (!setup) return <div className="sec"><div className="muted">Loading…</div></div>;
-  return <KeyTab s={s} setup={setup} keyFromCache={keyFromCache} />;
+  return <><KeyTab s={s} setup={setup} keyFromCache={keyFromCache} /><GraphicsSection api={api} /></>;
 }
 
 export function SettingsPage({ api, keyFromCache, onClose }: { api: Backend; keyFromCache: boolean; onClose: () => void }) {

@@ -47,10 +47,14 @@ class ProjectItem {
   /** A file with pictures (a camera, a screen recording). An audio-only file (a .wav, see `wav`) has none, and
    *  reports no frame rate, or its sample rate. */
   hasVideo = true;
+  /** ProjectItemType.CLIP (a bin is 2, the root 3). */
+  type = 1;
+  /** The file it was imported from (importFiles, see load); a scene's items live in D:/Footage. */
+  mediaPath?: string;
   constructor(public name: string, public nodeId: string, public durationS: number, public unit: Unit = "seconds", public hasAudio = true) {
     this.outS = durationS;
   }
-  getMediaPath() { return `D:/Footage/${this.name}`; }
+  getMediaPath() { return this.mediaPath ?? `D:/Footage/${this.name}`; }
   getFootageInterpretation() { return { frameRate: this.hasVideo || this.mediaFps > 1000 ? this.mediaFps : 0 }; }
   private toSeconds(v: any) {
     const s = this.unit === "seconds" ? Number(v) : Number(v) / TICKS;
@@ -73,6 +77,9 @@ class ProjectItem {
   }
   getInPoint() { return Time.s(this.inS); }
   getOutPoint() { return Time.s(this.outS); }
+  /** ProjectItem.clearInPoint / clearOutPoint: the marks go back to the media's own start and end. */
+  clearInPoint() { this.inS = 0; }
+  clearOutPoint() { this.outS = this.durationS; }
 }
 
 /** A component property as measured in Premiere 26.5.2 (2026-10-14): the audio Volume component's "Level" reads
@@ -226,9 +233,26 @@ class Markers {
   deleteMarker(m: Marker) { this.list = this.list.filter((x) => x !== m); }
 }
 
+/** A project bin (ProjectItemType.BIN = 2) the host made with createBin. */
+class Bin {
+  type = 2;
+  items: (ProjectItem | Bin)[] = [];
+  constructor(public name: string, public nodeId: string) {}
+  get children() { return coll(this.items); }
+  createBin(name: string) { const b = new Bin(name, `bin-${name}`); this.items.push(b); return b; }
+}
+
 class Seq {
   videoTracks: any; audioTracks: any;
   name = "Main edit";
+  frameSizeHorizontal = 1920; frameSizeVertical = 1080;
+  /** app.project.path ("" for a project never saved) and the project's own bins beside the Footage bin. */
+  projectPath = "D:\\Projects\\Edit.prproj";
+  bins: Bin[] = [];
+  /** Files on disk importFiles can bring in: a rendered graphic is a MOV with pictures and no sound. */
+  files: Record<string, { durationS: number; hasAudio?: boolean }> = {};
+  /** Every importFiles call, as [paths, the bin's name]. */
+  imports: [string[], string][] = [];
   markers = new Markers();
   /** The project items on this sequence, as the project panel holds them (app.project.rootItem, see load). */
   bin: ProjectItem[] = [];
@@ -352,9 +376,28 @@ function load(seq: Seq, { qe = true } = {}) {
   const fakeQe = new FakeQE(seq);
   const coll = (xs: any[]) => Object.assign([...xs], { numItems: xs.length });
   // app.project.rootItem: the root, a "Footage" bin inside it, the sequence's project items in that.
-  const project = { activeSequence: seq, get rootItem() {
-    return { nodeId: "root", name: "", children: coll([{ nodeId: "bin-1", name: "Footage", children: coll(seq.bin) }]) };
-  } };
+  const project = {
+    activeSequence: seq,
+    get path() { return seq.projectPath; },
+    get rootItem() {
+      return { nodeId: "root", name: "", type: 3, children: coll([{ nodeId: "bin-1", name: "Footage", type: 2, children: coll(seq.bin) }, ...seq.bins]),
+        createBin: (name: string) => { const b = new Bin(name, `bin-${name}`); seq.bins.push(b); return b; } };
+    },
+    /** importFiles(paths, suppressUI, targetBin, asNumberedStills): each file becomes a project item named after it, in
+     *  that bin (measured with a ProRes MOV 2026-10-21); a file that isn't there is not imported (false). */
+    importFiles(paths: string[], _ui: boolean, bin: any, _stills: boolean) {
+      seq.imports.push([[...paths], bin?.name ?? ""]);
+      let all = true;
+      for (const p of paths) {
+        const f = seq.files[p];
+        if (!f) { all = false; continue; }
+        const pi = new ProjectItem(p.split(/[\\/]/).pop()!, `node-g${seq.imports.length}-${p.length}`, f.durationS, "seconds", !!f.hasAudio);
+        pi.mediaPath = p;
+        (bin instanceof Bin ? bin.items : seq.bin).push(pi);
+      }
+      return all;
+    },
+  };
   const sandbox: any = { app: { project }, Time, $: { global: {} } };
   if (qe) sandbox.app.enableQE = () => { sandbox.qe = fakeQe; };
   const ctx = vm.createContext(sandbox);
@@ -3944,6 +3987,274 @@ describe("gcutToolSetSpeed: play chosen clips faster or slower (QE setSpeed, tim
       const real = outcomeOf(() => undoTool(c.s, c.record));
       if (name === "untouched") { expect(checked).toEqual({ ok: true, wouldUndo: true }); expect(real).toEqual({ ok: true }); }
       else expect(real).toEqual(checked);
+    });
+  });
+});
+
+// ── motion graphics: gcutGraphicsContext, place_graphic, replace_graphic ────────────────────
+
+const GFX = "D:\\Projects\\Genius Cut Graphics";
+const LT1 = `${GFX}\\lower-third\\v1\\lower-third.mov`, LT2 = `${GFX}\\lower-third\\v2\\lower-third.mov`;
+const CALLOUT = `${GFX}\\callout\\v1\\callout.mov`;
+
+/** An interview on V1 + A1 at 100–120 s (selected), a logo on V3 at 112–114 s, four video tracks, two audio;
+ *  three rendered graphics on disk: the lower third's v1 (4 s) and v2 (6 s, slower), a callout (3 s). */
+function graphicsScene() {
+  const seq = new Seq(4, 2);
+  const cam = new ProjectItem("interview.mov", "node-i", 600);
+  const v1 = seq.videoTracks[0].add(cam, 100, 10, 30);
+  const a1 = seq.audioTracks[0].add(cam, 100, 10, 30);
+  v1.linked = [a1]; a1.linked = [v1];
+  v1.selected = true; a1.selected = true;
+  const logo = seq.videoTracks[2].add(new ProjectItem("logo.png", "node-l", 30, "seconds", false), 112, 0, 2);
+  seq.files = { [LT1]: { durationS: 4 }, [LT2]: { durationS: 6 }, [CALLOUT]: { durationS: 3 } };
+  return { seq, cam, v1, a1, logo, host: load(seq) };
+}
+const gfxBin = (seq: Seq) => seq.bins.find((b) => b.name === "Genius Cut Graphics");
+
+describe("gcutGraphicsContext: what a graphics render needs from the project and the sequence", () => {
+  it("gives the project's path, the sequence's frame size and its timebase (ticks per frame, as a string)", () => {
+    const s = graphicsScene();
+    expect(s.host.call("gcutGraphicsContext", {})).toEqual({ projectPath: "D:\\Projects\\Edit.prproj", width: 1920, height: 1080, timebase: String(TPF) });
+  });
+  it("gives an empty projectPath for a project never saved, and a vertical sequence's size as it is", () => {
+    const s = graphicsScene();
+    s.seq.projectPath = "";
+    s.seq.frameSizeHorizontal = 1080; s.seq.frameSizeVertical = 1920;
+    expect(s.host.call("gcutGraphicsContext", {})).toMatchObject({ projectPath: "", width: 1080, height: 1920 });
+  });
+});
+
+describe("gcutToolPlaceGraphic: import a rendered graphic and lay it on a free track above the selection, and its undo", () => {
+  const place = (s: any, args: object) => act(s, "gcutToolPlaceGraphic", args);
+
+  it("imports the MOV into a \"Genius Cut Graphics\" bin and lays it whole on the lowest free track above, no sound", () => {
+    const s = graphicsScene(), audioBefore = exact(s.seq).slice(4);
+    const r = place(s, { path: LT1, atS: 105, aboveTrack: 1 });
+    expect(s.seq.imports).toEqual([[[LT1], "Genius Cut Graphics"]]);
+    const bin = gfxBin(s.seq)!;
+    expect(bin.items.map((i: any) => i.name)).toEqual(["lower-third.mov"]);
+    expect(span(s.seq.videoTracks[1])).toEqual([[105, 109, 0]]);
+    expect(exact(s.seq).slice(4)).toEqual(audioBefore); // a ProRes MOV without sound lays none
+    expect(r).toMatchObject({ ok: true, track: "V2", startS: 105, endS: 109, idMap: {} });
+    expect(r.newIds).toEqual([idOf("V2", 105, (bin.items[0] as ProjectItem).nodeId)]);
+    expect(getSeq(s).clips.map((c: any) => c.id)).toContain(r.newIds[0]);
+    expect(asStored(r.undo)).toEqual(r.undo);
+    expect(r.undo).toMatchObject({ kind: "graphic-place", sequenceId: "seq-1", path: LT1 });
+  });
+
+  it("aboveTrack defaults to 1, atS lands on the nearest frame", () => {
+    const s = graphicsScene();
+    const r = place(s, { path: CALLOUT, atS: 101.013 });
+    expect(r.track).toBe("V2");
+    expect(layout(s.seq.videoTracks[1])).toEqual([[101, 104]]);
+  });
+
+  it("reuses the bin and an already imported file (matched by its path, not its name)", () => {
+    const s = graphicsScene();
+    place(s, { path: LT1, atS: 100 });
+    place(s, { path: LT1, atS: 115 });
+    expect(s.seq.imports.length).toBe(1);
+    place(s, { path: LT2, atS: 106 }); // same file name, another version
+    expect(s.seq.imports.length).toBe(2);
+    expect(s.seq.bins.length).toBe(1);
+    expect(gfxBin(s.seq)!.items.length).toBe(2);
+    expect(s.seq.videoTracks[1].items.find((i: TrackItem) => i.start.seconds === 106)!.projectItem.getMediaPath()).toBe(LT2);
+  });
+
+  it("skips a track with anything over ANY part of the span, and a locked track", () => {
+    const s = graphicsScene();
+    // 110–114 on V3 meets the logo at 112: V4 it is.
+    expect(place(s, { path: LT1, atS: 110, aboveTrack: 2 }).track).toBe("V4");
+    const t = graphicsScene();
+    t.seq.videoTracks[1].locked = true;
+    expect(place(t, { path: CALLOUT, atS: 100 }).track).toBe("V3");
+    // Ending exactly where the logo starts is free.
+    const u = graphicsScene();
+    expect(place(u, { path: CALLOUT, atS: 109, aboveTrack: 2 }).track).toBe("V3");
+  });
+
+  it.each([
+    ["no track above is free", (s: any) => { s.seq.videoTracks[3].add(new ProjectItem("x", "node-x", 30, "seconds", false), 113, 0, 1); }, { atS: 110, aboveTrack: 2 },
+      "No video track above V2 is free from 110 s to 114 s. Add a video track in Premiere (or make room), then try again."],
+    ["nothing above the top track", (_: any) => {}, { atS: 100, aboveTrack: 4 },
+      "No video track above V4 is free from 100 s to 104 s. Add a video track in Premiere (or make room), then try again."],
+  ])("refuses when %s (add a video track), changing nothing on the timeline", (_, change, args, msg) => {
+    const s = graphicsScene();
+    change(s);
+    const before = exact(s.seq);
+    expect(() => place(s, { path: LT1, ...args })).toThrow(msg);
+    expect(exact(s.seq)).toEqual(before);
+  });
+
+  it.each([
+    ["another sequence", { sequenceId: "seq-2", path: LT1, atS: 100 }, "A different sequence is open than the one you read. Call get_sequence again."],
+    ["no path", { path: "", atS: 100 }, "path must be the rendered graphic's file (make_graphic's path)."],
+    ["a time before the start", { path: LT1, atS: -1 }, "atS must be a time between 0 and 120 s (the sequence's end)."],
+    ["a time past the end", { path: LT1, atS: 121 }, "atS must be a time between 0 and 120 s (the sequence's end)."],
+    ["a track that isn't there", { path: LT1, atS: 100, aboveTrack: 5 }, "aboveTrack must be a video track number from 1 to 4."],
+    ["a file that isn't there", { path: `${GFX}\\nope\\v1\\nope.mov`, atS: 100 }, `Premiere didn't import ${GFX}\\nope\\v1\\nope.mov. Check that the file is there.`],
+  ])("refuses %s, changing nothing on the timeline", (_, args, msg) => {
+    const s = graphicsScene(), before = exact(s.seq);
+    expect(() => s.host.call("gcutToolPlaceGraphic", { sequenceId: "seq-1", ...args })).toThrow(msg);
+    expect(exact(s.seq)).toEqual(before);
+  });
+
+  it("when the graphic doesn't land as expected, takes off what it laid and fails", () => {
+    const s = graphicsScene(), before = exact(s.seq);
+    s.seq.lateSpanIndex = (s.seq as any).placements; s.seq.lateInS = 1;
+    expect(() => place(s, { path: LT1, atS: 105 })).toThrow("The graphic didn't land on V2 as expected, so it was taken off again. Nothing was changed on the timeline.");
+    expect(exact(s.seq)).toEqual(before);
+  });
+
+  it("leaves the bin item's own in/out marks as they were, and lays the whole file all the same", () => {
+    const s = graphicsScene();
+    place(s, { path: LT1, atS: 100 });
+    const pi = gfxBin(s.seq)!.items[0] as ProjectItem;
+    pi.inS = 1; pi.outS = 2;
+    place(s, { path: LT1, atS: 112 });
+    expect(layout(s.seq.videoTracks[1])).toEqual([[100, 104], [112, 116]]);
+    expect([pi.inS, pi.outS]).toEqual([1, 2]);
+  });
+
+  describe("undo", () => {
+    function placed() {
+      const s = graphicsScene(), original = exact(s.seq);
+      const r = place(s, { path: LT1, atS: 105 });
+      return { s, original, r, record: asStored(r.undo) };
+    }
+    it("takes exactly that clip off; the file stays in the bin", () => {
+      const { s, original, record } = placed();
+      expect(undoTool({ host: load(s.seq) }, record)).toEqual({ ok: true });
+      expect(exact(s.seq)).toEqual(original);
+      expect(gfxBin(s.seq)!.items.length).toBe(1);
+      expect(undoTool(s, record)).toEqual({ ok: true, alreadyUndone: true });
+    });
+    it("refuses, changing nothing, when the graphic was moved or trimmed by hand since", () => {
+      const { s, record } = placed();
+      s.seq.videoTracks[1].items[0].setEnd(108 * TICKS);
+      const now = exact(s.seq);
+      expect(() => undoTool(s, record)).toThrow("The graphic on V2 was moved, trimmed or replaced by hand since. Nothing was undone; use Premiere's Undo instead.");
+      expect(exact(s.seq)).toEqual(now);
+    });
+    it("refuses on a locked track", () => {
+      const { s, record } = placed();
+      s.seq.videoTracks[1].locked = true;
+      expect(() => undoTool(s, record)).toThrow("V2 is locked. Unlock it to undo.");
+    });
+    it.each([
+      ["untouched", (_: any) => {}],
+      ["trimmed", ({ s }: any) => { s.seq.videoTracks[1].items[0].setEnd(108 * TICKS); }],
+      ["gone", ({ s }: any) => { s.seq.videoTracks[1].items = []; }],
+    ])("check: true matches the real undo (%s)", (name, change) => {
+      const c = placed();
+      change(c);
+      checkMatchesUndo(c.s, c.record, name === "untouched", c.original);
+    });
+  });
+});
+
+describe("gcutToolReplaceGraphic: swap a placed graphic for another version (same start, its own length), and its undo", () => {
+  const place = (s: any, args: object) => act(s, "gcutToolPlaceGraphic", args);
+  const replace = (s: any, clipId: string, path: string) => act(s, "gcutToolReplaceGraphic", { clipId, path });
+  function withV1(atS = 105) {
+    const s = graphicsScene();
+    const id = place(s, { path: LT1, atS }).newIds[0];
+    return { s, id, original: exact(s.seq) };
+  }
+
+  it("takes v1 off and lays the longer v2 at the same start on the same track; idMap old → new", () => {
+    const { s, id } = withV1();
+    const r = replace(s, id, LT2);
+    expect(layout(s.seq.videoTracks[1])).toEqual([[105, 111]]);
+    const v2Node = s.seq.videoTracks[1].items[0].projectItem.nodeId;
+    expect(s.seq.videoTracks[1].items[0].projectItem.getMediaPath()).toBe(LT2);
+    expect(r).toMatchObject({ ok: true, track: "V2", idMap: { [id]: [idOf("V2", 105, v2Node)] } });
+    expect(asStored(r.undo)).toEqual(r.undo);
+    expect(r.undo).toMatchObject({ kind: "graphic-replace", sequenceId: "seq-1", fromPath: LT1, toPath: LT2 });
+  });
+
+  it("undo lays v1 back at its old start and length, exactly", () => {
+    const { s, id, original } = withV1();
+    const r = replace(s, id, LT2);
+    expect(undoTool({ host: load(s.seq) }, asStored(r.undo))).toEqual({ ok: true });
+    expect(exact(s.seq)).toEqual(original);
+    expect(undoTool(s, asStored(r.undo))).toEqual({ ok: true, alreadyUndone: true });
+  });
+
+  it("a longer version refuses when anything is in its new span, changing nothing; a shorter one needs no more room", () => {
+    const { s, id } = withV1(109); // V2 109–113
+    s.seq.videoTracks[1].add(new ProjectItem("x", "node-x", 30, "seconds", false), 114, 0, 1);
+    const before = exact(s.seq);
+    expect(() => replace(s, id, LT2)).toThrow("Something is on V2 between 109 s and 115 s, where the new version would run. Make room there, then try again. Nothing was changed.");
+    expect(exact(s.seq)).toEqual(before);
+    expect(replace(s, id, CALLOUT).idMap[id]).toHaveLength(1);
+    expect(layout(s.seq.videoTracks[1])).toEqual([[109, 112], [114, 115]]);
+  });
+
+  it.each([
+    ["a stale clip id", (_: any, id: string) => id.replace("@", "@1"), LT2, STALE],
+    ["an audio clip", (s: any) => idsOn(s, "A1")[0], LT2, "Choose the graphic's clip on its video track."],
+    ["the version already there", (_: any, id: string) => id, LT1, "That version is the one already placed."],
+    ["a file that isn't there", (_: any, id: string) => id, `${GFX}\\nope.mov`, `Premiere didn't import ${GFX}\\nope.mov. Check that the file is there.`],
+    ["a locked track", (s: any, id: string) => { s.seq.videoTracks[1].locked = true; return id; }, LT2, "V2 is locked. Unlock it to replace a graphic."],
+  ])("refuses %s, changing nothing on the timeline", (_, pick, path, msg) => {
+    const { s, id } = withV1();
+    const clip = pick(s, id);
+    const before = exact(s.seq);
+    expect(() => replace(s, clip, path)).toThrow(msg);
+    expect(exact(s.seq)).toEqual(before);
+  });
+
+  it("when the new version doesn't land as expected, lays the old one back and fails", () => {
+    const { s, id, original } = withV1();
+    s.seq.lateSpanIndex = (s.seq as any).placements; s.seq.lateInS = 1;
+    expect(() => replace(s, id, LT2)).toThrow("The new version didn't land on V2 as expected, so the old one was laid back. Nothing was changed.");
+    expect(exact(s.seq)).toEqual(original);
+  });
+
+  describe("undo", () => {
+    function replaced() {
+      const { s, id, original } = withV1();
+      const record = asStored(replace(s, id, LT2).undo);
+      return { s, original, record };
+    }
+    it("refuses, changing nothing, when the new version was trimmed by hand", () => {
+      const { s, record } = replaced();
+      s.seq.videoTracks[1].items[0].setEnd(110 * TICKS);
+      const now = exact(s.seq);
+      expect(() => undoTool(s, record)).toThrow("The graphic on V2 was moved, trimmed or replaced by hand since. Nothing was undone; use Premiere's Undo instead.");
+      expect(exact(s.seq)).toEqual(now);
+    });
+    it("refuses, changing nothing, when something now sits where the old (longer) version would go back", () => {
+      const { s, id } = withV1(); // v1 105–109
+      const record = asStored(replace(s, id, CALLOUT).undo); // 105–108
+      s.seq.videoTracks[1].add(new ProjectItem("x", "node-x", 30, "seconds", false), 108, 0, 1);
+      const now = exact(s.seq);
+      expect(() => undoTool(s, record)).toThrow("Something was placed on V2 where the old version would go back since. Nothing was undone; use Premiere's Undo instead.");
+      expect(exact(s.seq)).toEqual(now);
+    });
+    it("refuses when the old version's file left the project", () => {
+      const { s, record } = replaced();
+      const bin = gfxBin(s.seq)!;
+      bin.items = bin.items.filter((i: any) => i.getMediaPath() !== LT1);
+      expect(() => undoTool(s, record)).toThrow("V2's old version isn't in the project any more, so the replace can't be undone. Use Premiere's Undo instead.");
+    });
+    it("when the old version won't go back as it was, lays the new one back and fails", () => {
+      const { s, record } = replaced();
+      const now = exact(s.seq);
+      s.seq.lateSpanIndex = (s.seq as any).placements; s.seq.lateInS = 1;
+      expect(() => undoTool(s, record)).toThrow("The old version didn't go back on V2 as expected, so the new one was laid back. Nothing was undone; try again, or use Premiere's Undo.");
+      expect(exact(s.seq)).toEqual(now);
+    });
+    it.each([
+      ["untouched", (_: any) => {}],
+      ["trimmed", ({ s }: any) => { s.seq.videoTracks[1].items[0].setEnd(110 * TICKS); }],
+      ["both gone", ({ s }: any) => { s.seq.videoTracks[1].items = []; }],
+    ])("check: true matches the real undo (%s)", (name, change) => {
+      const c = replaced();
+      change(c);
+      checkMatchesUndo(c.s, c.record, name === "untouched", c.original);
     });
   });
 });

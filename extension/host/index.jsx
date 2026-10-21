@@ -2968,6 +2968,331 @@ function gcutToolSetSpeed(argsJson) {
     }
 }
 
+// ── motion graphics: place_graphic, replace_graphic ───────────────────────────────────
+
+/*
+ * A graphic is a transparent MOV without sound that the backend's make_graphic rendered next to the project
+ * (<project folder>/Genius Cut Graphics/<slug>/v<N>/<slug>.mov). It is imported once into a "Genius Cut
+ * Graphics" bin (app.project.importFiles(paths, true, bin, false), measured 2026-10-21 with a ProRes MOV) and
+ * laid whole with overwriteClip at a whole frame (the spike laid a 4 s MOV on V2 so, and a MOV without sound
+ * lays no sound). Never TrackItem.move. Every version of a graphic has the same file name, so the imported
+ * item is found by its media path, not its name. A placed graphic's id is the usual clip id (gcutClipId).
+ */
+var GCUT_GRAPHICS_BIN = "Genius Cut Graphics";
+var GCUT_BIN_TYPE = 2; // ProjectItemType.BIN
+
+/**
+ * What a graphics render needs: { projectPath (app.project.path, "" for a project never saved), width,
+ * height (the active sequence's frame size), timebase (ticks per frame, as a string) }.
+ */
+function gcutGraphicsContext() {
+    try {
+        var seq = gcutSequence();
+        return gcutOk({ projectPath: String(app.project.path || ""), width: Number(seq.frameSizeHorizontal),
+                        height: Number(seq.frameSizeVertical), timebase: String(seq.timebase) });
+    } catch (e) {
+        return gcutFail(e);
+    }
+}
+
+/** A file path compared as Windows does: either slash, any case. */
+function gcutPathKey(p) { return String(p).replace(/\\/g, "/").toLowerCase(); }
+
+function gcutChildren(item) {
+    var out = [];
+    if (item && item.children) for (var k = 0; k < item.children.numItems; k++) out.push(item.children[k]);
+    return out;
+}
+
+/** The project's top-level "Genius Cut Graphics" bin, made the first time. */
+function gcutGraphicsBin() {
+    for (var pass = 0; pass < 2; pass++) {
+        var root = app.project.rootItem, kids = gcutChildren(root);
+        for (var k = 0; k < kids.length; k++) if (kids[k].type === GCUT_BIN_TYPE && String(kids[k].name) === GCUT_GRAPHICS_BIN) return kids[k];
+        if (pass === 0) root.createBin(GCUT_GRAPHICS_BIN);
+    }
+    throw new Error("Premiere didn't make the \"" + GCUT_GRAPHICS_BIN + "\" bin.");
+}
+
+/** The item in this bin imported from `path`, or null. */
+function gcutMediaIn(bin, path) {
+    var kids = gcutChildren(bin), key = gcutPathKey(path);
+    for (var k = 0; k < kids.length; k++) {
+        if (kids[k].type === GCUT_BIN_TYPE) continue;
+        var p;
+        try { p = kids[k].getMediaPath(); } catch (e) { continue; }
+        if (gcutPathKey(p) === key) return kids[k];
+    }
+    return null;
+}
+
+/** The graphic file's project item: the one already in the graphics bin, or imported there now. */
+function gcutImportGraphic(path) {
+    var bin = gcutGraphicsBin(), pi = gcutMediaIn(bin, path);
+    if (pi) return pi;
+    try { app.project.importFiles([String(path)], true, bin, false); } catch (e) { /* checked below */ }
+    pi = gcutMediaIn(bin, path);
+    if (!pi) throw new Error("Premiere didn't import " + path + ". Check that the file is there.");
+    return pi;
+}
+
+/**
+ * The whole file's span, { inS, lenS }: the item's marks cleared, read, and set back as they were (a graphic
+ * is always laid whole, whatever marks the bin item holds).
+ */
+function gcutWholeMedia(pi, clock) {
+    var tolS = clock.frameS / 2, inS = pi.getInPoint().seconds, outS = pi.getOutPoint().seconds;
+    if (typeof pi.clearInPoint !== "function" || typeof pi.clearOutPoint !== "function") return { inS: inS, lenS: outS - inS };
+    pi.clearOutPoint();
+    pi.clearInPoint();
+    var whole = { inS: pi.getInPoint().seconds, lenS: pi.getOutPoint().seconds - pi.getInPoint().seconds };
+    if (!gcutNear(whole.inS, inS, tolS) || !gcutNear(whole.inS + whole.lenS, outS, tolS)) gcutSetRange(pi, inS, outS, tolS);
+    return whole;
+}
+
+/** The first clip on video track t overlapping [fromT, toT) (by more than half a frame) other than one starting at `exceptT`, or null. */
+function gcutGraphicBlocker(seq, t, fromT, toT, clock, exceptT) {
+    var items = gcutItems(seq.videoTracks[t]);
+    for (var i = 0; i < items.length; i++) {
+        var s = gcutT(items[i].start);
+        if (s !== exceptT && gcutOverlaps(s, gcutT(items[i].end), fromT, toT, clock)) return items[i];
+    }
+    return null;
+}
+
+/** The graphic of `node` on video track t exactly as laid: start atT, length durT, in point inS; or null. */
+function gcutGraphicAt(seq, t, node, atT, inS, durT, clock) {
+    var items = gcutItems(seq.videoTracks[t]);
+    for (var i = 0; i < items.length; i++) {
+        var it = items[i], s = gcutT(it.start);
+        if (gcutNode(it) === node && gcutNear(s, atT, clock.half) && gcutNear(gcutT(it.end) - s, durT, clock.half) &&
+            gcutNear(it.inPoint.seconds, inS, clock.frameS / 2)) return it;
+    }
+    return null;
+}
+
+/** Take off every clip of `node` overlapping [fromT, toT) on any track, except those in `others` (there before). */
+function gcutTakeOffGraphic(seq, node, fromT, toT, clock, others) {
+    var tracks = gcutTracks(seq);
+    for (var t = 0; t < tracks.length; t++) {
+        var items = gcutItems(tracks[t].track);
+        for (var i = items.length - 1; i >= 0; i--) {
+            var s = gcutT(items[i].start);
+            if (gcutNode(items[i]) !== node || !gcutOverlaps(s, gcutT(items[i].end), fromT, toT, clock) || gcutKept(others, t, s, node)) continue;
+            try { items[i].remove(false, false); } catch (ignored) { /* checked by the caller */ }
+        }
+    }
+}
+
+/** True if nothing of `node` but `others` overlaps [fromT, toT) and every one of `others` is as it was. */
+function gcutGraphicClean(seq, node, fromT, toT, clock, others) {
+    var tracks = gcutTracks(seq);
+    for (var t = 0; t < tracks.length; t++) {
+        var items = gcutItems(tracks[t].track);
+        for (var i = 0; i < items.length; i++) {
+            var s = gcutT(items[i].start);
+            if (gcutNode(items[i]) === node && gcutOverlaps(s, gcutT(items[i].end), fromT, toT, clock) && !gcutKept(others, t, s, node)) return false;
+        }
+    }
+    return !gcutSnapshotIntact(seq, others, clock);
+}
+
+/**
+ * Lay `pi` from inS for durT ticks at atT on video track t (overwriteClip; the bin item's own marks set back
+ * after) and check it: exactly there, and nothing in `others` (what overlapped the span on every track
+ * before) changed. Returns the laid clip; otherwise takes off what it laid and returns null.
+ */
+function gcutLayGraphic(seq, t, pi, atT, inS, durT, clock, others) {
+    var tolS = clock.frameS / 2, outS = inS + durT / GCUT_TICKS, it = null;
+    var marks = { inS: pi.getInPoint().seconds, outS: pi.getOutPoint().seconds };
+    var reset = !gcutNear(marks.inS, inS, tolS) || !gcutNear(marks.outS, outS, tolS);
+    try {
+        if (reset) gcutSetRange(pi, inS, outS, tolS);
+        seq.videoTracks[t].overwriteClip(pi, String(atT));
+        it = gcutGraphicAt(seq, t, pi.nodeId, atT, inS, durT, clock);
+        if (it && gcutSnapshotIntact(seq, others, clock)) it = null;
+    } catch (e) {
+        it = null;
+    } finally {
+        if (reset) { try { gcutSetRange(pi, marks.inS, marks.outS, tolS); } catch (ignored) { /* best effort */ } }
+    }
+    if (!it) gcutTakeOffGraphic(seq, pi.nodeId, atT, atT + durT, clock, others);
+    return it;
+}
+
+/** A placed graphic as its undo record names it: gcutRef plus its in point and on/off. */
+function gcutGraphicRef(t, it, clock) {
+    var ref = gcutRef("video", t, it);
+    ref.inS = gcutClipInS("video", it, clock);
+    ref.enabled = gcutEnabled(it);
+    return ref;
+}
+
+function gcutGraphicByHand(ref) { return new Error("The graphic on " + ref.label + " was moved, trimmed or replaced by hand since. " + GCUT_BY_HAND); }
+
+function gcutIsGraphicRef(ref) {
+    return ref && typeof ref.trackIndex === "number" && typeof ref.startT === "number" && typeof ref.endT === "number" &&
+        typeof ref.inS === "number" && typeof ref.node === "string" && typeof ref.label === "string";
+}
+
+/**
+ * args: { sequenceId, path (make_graphic's MOV), atS, aboveTrack? (1-based video track: the selection's highest;
+ * default 1) } — import the graphic into the "Genius Cut Graphics" bin (reused, as is a file already imported)
+ * and lay it whole at atS (to the nearest frame) on the lowest video track above aboveTrack that is unlocked and
+ * empty over the WHOLE span [atS, atS + its length]. A new track can't be made from a script: when none is free
+ * it refuses ("Add a video track"), changing nothing on the timeline. Returns { ok, track ("V3"), startS, endS,
+ * newIds: [the laid clip's id], idMap: {}, undo: { kind: "graphic-place", sequenceId, clip: {kind, trackIndex,
+ * label, node, startT, endT, inS, enabled}, path } }.
+ */
+function gcutToolPlaceGraphic(argsJson) {
+    try {
+        var args = gcutParse(argsJson) || {};
+        var seq = gcutSequence(), clock = gcutClock(seq), nV = seq.videoTracks.numTracks;
+        gcutSameSequence(seq, args.sequenceId);
+        if (typeof args.path !== "string" || !args.path) throw new Error("path must be the rendered graphic's file (make_graphic's path).");
+        var endS = gcutSeqEndT(seq) / GCUT_TICKS;
+        if (!gcutIsTime(args.atS) || args.atS < 0 || args.atS > endS) throw new Error("atS must be a time between 0 and " + gcutSecText(endS) + " s (the sequence's end).");
+        var above = args.aboveTrack === undefined || args.aboveTrack === null ? 1 : args.aboveTrack;
+        if (typeof above !== "number" || Math.floor(above) !== above || above < 1 || above > nV) {
+            throw new Error("aboveTrack must be a video track number from 1 to " + nV + ".");
+        }
+        var pi = gcutImportGraphic(args.path), whole = gcutWholeMedia(pi, clock);
+        var atT = gcutFrameT(args.atS, clock), durT = gcutFrameT(whole.lenS, clock), toT = atT + durT, t = -1, k;
+        if (durT <= 0) throw new Error(args.path + " is shorter than a frame.");
+        for (k = above; k < nV && t < 0; k++) {
+            var track = seq.videoTracks[k];
+            if (typeof track.isLocked === "function" && track.isLocked()) continue;
+            if (!gcutGraphicBlocker(seq, k, atT, toT, clock, null)) t = k;
+        }
+        if (t < 0) {
+            throw new Error("No video track above V" + above + " is free from " + gcutSecText(atT / GCUT_TICKS) + " s to " + gcutSecText(toT / GCUT_TICKS) +
+                " s. Add a video track in Premiere (or make room), then try again.");
+        }
+        var others = gcutOthers(seq, [], atT, toT), label = gcutLabel("video", t);
+        var it = gcutLayGraphic(seq, t, pi, atT, whole.inS, durT, clock, others);
+        if (!it) {
+            throw new Error(gcutGraphicClean(seq, pi.nodeId, atT, toT, clock, others)
+                ? "The graphic didn't land on " + label + " as expected, so it was taken off again. Nothing was changed on the timeline."
+                : "The graphic didn't land on " + label + " as expected, and what was laid couldn't all be taken off. Use Premiere's Undo.");
+        }
+        return gcutOk({ ok: true, track: label, startS: atT / GCUT_TICKS, endS: toT / GCUT_TICKS, newIds: [gcutClipId("video", t, it)], idMap: {},
+                        undo: { kind: "graphic-place", sequenceId: gcutSeqId(seq), clip: gcutGraphicRef(t, it, clock), path: args.path } });
+    } catch (e) {
+        return gcutFail(e);
+    }
+}
+
+/**
+ * Undo a place_graphic: take exactly that clip off (the file stays in the bin). Gone, with nothing where it
+ * was: already undone. Anything else there (it was moved, trimmed or replaced): refused, changing nothing.
+ */
+function gcutUndoGraphicPlace(seq, record, clock, check) {
+    var ref = record.clip;
+    if (!gcutIsGraphicRef(ref)) throw new Error("This undo record is incomplete.");
+    var it = gcutFindRef(seq, ref);
+    if (!it) {
+        if (ref.trackIndex >= seq.videoTracks.numTracks || gcutGraphicBlocker(seq, ref.trackIndex, ref.startT, ref.endT, clock, null)) throw gcutGraphicByHand(ref);
+        return { ok: true, alreadyUndone: true };
+    }
+    gcutRefuseLocked(seq, [ref], "undo");
+    if (check) return { ok: true, wouldUndo: true };
+    it.remove(false, false);
+    if (gcutFindRef(seq, ref)) throw new Error("Premiere didn't take the graphic off " + ref.label + ". Use Premiere's Undo.");
+    return { ok: true };
+}
+
+/**
+ * args: { sequenceId, clipId (a placed graphic, from get_sequence), path (the new version's MOV) } — take the
+ * graphic off and lay the new version at the SAME start, with ITS OWN length (a slower version is longer), on
+ * the same track, on or off as the old one was. Refuses, changing nothing on the timeline, when anything else
+ * is on that track over the new version's span, the track is locked, the clip isn't on a video track or isn't
+ * at 100% speed, or the path is the version already there. Returns { ok, track, startS, endS, warning?,
+ * idMap: { oldId: [newId] }, undo: { kind: "graphic-replace", sequenceId, from, to (as place_graphic's clip),
+ * fromPath, toPath } }.
+ */
+function gcutToolReplaceGraphic(argsJson) {
+    try {
+        var args = gcutParse(argsJson) || {};
+        var seq = gcutSequence(), clock = gcutClock(seq);
+        gcutSameSequence(seq, args.sequenceId);
+        if (typeof args.path !== "string" || !args.path) throw new Error("path must be the new version's file (make_graphic's path).");
+        var chosen = gcutResolveIds(seq, [args.clipId]);
+        if (chosen.length !== 1 || chosen[0].kind !== "video") throw new Error("Choose the graphic's clip on its video track.");
+        var t = chosen[0].trackIndex, old = chosen[0].item, label = gcutLabel("video", t);
+        gcutRefuseLocked(seq, chosen, "replace a graphic");
+        if (!old.projectItem) throw new Error(label + "'s clip has no source file, so it isn't a graphic Genius Cut placed.");
+        if (Math.abs(gcutSpeed(old) - 1) > 1e-6) throw new Error(label + "'s graphic isn't at 100% speed, so replacing it couldn't be undone exactly. Set it back to 100% first.");
+        var fromPath = gcutSource(old);
+        if (gcutPathKey(fromPath) === gcutPathKey(args.path)) throw new Error("That version is the one already placed.");
+        var from = gcutGraphicRef(t, old, clock), oldId = gcutClipId("video", t, old), oldPi = old.projectItem;
+        var pi = gcutImportGraphic(args.path), whole = gcutWholeMedia(pi, clock);
+        var atT = from.startT, durT = gcutFrameT(whole.lenS, clock), toT = atT + durT;
+        if (durT <= 0) throw new Error(args.path + " is shorter than a frame.");
+        if (gcutGraphicBlocker(seq, t, atT, toT, clock, atT)) {
+            throw new Error("Something is on " + label + " between " + gcutSecText(atT / GCUT_TICKS) + " s and " + gcutSecText(toT / GCUT_TICKS) +
+                " s, where the new version would run. Make room there, then try again. Nothing was changed.");
+        }
+        var fx = gcutClipEffects("video", old);
+        var others = gcutOthers(seq, [{ kind: "video", trackIndex: t, startT: atT }], atT, Math.max(toT, from.endT));
+        old.remove(false, false);
+        if (gcutFindRef(seq, from)) throw new Error("The old version didn't come off " + label + ". Use Premiere's Undo to put back anything that did.");
+        var it = gcutLayGraphic(seq, t, pi, atT, whole.inS, durT, clock, others);
+        if (!it) {
+            var back = gcutGraphicClean(seq, pi.nodeId, atT, toT, clock, others) ? gcutLayGraphic(seq, t, oldPi, atT, from.inS, from.endT - from.startT, clock, others) : null;
+            if (back && !from.enabled) back.disabled = true;
+            throw new Error(back
+                ? "The new version didn't land on " + label + " as expected, so the old one was laid back. Nothing was changed."
+                : "The new version didn't land on " + label + " as expected, and the old one couldn't be laid back. Use Premiere's Undo.");
+        }
+        if (!from.enabled) it.disabled = true;
+        return gcutOk({ ok: true, track: label, startS: atT / GCUT_TICKS, endS: toT / GCUT_TICKS,
+                        warning: fx.length ? "The old version's effects (" + fx.join(", ") + ") weren't carried over to the new one." : undefined,
+                        idMap: gcutMapOf(oldId, gcutClipId("video", t, it)),
+                        undo: { kind: "graphic-replace", sequenceId: gcutSeqId(seq), from: from, to: gcutGraphicRef(t, it, clock), fromPath: fromPath, toPath: args.path } });
+    } catch (e) {
+        return gcutFail(e);
+    }
+}
+
+function gcutMapOf(oldId, newId) { var m = {}; m[oldId] = [newId]; return m; }
+
+/**
+ * Undo a replace_graphic: take the new version off and lay the old one back at its old start and length, on
+ * or off as it was. The old one back and the new gone: already undone. The new one not exactly as laid, or
+ * anything else where the old one would go: refused, changing nothing. A lay that fails lays the new one back.
+ */
+function gcutUndoGraphicReplace(seq, record, clock, check) {
+    var from = record.from, to = record.to;
+    if (!gcutIsGraphicRef(from) || !gcutIsGraphicRef(to)) throw new Error("This undo record is incomplete.");
+    var now = gcutFindRef(seq, to);
+    if (!now) {
+        if (gcutFindRef(seq, from)) return { ok: true, alreadyUndone: true };
+        throw gcutGraphicByHand(to);
+    }
+    if (gcutGraphicBlocker(seq, from.trackIndex, from.startT, from.endT, clock, to.startT)) {
+        throw new Error("Something was placed on " + from.label + " where the old version would go back since. " + GCUT_BY_HAND);
+    }
+    var oldPi = gcutProjectItemByNode(from.node);
+    if (!oldPi) throw new Error(from.label + "'s old version isn't in the project any more, so the replace can't be undone. Use Premiere's Undo instead.");
+    gcutRefuseLocked(seq, [to], "undo");
+    if (check) return { ok: true, wouldUndo: true };
+    var newPi = now.projectItem, toT = Math.max(from.endT, to.endT);
+    var others = gcutOthers(seq, [{ kind: "video", trackIndex: to.trackIndex, startT: to.startT }], from.startT, toT);
+    now.remove(false, false);
+    if (gcutFindRef(seq, to)) throw new Error("Premiere didn't take the new version off " + to.label + ". Use Premiere's Undo.");
+    var it = gcutLayGraphic(seq, from.trackIndex, oldPi, from.startT, from.inS, from.endT - from.startT, clock, others);
+    if (!it) {
+        var back = gcutGraphicClean(seq, from.node, from.startT, from.endT, clock, others)
+            ? gcutLayGraphic(seq, to.trackIndex, newPi, to.startT, to.inS, to.endT - to.startT, clock, others) : null;
+        if (back && !to.enabled) back.disabled = true;
+        throw new Error(back
+            ? "The old version didn't go back on " + from.label + " as expected, so the new one was laid back. Nothing was undone; try again, or use Premiere's Undo."
+            : "The old version didn't go back on " + from.label + " as expected, and the new one couldn't be laid back. Use Premiere's Undo.");
+    }
+    if (!from.enabled) it.disabled = true;
+    return { ok: true };
+}
+
 /** Chosen clips ({kind, trackIndex, item}) as gcutRecordedAt reads them. */
 function gcutChosenFound(chosen) {
     var out = [];
@@ -3013,6 +3338,8 @@ function gcutToolUndo(argsJson) {
             }, function (a, b) { return Math.abs(a - b) <= 1e-4; }));
         }
         if (record.kind === "mute") return gcutOk(gcutUndoMute(seq, record, check));
+        if (record.kind === "graphic-place") return gcutOk(gcutUndoGraphicPlace(seq, record, clock, check));
+        if (record.kind === "graphic-replace") return gcutOk(gcutUndoGraphicReplace(seq, record, clock, check));
         if (record.kind === "transition") {
             // No measured script call removes one transition; refusing would block a whole group undo.
             return gcutOk({ ok: true, skipped: true, message: "The transition stays: Premiere can't remove it from a script. Remove it by hand if needed." });

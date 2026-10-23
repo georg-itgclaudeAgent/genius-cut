@@ -254,7 +254,7 @@ def test_trim_spend_rows_carry_the_agent_runs_id_when_given(tmp_path):
     from geniuscut import spend
 
     def priced(words, fewshot, instruction):
-        spend.record("claude-opus-5-5", 1000, 100)
+        spend.record("anthropic:claude-opus-5-5", 1000, 100)
         return CUTS
 
     token = get_or_create_token(tmp_path)

@@ -71,7 +71,7 @@ def test_claude_usage_is_recorded_at_the_opus_price():
     fake._response.usage = SimpleNamespace(input_tokens=1_000, output_tokens=2_000)
     with spend.meter() as m:
         claude.ask_json("hi", {"type": "object"}, client=fake)
-    assert m.model == "claude-opus-5-5" and m.usd == pytest.approx(1_000 * 4e-6 + 2_000 * 20e-6)
+    assert m.model == "anthropic:claude-opus-5-5" and m.usd == pytest.approx(1_000 * 4e-6 + 2_000 * 20e-6)
 
 
 def test_an_unpriced_claude_model_is_refused_so_the_limit_holds(monkeypatch):

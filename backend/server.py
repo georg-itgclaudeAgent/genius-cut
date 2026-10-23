@@ -14,14 +14,16 @@ CORS is configured: a browser page can't reach the API, and the Host check below
 also stops DNS-rebinding tricks.
 
 `GET`/`PUT /settings` read and save this editor's settings (where their Anthropic key lives,
-the monthly limit; never a key), and `POST /settings/test-key` checks a key source (a pass saves it
-and marks setup complete). `/setup/*` and `/usage` serve the Setup and Settings screens; their
+the monthly limit, the selected AI model, the Vertex project/region; never a key; PUT merges the fields
+sent), `PUT /settings/model` switches the model, `GET /models` lists the catalog with live states, and
+`POST /settings/test-key` checks a key source (a pass saves it and marks setup complete). The model
+routes, the `/health` ai block and every `cost` shape are listed at the top of geniuscut/catalog.py. `/setup/*` and `/usage` serve the Setup and Settings screens; their
 request/response shapes are listed at the top of geniuscut/setup.py. `/agent/runs*` run Claude's
 side of an instruction (shapes at the top of geniuscut/agent.py). `/graphics/*` report and run the one-time
 graphics setup (shapes at the top of geniuscut/graphics.py).
 
 AI errors: a missing key is 503, the monthly spend limit (`spend.BudgetExceeded`) is
-402, and any other provider error is 502. `/health` reports the AI provider, model and
+402, and any other provider error is 502. `/health` reports the selected model, its provider and
 the month's spend so far, never a key.
 """
 
@@ -40,13 +42,13 @@ import logging
 import subprocess
 import threading
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
-from geniuscut import (agent, audio, claude, config, cuts, graphics, library, llm, secrets, settings, setup, spend,
+from geniuscut import (agent, audio, catalog, claude, config, cuts, graphics, library, llm, secrets, settings, setup, spend,
                        transcripts, trim)
 from geniuscut.llm import LLMError
 from geniuscut.models import StyleExample, TranscriptJob, TranscriptRequest, TrimRequest, TrimResponse, Word
@@ -57,20 +59,44 @@ LOOPBACK_HOSTS = ["127.0.0.1", "localhost"]
 
 
 def ai_status() -> dict:
-    """The `/health` ai block. Never raises: a bad setting or ledger shows as nulls."""
+    """The `/health` ai block for the selected model (shape: geniuscut/catalog.py). Never raises: a bad
+    setting or ledger shows as nulls."""
     try:
-        provider, model = llm.provider(), llm.model()
+        model_id = llm.selected_id()
     except LLMError:
-        provider, model = "unknown", None
+        model_id = None
     try:
         month_usd = round(spend.month_total(), 6)
     except Exception:  # noqa: BLE001 — health must answer even if the ledger can't be read
         log.exception("Couldn't read the AI spend ledger")
         month_usd = None
-    per_minute = spend.estimate_per_minute(model) if model else None
-    return {"provider": provider, "model": model, "month_usd": month_usd, "limit_usd": spend.limit_usd(),
-            "limit_tier": settings.load().monthly_limit_usd, "usd_per_minute": per_minute,
-            "key_from_cache": secrets.key_from_cache()}
+    per_minute = spend.estimate_per_minute(model_id) if model_id else None
+    return {"model_id": model_id, "label": catalog.label(model_id),
+            "provider": catalog.provider_of(model_id) if model_id else "unknown", "month_usd": month_usd,
+            "limit_usd": spend.limit_usd(), "limit_tier": settings.load().monthly_limit_usd,
+            "usd_per_minute": per_minute, "key_from_cache": secrets.key_from_cache()}
+
+
+class SettingsPatch(BaseModel):
+    """PUT /settings: only the fields sent are changed (setup_complete is never taken from the body)."""
+    anthropic_key: settings.KeySource | None = None
+    monthly_limit_usd: Literal[20, 100] | None = None
+    model: str | None = None
+    vertex: dict | None = None
+
+
+class ModelChoice(BaseModel):
+    model: str
+
+
+class VertexLoginRequest(BaseModel):
+    project: str | None = None
+
+
+def _first_error(e: ValidationError) -> str:
+    errs = e.errors()
+    msg = str(errs[0].get("msg", "")) if errs else str(e)
+    return msg.removeprefix("Value error, ")
 
 
 class TestKeyRequest(BaseModel):
@@ -121,11 +147,14 @@ def create_app(
     gcloud_run: Callable = subprocess.run,
     find_gcloud: Callable[[], str | None] = setup.find_gcloud,
     login: setup.Login | None = None,
+    vertex_login: setup.VertexLogin | None = None,
+    availability: catalog.Availability | None = None,
     agent_runs: agent.Runs | None = None,
     graphics_engine: graphics.Engine | None = None,
     graphics_setup: graphics.Setup | None = None,
 ) -> FastAPI:
     llm_cost = globals()["llm"].run_cost  # the `llm` parameter shadows the module in here
+    avail = availability or catalog.availability()
     app = FastAPI(title="Genius Cut backend", version=config.VERSION)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=LOOPBACK_HOSTS)
     lib_dir = Path(library_dir) if library_dir else config.data_dir() / "library"
@@ -233,15 +262,45 @@ def create_app(
         return settings.load()
 
     @app.put("/settings", dependencies=auth)
-    def put_settings(body: settings.Settings) -> settings.Settings:
-        body.anthropic_key.project = body.anthropic_key.project.strip()
+    def put_settings(body: SettingsPatch) -> settings.Settings:
+        old = settings.load()
+        sent = body.model_fields_set
+        update: dict = {}
         try:
-            settings.validate_for_save(body)
+            if "anthropic_key" in sent and body.anthropic_key is not None:
+                key = body.anthropic_key.model_copy(update={"project": body.anthropic_key.project.strip()})
+                settings.validate_key_source(key)
+                update["anthropic_key"] = key
+            if "monthly_limit_usd" in sent and body.monthly_limit_usd is not None:
+                update["monthly_limit_usd"] = body.monthly_limit_usd
+            if "model" in sent and body.model is not None:
+                settings.validate_model(body.model)
+                update["model"] = body.model
+            if "vertex" in sent and body.vertex is not None:
+                update["vertex"] = settings.VertexSettings.model_validate({**old.vertex.model_dump(), **body.vertex})
+        except ValidationError as e:
+            raise HTTPException(status_code=422, detail=_first_error(e)) from e
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
-        old = settings.load()  # only a passing key test completes setup; a new source undoes it
-        body.setup_complete = old.setup_complete and old.anthropic_key == body.anthropic_key
-        return settings.save(body)
+        new = old.model_copy(update=update)
+        # only a passing key test completes setup; a new key source undoes it
+        new.setup_complete = old.setup_complete and old.anthropic_key == new.anthropic_key
+        saved = settings.save(new)
+        if "vertex" in update and update["vertex"] != old.vertex:
+            avail.invalidate("vertex")
+        return saved
+
+    @app.put("/settings/model", dependencies=auth)
+    def put_settings_model(body: ModelChoice) -> settings.Settings:
+        try:
+            settings.validate_model(body.model)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e)) from e
+        return settings.save(settings.load().model_copy(update={"model": body.model}))
+
+    @app.get("/models", dependencies=auth)
+    def get_models(refresh: int = 0) -> dict:
+        return catalog.listing(avail, settings.load().model, refresh=bool(refresh))
 
     @app.post("/settings/test-key", dependencies=auth)
     def post_test_key(body: TestKeyRequest | None = None) -> dict:
@@ -258,6 +317,9 @@ def create_app(
 
     # ── setup screen (shapes: geniuscut/setup.py) ──────────────────────
     login_job = login or setup.Login(find=find_gcloud)
+    vertex_job = vertex_login or setup.VertexLogin(find=find_gcloud)
+    if vertex_job.on_done is None:  # a new Google sign-in changes every Vertex state
+        vertex_job.on_done = lambda: avail.invalidate("vertex")
 
     def setup_errors(e: Exception) -> HTTPException:
         if isinstance(e, ValueError):
@@ -280,6 +342,20 @@ def create_app(
     @app.get("/setup/login", dependencies=auth)
     def get_login() -> dict:
         return login_job.status()
+
+    @app.post("/setup/vertex-login", dependencies=auth, status_code=202)
+    def post_vertex_login(body: VertexLoginRequest | None = None) -> dict:
+        project = body.project if body and body.project is not None else settings.load().vertex.project
+        try:
+            return vertex_job.start(project)
+        except setup.LoginBusy as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        except (ValueError, setup.SetupError) as e:
+            raise setup_errors(e) from e
+
+    @app.get("/setup/vertex-login", dependencies=auth)
+    def get_vertex_login() -> dict:
+        return vertex_job.status()
 
     @app.get("/setup/projects", dependencies=auth)
     def get_projects() -> dict:

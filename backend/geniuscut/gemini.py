@@ -7,8 +7,8 @@
 - `thinkingConfig.thinkingLevel` on gemini-3* models (older models don't take it) comes
   from GENIUSCUT_GEMINI_THINKING (low|medium|high), default `low`; `effort` is ignored here.
 - Before every call the spend gate checks the worst case against the monthly limit, so a
-  refused run never reaches the API. Usage is recorded after every reply, even one that
-  then fails (a cut-off reply is still billed).
+  refused run never reaches the API. Gate, prices and ledger use the catalog id `gemini:<model>`.
+  Usage is recorded after every reply, even one that then fails (a cut-off reply is still billed).
 - `client` is an injectable transport `client(url, body, headers) -> dict` for tests.
 """
 
@@ -33,6 +33,11 @@ DEFAULT_THINKING = "low"
 
 def model() -> str:
     return (os.environ.get("GENIUSCUT_GEMINI_MODEL") or DEFAULT_MODEL).strip()
+
+
+def model_id() -> str:
+    """The catalog id prices, the gate and the ledger use: `gemini:<model()>`."""
+    return f"gemini:{model()}"
 
 
 def thinking_level() -> str:
@@ -78,10 +83,11 @@ def _usage(response: dict) -> tuple[int, int]:
 def _call(prompt: str, *, system: str | None, client, effort: str, max_tokens: int,
           schema: dict | None) -> str:
     name = model()
-    if spend.price(name) is None:  # an unpriced model would skip the gate: unlimited spend
-        raise LLMError(f"No price is known for Gemini model '{name}', so the monthly limit can't be "
+    cid = model_id()
+    if spend.price(cid) is None:  # an unpriced model would skip the gate: unlimited spend
+        raise LLMError(f"No price is known for Gemini model '{cid}', so the monthly limit can't be "
                        f"enforced. Use one of: {', '.join(sorted(spend.PRICES))}.")
-    spend.check_budget(name, (system or "") + prompt, max_tokens)
+    spend.check_budget(cid, (system or "") + prompt, max_tokens)
     config = {"maxOutputTokens": max_tokens}
     if schema is not None:
         config.update(responseMimeType="application/json", responseJsonSchema=schema)
@@ -104,7 +110,7 @@ def _call(prompt: str, *, system: str | None, client, effort: str, max_tokens: i
     if not isinstance(response, dict):
         raise LLMError("Gemini returned an unreadable response.")
 
-    spend.record(name, *_usage(response))
+    spend.record(cid, *_usage(response), price_as=cid)
     block = (response.get("promptFeedback") or {}).get("blockReason")
     if block:
         raise LLMError(f"Gemini declined the request ({block}).")

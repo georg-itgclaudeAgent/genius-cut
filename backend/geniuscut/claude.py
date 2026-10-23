@@ -24,7 +24,10 @@
   tokens); `usage.server_tool_use` isn't priced.
 - Before every call the spend gate checks the worst case against the monthly limit, so a
   refused run never reaches the API; an unpriced model is refused. Usage is recorded in the
-  spend ledger after every reply.
+  spend ledger after every reply. Gate, prices and ledger use the catalog id (`model_id()`:
+  `anthropic:claude-opus-5-5` or `vertex:claude-opus-5-5`); a reply is recorded under the id of the
+  model that answered, priced as the id asked for when that one has no price. An API error also
+  updates the model picker's cached state (catalog.observe), e.g. the workspace cap.
 """
 
 import json
@@ -34,7 +37,7 @@ from contextlib import contextmanager
 
 import anthropic
 
-from geniuscut import secrets, spend
+from geniuscut import catalog, secrets, spend
 from geniuscut.errors import LLMError
 
 MODEL = os.environ.get("GENIUSCUT_CLAUDE_MODEL", "claude-opus-5-5")
@@ -84,6 +87,23 @@ def provider() -> str:
     return (os.environ.get("GENIUSCUT_CLAUDE_PROVIDER") or "anthropic").strip().lower()
 
 
+def model_id() -> str:
+    """The catalog id of the model this module calls: `<provider()>:<MODEL>`."""
+    return f"{provider()}:{MODEL}"
+
+
+def _answered(response, asked: str) -> str:
+    """The catalog id of the model that answered (a server-side fallback may differ)."""
+    name = getattr(response, "model", None)
+    return f"{asked.partition(':')[0]}:{name}" if isinstance(name, str) and name else asked
+
+
+def _require_price(cid: str) -> None:
+    if spend.price(cid) is None:  # an unpriced model would skip the gate: unlimited spend
+        raise ClaudeError(f"No price is known for Claude model '{cid}', so the monthly limit can't be "
+                          f"enforced. Use one of: {', '.join(sorted(spend.PRICES))}.")
+
+
 def default_client():
     p = provider()
     if p == "anthropic":
@@ -107,10 +127,9 @@ def _api_message(e) -> str:
 
 
 def _call(prompt: str, *, system: str | None, client, output_config: dict, max_tokens: int):
-    if spend.price(MODEL) is None:  # an unpriced model would skip the gate: unlimited spend
-        raise ClaudeError(f"No price is known for Claude model '{MODEL}', so the monthly limit can't be "
-                          f"enforced. Use one of: {', '.join(sorted(spend.PRICES))}.")
-    spend.check_budget(MODEL, (system or "") + prompt, max_tokens)
+    cid = model_id()
+    _require_price(cid)
+    spend.check_budget(cid, (system or "") + prompt, max_tokens)
     client = client or default_client()
     kwargs = dict(
         model=MODEL,
@@ -125,11 +144,12 @@ def _call(prompt: str, *, system: str | None, client, output_config: dict, max_t
     else:
         kwargs.update(betas=[FALLBACK_BETA], fallbacks="default")
         create = client.beta.messages.create
-    with _api_errors():
+    with _api_errors(cid):
         response = create(**kwargs)
     usage = getattr(response, "usage", None)
     if usage is not None:
-        spend.record(MODEL, int(getattr(usage, "input_tokens", 0) or 0), int(getattr(usage, "output_tokens", 0) or 0))
+        spend.record(_answered(response, cid), int(getattr(usage, "input_tokens", 0) or 0),
+                     int(getattr(usage, "output_tokens", 0) or 0), price_as=cid)
     if response.stop_reason == "refusal":
         details = getattr(response, "stop_details", None)
         raise ClaudeError(f"Claude declined the request ({getattr(details, 'category', None) or 'no category'}).")
@@ -141,21 +161,29 @@ def _call(prompt: str, *, system: str | None, client, output_config: dict, max_t
     return text
 
 
+def _note(cid: str | None, e: Exception) -> None:
+    if cid:
+        catalog.observe(cid, e)  # never raises
+
+
 @contextmanager
-def _api_errors():
-    """Anthropic SDK errors as ClaudeError with a plain message."""
+def _api_errors(cid: str | None = None):
+    """Anthropic SDK errors as ClaudeError with a plain message; `cid`'s picker state notes the error."""
     try:
         yield
     except anthropic.AuthenticationError as e:
+        _note(cid, e)
         raise KeyRejected() from e
     except anthropic.RateLimitError as e:
         raise ClaudeError(f"Anthropic is rate-limiting requests; try again shortly. {_api_message(e)}") from e
     except anthropic.APIStatusError as e:
+        _note(cid, e)
         raise ClaudeError(f"Anthropic API error {e.status_code}: {_api_message(e)}") from e
     except anthropic.APIConnectionError as e:
         raise ClaudeError("Couldn't reach the Anthropic API. Check the internet connection.") from e
     except Exception as e:
         if type(e).__module__.startswith("google.auth"):
+            _note(cid, e)
             raise ClaudeError("No Google Cloud login for Vertex AI on this machine. "
                               "Run: gcloud auth application-default login") from e
         raise
@@ -169,14 +197,13 @@ def agent_step(messages: list, tools: list[dict], system: str, *, client, input_
                envato: bool = False):
     """One agent step: gate on `input_tokens` (the caller's estimate) plus AGENT_MAX_TOKENS,
     stream, return the final message. The caller handles stop_reason (refusal, max_tokens,
-    tool_use, end_turn) and appends `response.content` whole. Spend is recorded under the model
-    that answered (an unpriced fallback is priced as MODEL), cache tokens included. `envato` adds the
+    tool_use, end_turn) and appends `response.content` whole. Spend is recorded under the catalog id of the
+    model that answered (an unpriced fallback is priced as `model_id()`), cache tokens included. `envato` adds the
     Envato MCP server and its search toolset (Anthropic API only); an API error about it raises
     EnvatoUnavailable."""
-    if spend.price(MODEL) is None:
-        raise ClaudeError(f"No price is known for Claude model '{MODEL}', so the monthly limit can't be "
-                          f"enforced. Use one of: {', '.join(sorted(spend.PRICES))}.")
-    spend.check_tokens(MODEL, input_tokens, AGENT_MAX_TOKENS)
+    cid = model_id()
+    _require_price(cid)
+    spend.check_tokens(cid, input_tokens, AGENT_MAX_TOKENS)
     kwargs = dict(model=MODEL, max_tokens=AGENT_MAX_TOKENS, system=system, tools=tools,
                   tool_choice={"type": "auto"}, messages=messages, output_config={"effort": "high"},
                   cache_control={"type": "ephemeral"})
@@ -187,7 +214,7 @@ def agent_step(messages: list, tools: list[dict], system: str, *, client, input_
         if envato:
             kwargs.update(betas=[FALLBACK_BETA, MCP_BETA], mcp_servers=[ENVATO_SERVER], tools=[*tools, ENVATO_TOOLSET])
         stream = client.beta.messages.stream
-    with _api_errors():
+    with _api_errors(cid):
         try:
             with stream(**kwargs) as s:
                 response = s.get_final_message()
@@ -197,9 +224,9 @@ def agent_step(messages: list, tools: list[dict], system: str, *, client, input_
             raise
     usage = getattr(response, "usage", None)
     if usage is not None:
-        spend.record(getattr(response, "model", None) or MODEL, _tokens(usage, "input_tokens"),
+        spend.record(_answered(response, cid), _tokens(usage, "input_tokens"),
                      _tokens(usage, "output_tokens"), cache_write=_tokens(usage, "cache_creation_input_tokens"),
-                     cache_read=_tokens(usage, "cache_read_input_tokens"), price_as=MODEL)
+                     cache_read=_tokens(usage, "cache_read_input_tokens"), price_as=cid)
     return response
 
 

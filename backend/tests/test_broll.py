@@ -166,8 +166,8 @@ def test_spend_is_recorded_when_usage_reports_server_tool_use():
     fake = FakeClient(reply(mcp_use(), mcp_result(), text("plan"), u=u))
     r = runs_with(fake).start("mark B-roll spots", SELECTION, SEQUENCE)
     rows = ledger()
-    assert len(rows) == 1 and rows[0]["model"] == "claude-opus-5-5"
-    expected = spend.cost_usd("claude-opus-5-5", 2000, 1000, cache_write=100, cache_read=400)
+    assert len(rows) == 1 and rows[0]["model"] == "anthropic:claude-opus-5-5"
+    expected = spend.cost_usd("anthropic:claude-opus-5-5", 2000, 1000, cache_write=100, cache_read=400)
     assert rows[0]["usd"] == pytest.approx(expected)
     assert r["cost"]["usd"] == pytest.approx(expected) and r["cost"]["input_tokens"] == 2500
 

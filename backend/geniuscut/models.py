@@ -124,10 +124,12 @@ class SequenceCut(CutSpan):
 class RunCost(BaseModel):
     """What one run's AI calls cost, and where the month stands afterwards. USD throughout."""
 
-    model: str
+    model: str = Field(description="Catalog id of the model that answered last, e.g. anthropic:claude-opus-5-5")
+    label: str = Field(description="The model's name in the picker, e.g. Claude Opus 5.5 (Anthropic)")
+    provider: str = Field(description="anthropic | vertex | gemini | unknown")
     input_tokens: int
     output_tokens: int
-    usd: float | None = Field(description="None when the model has no price (Claude)")
+    usd: float | None = Field(description="None when the model has no price")
     month_usd: float
     limit_usd: float
 

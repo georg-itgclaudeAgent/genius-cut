@@ -4,8 +4,9 @@ the month's total would pass the limit.
 - Every call is one JSON line in `<data dir>/spend.jsonl`. Append-only; a corrupt line is
   skipped, never fatal, and a ledger that can't be written never fails the call.
 - Months are calendar months in UTC.
-- Only priced models are gated; an unpriced model's calls cost `None` and count as 0
-  towards the month (gemini.py and claude.py refuse to call an unpriced model).
+- Models are catalog ids (`anthropic:claude-opus-5-5`, see catalog.py, which holds the prices). Only
+  priced ids are gated; an unpriced id's calls cost `None` and count as 0 towards the month (gemini.py
+  and claude.py refuse to call an unpriced model). Every row carries `provider`.
 - The limit is this editor's `settings.json` `monthly_limit_usd` (20 or 100), unless
   GENIUSCUT_MONTHLY_LIMIT_USD overrides it (tests, dev).
 """
@@ -21,7 +22,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 
-from geniuscut import config, settings
+from geniuscut import catalog, config, settings
 from geniuscut.errors import LLMError
 
 log = logging.getLogger(__name__)
@@ -29,30 +30,14 @@ log = logging.getLogger(__name__)
 DEFAULT_LIMIT_USD = float(settings.DEFAULT_LIMIT)
 LIMIT_ENV = "GENIUSCUT_MONTHLY_LIMIT_USD"
 
-# USD per 1M tokens (input, output), Gemini API paid tier, prompts ≤200k tokens.
-# Source: ai.google.dev/gemini-api/docs/pricing, checked 2026-10-05. Re-check before
-# relying on them: Google changes these, and the Flash promo ends on 2026-12-31.
-# Each model is a list of (first day the price applies, input, output), oldest first.
-PRICES: dict[str, list[tuple[date, float, float]]] = {
-    "gemini-3.7-flash": [(date.min, 0.75, 3.75), (date(2027, 1, 1), 1.50, 7.50)],
-    "gemini-3.6-flash": [(date.min, 0.75, 3.75), (date(2027, 1, 1), 1.50, 7.50)],
-    "gemini-3.5-flash": [(date.min, 1.50, 9.00)],
-    "gemini-3.5-flash-lite": [(date.min, 0.30, 2.50)],
-    "gemini-3.1-flash-lite": [(date.min, 0.25, 1.50)],
-    "gemini-3.1-pro-preview": [(date.min, 2.00, 12.00)],
-    "gemini-2.5-pro": [(date.min, 1.25, 10.00)],
-    "gemini-2.5-flash": [(date.min, 0.30, 2.50)],
-    "gemini-2.5-flash-lite": [(date.min, 0.10, 0.40)],
-    # Claude on the Anthropic API (first-party rates, cached 2026-09-25). Output includes
-    # thinking, which Opus 5.5 can't turn off; usage.output_tokens already counts it.
-    "claude-opus-5-5": [(date.min, 4.00, 20.00)],
-}
+# Prices live in catalog.py (sources and dates there), keyed by catalog id
+# (`anthropic:claude-opus-5-5`, `vertex:claude-opus-5-5`, `gemini:gemini-3.8-flash`), never a bare model
+# name. Each id is a tuple of catalog.Price, oldest first; a Price may have a long-prompt tier.
+PRICES: dict[str, tuple[catalog.Price, ...]] = {e.id: e.prices for e in catalog.ENTRIES if e.prices}
 
-# Prompt-cache prices, USD per 1M tokens (cache write, cache read). Opus 5.5: a write is the
-# input rate x 1.25, a read $0.20. A model without an entry pays its input rate for both.
+# (cache write, cache read) USD per 1M tokens, base tier of the current price: a convenience view.
 CACHE_PRICES: dict[str, tuple[float, float]] = {
-    "claude-opus-5-5": (5.00, 0.20),
-}
+    mid: (tiers[-1].base.cache_write, tiers[-1].base.cache_read) for mid, tiers in PRICES.items()}
 
 
 CHARS_PER_TOKEN = 1.5  # prompt-size estimate for the gate, see check_budget
@@ -66,25 +51,28 @@ def _today() -> date:
     return datetime.now(timezone.utc).date()
 
 
-def price(model: str, on: date | None = None) -> tuple[float, float] | None:
+def rate(model: str, on: date | None = None, prompt_tokens: int = 0) -> catalog.Rate | None:
+    """The catalog Rate for `model` (a catalog id) on `on`, for a prompt of `prompt_tokens` (all input incl.
+    cache reads and writes; above a model's long-context threshold every token pays the long rate)."""
     tiers = PRICES.get(model)
     if not tiers:
         return None
-    on = on or _today()
-    current = None
-    for since, inp, out in tiers:
-        if on >= since:
-            current = (inp, out)
-    return current
+    return catalog.price_on(tiers, on or _today(), prompt_tokens)
+
+
+def price(model: str, on: date | None = None, prompt_tokens: int = 0) -> tuple[float, float] | None:
+    """(input, output) USD per 1M tokens, or None when `model` isn't a priced catalog id."""
+    r = rate(model, on, prompt_tokens)
+    return (r.input, r.output) if r else None
 
 
 def cost_usd(model: str, input_tokens: int, output_tokens: int, on: date | None = None, *,
              cache_write: int = 0, cache_read: int = 0) -> float | None:
-    p = price(model, on)
-    if p is None:
+    r = rate(model, on, input_tokens + cache_write + cache_read)
+    if r is None:
         return None
-    write, read = CACHE_PRICES.get(model, (p[0], p[0]))
-    return (input_tokens * p[0] + output_tokens * p[1] + cache_write * write + cache_read * read) / 1_000_000
+    return (input_tokens * r.input + output_tokens * r.output + cache_write * r.cache_write
+            + cache_read * r.cache_read) / 1_000_000
 
 
 def money(usd: float) -> str:
@@ -172,9 +160,10 @@ def record(model: str, input_tokens: int, output_tokens: int, *, now: datetime |
            cache_write: int = 0, cache_read: int = 0, price_as: str | None = None) -> float | None:
     """Log one call's usage (to the ledger and any open meter); returns its cost.
 
-    `model` is the model that answered (a server-side fallback may differ from the one asked);
-    if it has no price, it is priced as `price_as`, so a fallback can't switch the gate off.
-    A meter counts cache writes and reads as input tokens."""
+    `model` is the catalog id of the model that answered (a server-side fallback may differ from the one
+    asked); if it has no price, it is priced as `price_as` (the catalog id asked for), so a fallback can't
+    switch the gate off. The row's `provider` is the id's prefix. A meter counts cache writes and reads as
+    input tokens."""
     now = now or datetime.now(timezone.utc)
     on = now.astimezone(timezone.utc).date()
     priced = model if price(model, on) is not None or not price_as else price_as
@@ -183,7 +172,7 @@ def record(model: str, input_tokens: int, output_tokens: int, *, now: datetime |
     if m is not None:
         m.calls.append((model, input_tokens + cache_write + cache_read, output_tokens, usd))
     row = {"ts": now.astimezone(timezone.utc).isoformat(timespec="seconds"), "model": model,
-           "kind": _kind.get(), "input_tokens": input_tokens, "output_tokens": output_tokens,
+           "provider": catalog.provider_of(model), "kind": _kind.get(), "input_tokens": input_tokens, "output_tokens": output_tokens,
            "usd": usd}
     if cache_write or cache_read:
         row.update(cache_write_tokens=cache_write, cache_read_tokens=cache_read)
@@ -257,10 +246,13 @@ def usage(now: datetime | None = None, last: int = 10) -> dict:
     for i, (row, ts, usd) in enumerate(_month_rows(now)):
         key = str(row.get("run") or f"row-{i}")
         r = runs.get(key)
+        model = catalog.normalise(row.get("model", "")) if "model" in row else None
         if r is None:
             r = runs[key] = {"at": ts.isoformat(timespec="seconds"), "kind": str(row.get("kind", "other")),
-                             "model": str(row.get("model", "")), "usd": None, "_last": ts}
-        r["model"], r["_last"] = str(row.get("model", r["model"])), max(r["_last"], ts)
+                             "model": model or "", "usd": None, "_last": ts}
+        r["model"], r["_last"] = model if model is not None else r["model"], max(r["_last"], ts)
+        r["provider"] = str(row.get("provider") or catalog.provider_of(r["model"]))
+        r["label"] = catalog.label(r["model"]) or ""
         if row.get("usd") is not None:
             r["usd"] = round((r["usd"] or 0.0) + usd, 6)
     ordered = sorted(runs.values(), key=lambda r: r["_last"], reverse=True)
@@ -341,7 +333,7 @@ OUTPUT_TOKENS_PER_WORD = 1.7
 
 
 def estimate_per_minute(model: str, on: date | None = None) -> float | None:
-    """Rough USD per minute of clip, for the panel's "Est." line. None if unpriced.
+    """Rough USD per minute of clip, for the panel's "Est." line, for a catalog id. None if unpriced.
 
     Calibrated on a live run, 2026-10-05, gemini-3.7-flash, thinking "low": a 10:47 clip of
     1,560 words was 12,053 input and 2,661 output tokens, $0.019. Hence:

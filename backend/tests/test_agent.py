@@ -344,8 +344,8 @@ def test_an_empty_instruction_is_refused(tmp_path):
 
 def test_cache_prices_for_opus_5_5():
     on = date(2026, 10, 14)
-    assert spend.cost_usd("claude-opus-5-5", 0, 0, on=on, cache_read=1_000_000) == pytest.approx(0.20)
-    assert spend.cost_usd("claude-opus-5-5", 0, 0, on=on, cache_write=1_000_000) == pytest.approx(5.00)
+    assert spend.cost_usd("anthropic:claude-opus-5-5", 0, 0, on=on, cache_read=1_000_000) == pytest.approx(0.20)
+    assert spend.cost_usd("anthropic:claude-opus-5-5", 0, 0, on=on, cache_write=1_000_000) == pytest.approx(5.00)
 
 
 def test_each_step_is_recorded_under_the_answering_model_with_cache_tokens(tmp_path):
@@ -357,7 +357,9 @@ def test_each_step_is_recorded_under_the_answering_model_with_cache_tokens(tmp_p
     first = start(c, auth).json()
     body = results(c, auth, first["run_id"], ("t1", "ok", False)).json()
     rows = ledger()
-    assert [r["model"] for r in rows] == ["claude-opus-5-5", "claude-fallback-model"]
+    assert [r["model"] for r in rows] == ["anthropic:claude-opus-5-5", "anthropic:claude-fallback-model"]
+    assert [r["provider"] for r in rows] == ["anthropic", "anthropic"]
+    assert "priced_as" not in rows[0] and rows[1]["priced_as"] == "anthropic:claude-opus-5-5"
     assert all(r["run"] == first["run_id"] and r["kind"] == "agent" for r in rows)
     assert (rows[0]["cache_write_tokens"], rows[0]["cache_read_tokens"]) == (2000, 10_000)
     step1 = (1000 * 4 + 2000 * 5 + 10_000 * 0.20 + 500 * 20) / 1e6
@@ -365,13 +367,15 @@ def test_each_step_is_recorded_under_the_answering_model_with_cache_tokens(tmp_p
     assert rows[0]["usd"] == pytest.approx(step1) and rows[1]["usd"] == pytest.approx(step2)
     assert first["cost"]["usd"] == pytest.approx(step1)
     assert body["cost"]["usd"] == pytest.approx(step1 + step2)  # the run's total so far
-    assert body["cost"]["model"] == "claude-fallback-model"
+    assert body["cost"]["model"] == "anthropic:claude-fallback-model"
+    assert (body["cost"]["label"], body["cost"]["provider"]) == ("claude-fallback-model", "anthropic")
+    assert first["cost"]["label"] == "Claude Opus 5.5 (Anthropic)"
     assert spend.usage()["run_count"] == 1
 
 
 def test_the_gate_estimates_a_step_from_the_previous_usage(tmp_path, monkeypatch):
     with spend.meter(kind="trim"):
-        spend.record("claude-opus-5-5", 1_750_000, 0)  # $7.00 so far this month
+        spend.record("anthropic:claude-opus-5-5", 1_750_000, 0)  # $7.00 so far this month
     # Step 1 reads 3.5M cached tokens: the next step resends all of it, ~$14 + $0.32 worst-case output.
     fake = FakeClient(reply(tool("t1", "get_sequence"), stop="tool_use", u=usage(1000, 100, cr=3_500_000)),
                       reply(text("never"), stop="end_turn"))
@@ -386,7 +390,7 @@ def test_the_gate_estimates_a_step_from_the_previous_usage(tmp_path, monkeypatch
 
 def test_the_first_step_is_gated_too(tmp_path):
     with spend.meter(kind="trim"):
-        spend.record("claude-opus-5-5", 5_000_000, 0)  # $20.00: the limit
+        spend.record("anthropic:claude-opus-5-5", 5_000_000, 0)  # $20.00: the limit
     fake = FakeClient()
     c, auth = app(tmp_path, fake)
     body = start(c, auth).json()

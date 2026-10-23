@@ -356,10 +356,10 @@ def test_key_from_cache_is_true_only_when_the_cached_key_is_in_use(tmp_path):
 
 def test_rows_carry_the_run_id_and_a_meter_makes_one_run():
     with spend.meter(kind="trim"):
-        spend.record("gemini-2.5-flash-lite", 1_000_000, 0)
-        spend.record("gemini-2.5-flash-lite", 1_000_000, 0)
+        spend.record("anthropic:claude-sonnet-5-5", 50_000, 0)
+        spend.record("anthropic:claude-sonnet-5-5", 50_000, 0)
     with spend.meter(kind="agent", run="run-a"):
-        spend.record("claude-opus-5-5", 1000, 0)
+        spend.record("anthropic:claude-opus-5-5", 1000, 0)
     rows = [json.loads(x) for x in spend.ledger_path().read_text(encoding="utf-8").splitlines()]
     assert rows[0]["run"] == rows[1]["run"] and rows[0]["run"] != "run-a"
     assert rows[2]["run"] == "run-a"
@@ -369,23 +369,24 @@ def test_usage_groups_rows_by_run_newest_first():
     now = datetime(2026, 10, 14, 12, 0, tzinfo=UTC)
     with spend.meter(kind="agent", run="run-a"):
         for i in range(10):  # ten steps, one run
-            spend.record("claude-opus-5-5", 100_000, 0, now=datetime(2026, 10, 3, 9, i, tzinfo=UTC))  # $0.40 each
+            spend.record("vertex:claude-opus-5-5", 100_000, 0, now=datetime(2026, 10, 3, 9, i, tzinfo=UTC))  # $0.40 each
     with spend.meter(kind="trim"):
-        spend.record("gemini-2.5-flash-lite", 1_000_000, 0, now=datetime(2026, 10, 5, 9, 0, tzinfo=UTC))  # $0.10
-    spend.record("gemini-2.5-flash-lite", 1_000_000, 0, now=datetime(2026, 9, 30, 9, 0, tzinfo=UTC))  # last month
+        spend.record("anthropic:claude-sonnet-5-5", 50_000, 0, now=datetime(2026, 10, 5, 9, 0, tzinfo=UTC))  # $0.10
+    spend.record("anthropic:claude-sonnet-5-5", 50_000, 0, now=datetime(2026, 9, 30, 9, 0, tzinfo=UTC))  # last month
     u = spend.usage(now=now)
     assert u["month_usd"] == pytest.approx(4.10) and u["limit_usd"] == 20.0 and u["limit_tier"] == 20
     assert u["resets_on"] == "2026-11-01" and u["run_count"] == 2
     assert [r["kind"] for r in u["runs"]] == ["trim", "agent"]
     agent = u["runs"][1]
-    assert agent["model"] == "claude-opus-5-5" and agent["usd"] == pytest.approx(4.00)
+    assert agent["model"] == "vertex:claude-opus-5-5" and agent["usd"] == pytest.approx(4.00)
+    assert (agent["provider"], agent["label"]) == ("vertex", "Claude Opus 5.5 (Google Cloud)")
     assert agent["at"].startswith("2026-10-03T09:00")
 
 
 def test_usage_lists_the_last_ten_runs():
     for d in range(1, 13):
         with spend.meter(kind="trim"):
-            spend.record("gemini-2.5-flash-lite", 1_000_000, 0, now=datetime(2026, 10, d, tzinfo=UTC))
+            spend.record("anthropic:claude-sonnet-5-5", 50_000, 0, now=datetime(2026, 10, d, tzinfo=UTC))
     u = spend.usage(now=datetime(2026, 10, 14, tzinfo=UTC))
     assert u["run_count"] == 12 and len(u["runs"]) == 10
     assert u["runs"][0]["at"].startswith("2026-10-12")
@@ -394,8 +395,8 @@ def test_usage_lists_the_last_ten_runs():
 def test_usage_route(tmp_path):
     settings.save(settings.Settings(monthly_limit_usd=100))
     with spend.meter(kind="trim"):
-        spend.record("gemini-2.5-flash-lite", 1_000_000, 0)
+        spend.record("anthropic:claude-sonnet-5-5", 50_000, 0)
     c, auth = app(tmp_path)
     body = c.get("/usage", headers=auth).json()
     assert body["limit_tier"] == 100 and body["run_count"] == 1 and len(body["runs"]) == 1
-    assert set(body["runs"][0]) == {"at", "kind", "model", "usd"}
+    assert set(body["runs"][0]) == {"at", "kind", "model", "label", "provider", "usd"}

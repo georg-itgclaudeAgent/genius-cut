@@ -70,8 +70,8 @@ def finish(c, auth, job_id):
     return r.json()
 
 
-def test_api_version_is_7_for_graphics():
-    assert config.API_VERSION == 7
+def test_api_version_is_8_for_the_model_picker():
+    assert config.API_VERSION == 8
 
 
 # ── transcribe_range ───────────────────────────────────────────────

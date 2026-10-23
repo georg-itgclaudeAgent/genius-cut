@@ -38,7 +38,7 @@ def test_get_settings_returns_the_defaults(tmp_path):
     r = c.get("/settings", headers=auth)
     assert r.status_code == 200
     assert r.json() == {"anthropic_key": {"project": "", "secret": "ANTHROPIC_API_KEY", "version": "latest"},
-                        "monthly_limit_usd": 20, "setup_complete": False}
+                        "monthly_limit_usd": 20, "setup_complete": False, "model": "anthropic:claude-opus-5-5", "vertex": {"project": "agent-georg", "region": "global"}}
 
 
 def test_put_settings_saves_and_returns_them(tmp_path):
@@ -46,7 +46,8 @@ def test_put_settings_saves_and_returns_them(tmp_path):
     body = {"anthropic_key": {**SRC, "project": "  editor-proj "}, "monthly_limit_usd": 100}
     r = c.put("/settings", json=body, headers=auth)
     assert r.status_code == 200, r.text
-    assert r.json() == {"anthropic_key": SRC, "monthly_limit_usd": 100, "setup_complete": False}
+    assert r.json() == {"anthropic_key": SRC, "monthly_limit_usd": 100, "setup_complete": False,
+                        "model": "anthropic:claude-opus-5-5", "vertex": {"project": "agent-georg", "region": "global"}}
     assert settings.load().anthropic_key.project == "editor-proj"
     assert c.get("/settings", headers=auth).json()["monthly_limit_usd"] == 100
 

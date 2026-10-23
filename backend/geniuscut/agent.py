@@ -21,8 +21,8 @@ Step reply (HTTP 200):
   "tool_calls": [{"id": str, "name": str, "input": object}],   # non-empty only for "tool_calls"
   "text": str,                                                  # Claude's text in this reply ("" if none)
   "message": str|null, "reason": "limit"|"key"|"error"|"refusal"|"max_tokens"|"step_cap"|null,  # "stopped" only
-  "cost": {"model": str, "input_tokens": int, "output_tokens": int, "usd": float|null,
-           "month_usd": float, "limit_usd": float},            # usd = this run's total so far
+  "cost": {"model": <catalog id>, "label": str, "provider": str, "input_tokens": int, "output_tokens": int,
+           "usd": float|null, "month_usd": float, "limit_usd": float},  # usd = this run's total so far
   "graphics": [{"slug": str, "version": int, "preview": str, "path": str, "duration_s": float}]}
                                          # newest version of every graphic made in this run (preview = PNG path)
   reason also "graphics" (a graphic failed 3 times) and "cancelled" (DELETE while a step was working).

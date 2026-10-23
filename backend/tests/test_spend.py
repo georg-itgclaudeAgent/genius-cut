@@ -6,7 +6,7 @@ from datetime import date, datetime, timezone
 
 import pytest
 
-from geniuscut import config, llm, settings, spend
+from geniuscut import catalog, config, llm, settings, spend
 
 UTC = timezone.utc
 
@@ -15,31 +15,73 @@ UTC = timezone.utc
 
 def test_flash_price_until_the_end_of_2026():
     # 1M in + 1M out at 0.75 / 3.75
-    assert spend.cost_usd("gemini-3.7-flash", 1_000_000, 1_000_000, on=date(2026, 12, 31)) == pytest.approx(4.50)
-    assert spend.cost_usd("gemini-3.6-flash", 1_000_000, 0, on=date(2026, 10, 5)) == pytest.approx(0.75)
+    assert spend.cost_usd("gemini:gemini-3.7-flash", 1_000_000, 1_000_000, on=date(2026, 12, 31)) == pytest.approx(4.50)
+    assert spend.cost_usd("gemini:gemini-3.8-flash", 1_000_000, 0, on=date(2026, 10, 5)) == pytest.approx(0.75)
 
 
 def test_flash_price_doubles_from_2027_automatically():
-    assert spend.cost_usd("gemini-3.7-flash", 1_000_000, 1_000_000, on=date(2027, 1, 1)) == pytest.approx(9.00)
-    assert spend.cost_usd("gemini-3.6-flash", 0, 1_000_000, on=date(2027, 6, 1)) == pytest.approx(7.50)
+    assert spend.cost_usd("gemini:gemini-3.7-flash", 1_000_000, 1_000_000, on=date(2027, 1, 1)) == pytest.approx(9.00)
+    assert spend.cost_usd("gemini:gemini-3.8-flash", 0, 1_000_000, on=date(2027, 6, 1)) == pytest.approx(7.50)
 
 
-@pytest.mark.parametrize("model, inp, out", [
-    ("gemini-3.5-flash", 1.50, 9.00), ("gemini-3.5-flash-lite", 0.30, 2.50),
-    ("gemini-3.1-flash-lite", 0.25, 1.50), ("gemini-3.1-pro-preview", 2.00, 12.00),
-    ("gemini-2.5-pro", 1.25, 10.00), ("gemini-2.5-flash", 0.30, 2.50), ("gemini-2.5-flash-lite", 0.10, 0.40),
+# Official pages, checked 2026-10-23 (catalog.py): Anthropic pricing, Vertex Claude Global, Gemini API Standard.
+@pytest.mark.parametrize("model, inp, out, write, read", [
+    ("anthropic:claude-opus-5-5", 4.00, 20.00, 5.00, 0.20), ("vertex:claude-opus-5-5", 4.00, 20.00, 5.00, 0.20),
+    ("anthropic:claude-sonnet-5-5", 2.00, 10.00, 2.50, 0.10), ("vertex:claude-sonnet-5-5", 2.00, 10.00, 2.50, 0.10),
+    ("anthropic:claude-haiku-5-5", 0.10, 0.50, 0.125, 0.01), ("vertex:claude-haiku-5-5", 0.10, 0.50, 0.125, 0.01),
+    ("anthropic:claude-fable-5-1", 10.00, 50.00, 12.50, 0.25), ("vertex:claude-fable-5-1", 10.00, 50.00, 12.50, 0.25),
+    ("gemini:gemini-3.8-flash", 0.75, 3.75, 0.75, 0.075), ("gemini:gemini-3.7-flash", 0.75, 3.75, 0.75, 0.075),
+    ("gemini:gemini-3.5-flash", 1.50, 9.00, 1.50, 0.15), ("gemini:gemini-3.1-pro-preview", 2.00, 12.00, 2.00, 0.20),
 ])
-def test_fixed_prices(model, inp, out):
-    on = date(2026, 10, 5)
-    assert spend.cost_usd(model, 1_000_000, 0, on=on) == pytest.approx(inp)
-    assert spend.cost_usd(model, 0, 1_000_000, on=on) == pytest.approx(out)
+def test_every_catalog_model_is_priced_by_catalog_id(model, inp, out, write, read):
+    on = date(2026, 10, 23)
+    small = 50_000  # under every long-context threshold
+    assert spend.cost_usd(model, small, 0, on=on) == pytest.approx(small * inp / 1e6)
+    assert spend.cost_usd(model, 0, small, on=on) == pytest.approx(small * out / 1e6)
+    assert spend.cost_usd(model, 0, 0, on=on, cache_write=small) == pytest.approx(small * write / 1e6)
+    assert spend.cost_usd(model, 0, 0, on=on, cache_read=small) == pytest.approx(small * read / 1e6)
+
+
+def test_all_twelve_catalog_entries_and_nothing_else_are_priced():
+    assert set(spend.PRICES) == set(catalog.BY_ID) and len(spend.PRICES) == 12
+
+
+@pytest.mark.parametrize("bare", ["claude-opus-5-5", "gemini-3.7-flash", "gemini-2.5-flash-lite", "gemini-3.6-flash",
+                                  "gemini:gemini-3.6-flash"])
+def test_bare_model_names_are_not_priced(bare):
+    assert spend.price(bare) is None and spend.cost_usd(bare, 1000, 1000) is None
 
 
 def test_claude_opus_5_5_price():
     # Anthropic first-party rates: $4.00 in / $20.00 out per 1M tokens (thinking is output).
     on = date(2026, 10, 14)
-    assert spend.cost_usd("claude-opus-5-5", 1_000_000, 0, on=on) == pytest.approx(4.00)
-    assert spend.cost_usd("claude-opus-5-5", 0, 1_000_000, on=on) == pytest.approx(20.00)
+    assert spend.cost_usd("anthropic:claude-opus-5-5", 1_000_000, 0, on=on) == pytest.approx(4.00)
+    assert spend.cost_usd("anthropic:claude-opus-5-5", 0, 1_000_000, on=on) == pytest.approx(20.00)
+
+
+def test_haiku_5_5_prompts_over_100k_pay_the_long_prices_for_every_token():
+    on = date(2026, 10, 23)
+    assert spend.cost_usd("anthropic:claude-haiku-5-5", 100_000, 1000, on=on) == pytest.approx(
+        (100_000 * 0.10 + 1000 * 0.50) / 1e6)
+    # 60k input + 50k cache read = 110k prompt tokens: all at 0.50 / 2.50 / cache read 0.05
+    assert spend.cost_usd("vertex:claude-haiku-5-5", 60_000, 1000, on=on, cache_read=50_000) == pytest.approx(
+        (60_000 * 0.50 + 1000 * 2.50 + 50_000 * 0.05) / 1e6)
+
+
+def test_gemini_3_1_pro_prompts_over_200k_pay_the_long_prices():
+    on = date(2026, 10, 23)
+    assert spend.price("gemini:gemini-3.1-pro-preview", on) == (2.00, 12.00)
+    assert spend.price("gemini:gemini-3.1-pro-preview", on, prompt_tokens=200_001) == (4.00, 18.00)
+    assert spend.cost_usd("gemini:gemini-3.1-pro-preview", 300_000, 1000, on=on) == pytest.approx(
+        (300_000 * 4.00 + 1000 * 18.00) / 1e6)
+
+
+def test_the_gate_uses_the_tier_its_estimate_falls_in(monkeypatch):
+    # 250k input tokens on 3.1 Pro: 250k * $4 + 1000 * $18 = $1.018 (the base tier would say $0.512)
+    monkeypatch.setenv("GENIUSCUT_MONTHLY_LIMIT_USD", "1.0")
+    with pytest.raises(spend.BudgetExceeded):
+        spend.check_tokens("gemini:gemini-3.1-pro-preview", 250_000, 1000)
+    spend.check_tokens("gemini:gemini-3.1-pro-preview", 150_000, 1000)  # $0.312
 
 
 def test_unpriced_models_cost_none():
@@ -47,7 +89,7 @@ def test_unpriced_models_cost_none():
 
 
 def test_cost_defaults_to_today():
-    assert spend.cost_usd("gemini-2.5-flash-lite", 1_000_000, 0) == pytest.approx(0.10)
+    assert spend.cost_usd("anthropic:claude-sonnet-5-5", 1_000_000, 0) == pytest.approx(2.00)
 
 
 # ── ledger ─────────────────────────────────────────────────────────
@@ -58,11 +100,12 @@ def test_ledger_lives_in_the_data_dir():
 
 def test_record_appends_one_row_per_call():
     now = datetime(2026, 10, 5, 3, 0, tzinfo=UTC)
-    spend.record("gemini-3.7-flash", 1000, 2000, now=now)
+    spend.record("gemini:gemini-3.7-flash", 1000, 2000, now=now)
     spend.record("unpriced-model", 10, 20, now=now)
     rows = [json.loads(line) for line in spend.ledger_path().read_text(encoding="utf-8").splitlines()]
     assert len(rows) == 2
-    assert rows[0]["model"] == "gemini-3.7-flash" and rows[0]["kind"] == "other"
+    assert rows[0]["model"] == "gemini:gemini-3.7-flash" and rows[0]["kind"] == "other"
+    assert rows[0]["provider"] == "gemini" and rows[1]["provider"] == "unknown"
     assert rows[0]["input_tokens"] == 1000 and rows[0]["output_tokens"] == 2000
     assert rows[0]["usd"] == pytest.approx(0.00075 + 0.0075)
     assert rows[0]["ts"].startswith("2026-10-05T03:00:00")
@@ -70,9 +113,9 @@ def test_record_appends_one_row_per_call():
 
 
 def test_month_total_sums_this_utc_month_only():
-    spend.record("gemini-2.5-flash-lite", 1_000_000, 0, now=datetime(2026, 9, 30, 23, 59, tzinfo=UTC))  # 0.10 last month
-    spend.record("gemini-2.5-flash-lite", 2_000_000, 0, now=datetime(2026, 10, 1, 0, 0, tzinfo=UTC))    # 0.20
-    spend.record("gemini-2.5-flash-lite", 0, 1_000_000, now=datetime(2026, 10, 31, 23, 59, tzinfo=UTC))  # 0.40
+    spend.record("anthropic:claude-sonnet-5-5", 50_000, 0, now=datetime(2026, 9, 30, 23, 59, tzinfo=UTC))  # 0.10 last month
+    spend.record("anthropic:claude-sonnet-5-5", 100_000, 0, now=datetime(2026, 10, 1, 0, 0, tzinfo=UTC))    # 0.20
+    spend.record("anthropic:claude-sonnet-5-5", 0, 40_000, now=datetime(2026, 10, 31, 23, 59, tzinfo=UTC))  # 0.40
     spend.record("unpriced-model", 5, 5, now=datetime(2026, 10, 2, tzinfo=UTC))                          # unpriced: 0
     assert spend.month_total(now=datetime(2026, 10, 15, tzinfo=UTC)) == pytest.approx(0.60)
     assert spend.month_total(now=datetime(2026, 9, 1, tzinfo=UTC)) == pytest.approx(0.10)
@@ -83,7 +126,7 @@ def test_month_boundary_is_utc_not_local_time():
     # 2026-11-01 07:30 in Davao (UTC+8) is still October in UTC.
     from datetime import timedelta
     davao = timezone(timedelta(hours=8))
-    spend.record("gemini-2.5-flash-lite", 1_000_000, 0, now=datetime(2026, 11, 1, 7, 30, tzinfo=davao))
+    spend.record("anthropic:claude-sonnet-5-5", 50_000, 0, now=datetime(2026, 11, 1, 7, 30, tzinfo=davao))
     assert spend.month_total(now=datetime(2026, 10, 20, tzinfo=UTC)) == pytest.approx(0.10)
     assert spend.month_total(now=datetime(2026, 11, 2, tzinfo=UTC)) == 0
 
@@ -100,7 +143,7 @@ def test_corrupt_ledger_lines_are_skipped():
     assert spend.month_total(now=datetime(2026, 10, 9, tzinfo=UTC)) == pytest.approx(0.50)
 
 
-GOOD_ROW = {"ts": "2026-10-05T01:00:00+00:00", "model": "gemini-3.7-flash", "kind": "trim",
+GOOD_ROW = {"ts": "2026-10-05T01:00:00+00:00", "model": "gemini:gemini-3.7-flash", "kind": "trim",
             "input_tokens": 1, "output_tokens": 1, "usd": 0.25}
 OCT = datetime(2026, 10, 9, tzinfo=UTC)
 
@@ -131,26 +174,26 @@ def test_a_nan_row_does_not_switch_the_gate_off(monkeypatch):
     _write_ledger((json.dumps(GOOD_ROW) + '\n{"ts": "2026-10-05T03:00:00+00:00", "usd": NaN}\n'
                    + json.dumps(GOOD_ROW) + "\n").encode())
     with pytest.raises(spend.BudgetExceeded):
-        spend.check_budget("gemini-3.7-flash", "hi", 16000, now=OCT)
+        spend.check_budget("gemini:gemini-3.7-flash", "hi", 16000, now=OCT)
 
 
 def test_an_infinity_row_does_not_block_every_run():
     _write_ledger(b'{"ts": "2026-10-05T03:00:00+00:00", "usd": Infinity}\n\xff\n')
-    spend.check_budget("gemini-3.7-flash", "hi", 16000, now=OCT)
+    spend.check_budget("gemini:gemini-3.7-flash", "hi", 16000, now=OCT)
 
 
 def test_a_failed_ledger_write_still_counts_towards_the_month(monkeypatch, tmp_path):
     blocker = tmp_path / "blocker"
     blocker.write_text("a file, not a folder")
     monkeypatch.setenv("GENIUSCUT_DATA_DIR", str(blocker / "data"))
-    spend.record("gemini-2.5-flash-lite", 1_000_000, 0, now=datetime(2026, 10, 5, tzinfo=UTC))   # $0.10, unwritten
-    spend.record("gemini-2.5-flash-lite", 1_000_000, 0, now=datetime(2026, 9, 5, tzinfo=UTC))    # last month
+    spend.record("anthropic:claude-sonnet-5-5", 50_000, 0, now=datetime(2026, 10, 5, tzinfo=UTC))   # $0.10, unwritten
+    spend.record("anthropic:claude-sonnet-5-5", 50_000, 0, now=datetime(2026, 9, 5, tzinfo=UTC))    # last month
     spend.record("unpriced-model", 5, 5, now=datetime(2026, 10, 5, tzinfo=UTC))                 # unpriced
     monkeypatch.setenv("GENIUSCUT_DATA_DIR", str(tmp_path / "elsewhere"))  # the ledger is readable again
     assert spend.month_total(now=OCT) == pytest.approx(0.10)
     monkeypatch.setenv("GENIUSCUT_MONTHLY_LIMIT_USD", "0.12")
     with pytest.raises(spend.BudgetExceeded):
-        spend.check_budget("gemini-3.7-flash", "hi", 16000, now=OCT)
+        spend.check_budget("gemini:gemini-3.7-flash", "hi", 16000, now=OCT)
 
 
 def test_no_ledger_yet_means_nothing_spent():
@@ -181,16 +224,16 @@ def test_limit_comes_from_settings_unless_the_env_overrides(monkeypatch):
 # ── budget gate ────────────────────────────────────────────────────
 
 def test_gate_passes_under_the_limit():
-    spend.check_budget("gemini-3.7-flash", "x" * 3000, 16000)  # worst case ≈ $0.06
+    spend.check_budget("gemini:gemini-3.7-flash", "x" * 3000, 16000)  # worst case ≈ $0.06
 
 
 def test_gate_is_a_budget_exceeded_llm_error_with_the_exact_message(monkeypatch):
     monkeypatch.setenv("GENIUSCUT_MONTHLY_LIMIT_USD", "2")
     now = datetime(2026, 10, 5, tzinfo=UTC)
-    spend.record("gemini-2.5-flash-lite", 0, 4_850_000, now=now)  # $1.94
+    spend.record("anthropic:claude-sonnet-5-5", 0, 194_000, now=now)  # $1.94
     # est_input = ceil(3001 / 1.5) = 2001 tokens; worst case = 2001 * 0.75e-6 + 16000 * 3.75e-6 = $0.0615
     with pytest.raises(spend.BudgetExceeded) as e:
-        spend.check_budget("gemini-3.7-flash", "x" * 3001, 16000, now=now)
+        spend.check_budget("gemini:gemini-3.7-flash", "x" * 3001, 16000, now=now)
     assert isinstance(e.value, llm.LLMError)
     assert str(e.value) == ("This run could cost up to $0.06, and this month's AI spend is $1.94 of the $2.00 limit. "
                             "Raise GENIUSCUT_MONTHLY_LIMIT_USD to continue.")
@@ -199,7 +242,7 @@ def test_gate_is_a_budget_exceeded_llm_error_with_the_exact_message(monkeypatch)
 def test_gate_shows_tiny_amounts_as_under_a_cent(monkeypatch):
     monkeypatch.setenv("GENIUSCUT_MONTHLY_LIMIT_USD", "0.001")
     with pytest.raises(spend.BudgetExceeded) as e:
-        spend.check_budget("gemini-2.5-flash-lite", "hi", 5000)  # worst case $0.002
+        spend.check_budget("anthropic:claude-haiku-5-5", "hi", 5000)  # worst case $0.0025
     assert str(e.value).startswith("This run could cost up to <$0.01, and this month's AI spend is $0.00 of the <$0.01 limit.")
 
 
@@ -207,10 +250,10 @@ def test_gate_estimates_input_at_1_5_characters_per_token(monkeypatch):
     # Measured 2026-10-05: 19,197 characters of numbered transcript were 12,053 tokens.
     # 15,000 chars -> 10,000 tokens -> $0.0075 input, no output: passes $0.0076, fails $0.0074.
     monkeypatch.setenv("GENIUSCUT_MONTHLY_LIMIT_USD", "0.0076")
-    spend.check_budget("gemini-3.7-flash", "x" * 15_000, 0)
+    spend.check_budget("gemini:gemini-3.7-flash", "x" * 15_000, 0)
     monkeypatch.setenv("GENIUSCUT_MONTHLY_LIMIT_USD", "0.0074")
     with pytest.raises(spend.BudgetExceeded):
-        spend.check_budget("gemini-3.7-flash", "x" * 15_000, 0)
+        spend.check_budget("gemini:gemini-3.7-flash", "x" * 15_000, 0)
 
 
 def test_gate_ignores_unpriced_models(monkeypatch):
@@ -228,13 +271,13 @@ def test_money_format():
 # ── meter ──────────────────────────────────────────────────────────
 
 def test_meter_collects_every_call_inside_the_block_and_tags_the_kind():
-    spend.record("gemini-2.5-flash-lite", 1_000_000, 0)  # outside: not counted
+    spend.record("anthropic:claude-sonnet-5-5", 50_000, 0)  # outside: not counted
     with spend.meter(kind="trim") as m:
-        spend.record("gemini-2.5-flash-lite", 1_000_000, 0)
-        spend.record("gemini-2.5-flash-lite", 0, 1_000_000)
-    spend.record("gemini-2.5-flash-lite", 1_000_000, 0)  # after: not counted
+        spend.record("anthropic:claude-sonnet-5-5", 50_000, 0)
+        spend.record("anthropic:claude-sonnet-5-5", 0, 40_000)
+    spend.record("anthropic:claude-sonnet-5-5", 50_000, 0)  # after: not counted
     assert m.usd == pytest.approx(0.50)
-    assert (m.input_tokens, m.output_tokens, m.model) == (1_000_000, 1_000_000, "gemini-2.5-flash-lite")
+    assert (m.input_tokens, m.output_tokens, m.model) == (50_000, 40_000, "anthropic:claude-sonnet-5-5")
     kinds = [json.loads(line)["kind"] for line in spend.ledger_path().read_text(encoding="utf-8").splitlines()]
     assert kinds == ["other", "trim", "trim", "other"]
 
@@ -242,11 +285,11 @@ def test_meter_collects_every_call_inside_the_block_and_tags_the_kind():
 def test_tagged_sets_the_kind_without_a_meter_and_keeps_the_outer_meter():
     with spend.meter(kind="trim") as m:
         with spend.tagged("summary"):
-            spend.record("gemini-2.5-flash-lite", 1_000_000, 0)
+            spend.record("anthropic:claude-sonnet-5-5", 50_000, 0)
     with spend.tagged("trim"):
-        spend.record("gemini-2.5-flash-lite", 1_000_000, 0)
-    spend.record("gemini-2.5-flash-lite", 1_000_000, 0)
-    assert m.input_tokens == 1_000_000
+        spend.record("anthropic:claude-sonnet-5-5", 50_000, 0)
+    spend.record("anthropic:claude-sonnet-5-5", 50_000, 0)
+    assert m.input_tokens == 50_000
     kinds = [json.loads(line)["kind"] for line in spend.ledger_path().read_text(encoding="utf-8").splitlines()]
     assert kinds == ["summary", "trim", "other"]
 
@@ -266,7 +309,7 @@ def test_meter_usd_is_none_when_only_unpriced_calls_ran():
 def test_meter_counts_priced_calls_when_mixed_with_unpriced():
     with spend.meter() as m:
         spend.record("unpriced-model", 100, 200)
-        spend.record("gemini-2.5-flash-lite", 1_000_000, 0)
+        spend.record("anthropic:claude-sonnet-5-5", 50_000, 0)
     assert m.usd == pytest.approx(0.10)
 
 
@@ -275,7 +318,7 @@ def test_an_unwritable_ledger_never_fails_the_call(monkeypatch, tmp_path):
     blocker.write_text("a file, not a folder")
     monkeypatch.setenv("GENIUSCUT_DATA_DIR", str(blocker / "data"))
     with spend.meter() as m:
-        spend.record("gemini-2.5-flash-lite", 1_000_000, 0)
+        spend.record("anthropic:claude-sonnet-5-5", 50_000, 0)
     assert m.usd == pytest.approx(0.10)
 
 
@@ -284,24 +327,24 @@ def test_an_unwritable_ledger_never_fails_the_call(monkeypatch, tmp_path):
 def test_estimate_per_minute():
     # 160 words: input 160 * 7.7 + 400 / 10 = 1272 tokens; output 1.7 * 160 = 272 tokens.
     expected = 1272 * 0.75 / 1e6 + 272 * 3.75 / 1e6
-    assert spend.estimate_per_minute("gemini-3.7-flash", on=date(2026, 10, 5)) == pytest.approx(expected)
+    assert spend.estimate_per_minute("gemini:gemini-3.7-flash", on=date(2026, 10, 5)) == pytest.approx(expected)
 
 
 def test_estimate_matches_the_measured_10_47_clip():
     # Live run 2026-10-05, thinking low: $0.019 for a 10:47 clip. The panel shows ~$0.02.
-    clip = spend.estimate_per_minute("gemini-3.7-flash", on=date(2026, 10, 5)) * (647 / 60)
+    clip = spend.estimate_per_minute("gemini:gemini-3.7-flash", on=date(2026, 10, 5)) * (647 / 60)
     assert clip == pytest.approx(0.02, rel=0.25)
     assert spend.estimate_per_minute("unpriced-model") is None
-    assert spend.estimate_per_minute("claude-opus-5-5") is not None
+    assert spend.estimate_per_minute("anthropic:claude-opus-5-5") is not None
 
 
 # ── limit messages (20 / 100 tiers) ───────────────────────────────
 
 def test_the_20_dollar_tier_says_the_limit_can_be_raised_in_settings():
     now = datetime(2026, 10, 14, tzinfo=UTC)
-    spend.record("gemini-2.5-flash-lite", 0, 50_000_000, now=now)  # $20.00
+    spend.record("anthropic:claude-sonnet-5-5", 0, 2_000_000, now=now)  # $20.00
     with pytest.raises(spend.BudgetExceeded) as e:
-        spend.check_budget("claude-opus-5-5", "hi", 16000, now=now)
+        spend.check_budget("anthropic:claude-opus-5-5", "hi", 16000, now=now)
     assert str(e.value) == ("Partial monthly limit reached. You can increase this limit in Settings "
                             "under the Usage & limit tab.")
 
@@ -313,8 +356,8 @@ def test_the_20_dollar_tier_says_the_limit_can_be_raised_in_settings():
 ])
 def test_the_100_dollar_tier_says_when_the_month_resets(now, date_text):
     settings.save(settings.Settings(monthly_limit_usd=100))
-    spend.record("gemini-2.5-flash-lite", 0, 250_000_000, now=now)  # $100.00
+    spend.record("anthropic:claude-sonnet-5-5", 0, 10_000_000, now=now)  # $100.00
     with pytest.raises(spend.BudgetExceeded) as e:
-        spend.check_budget("claude-opus-5-5", "hi", 16000, now=now)
+        spend.check_budget("anthropic:claude-opus-5-5", "hi", 16000, now=now)
     assert str(e.value) == (f"Your allowed monthly limit has been reached. Please wait until {date_text} "
                             "to continue, or ask your admin for additional credits.")

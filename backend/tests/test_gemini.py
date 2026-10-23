@@ -100,6 +100,8 @@ def test_invalid_thinking_env_falls_back_to_low(monkeypatch, bad):
 
 
 def test_no_thinking_level_for_older_models(monkeypatch):
+    # not in the catalog any more: priced here only to reach the request
+    monkeypatch.setitem(spend.PRICES, "gemini:gemini-2.5-flash", spend.PRICES["gemini:gemini-3.5-flash"])
     monkeypatch.setenv("GENIUSCUT_GEMINI_MODEL", "gemini-2.5-flash")
     t = Transport()
     gemini.ask_json("hi", {}, client=t)
@@ -240,10 +242,11 @@ def test_usage_counts_thinking_as_output_and_is_metered():
     usage = {"promptTokenCount": 1000, "candidatesTokenCount": 300, "thoughtsTokenCount": 700}
     with spend.meter(kind="trim") as m:
         gemini.ask_json("hi", {}, client=Transport(reply(usage=usage)))
-    assert (m.input_tokens, m.output_tokens, m.model) == (1000, 1000, "gemini-3.7-flash")
+    assert (m.input_tokens, m.output_tokens, m.model) == (1000, 1000, "gemini:gemini-3.7-flash")
     assert m.usd == pytest.approx(1000 * 0.75e-6 + 1000 * 3.75e-6)
     row = json.loads(spend.ledger_path().read_text(encoding="utf-8").splitlines()[0])
     assert row["kind"] == "trim" and row["output_tokens"] == 1000
+    assert row["model"] == "gemini:gemini-3.7-flash" and row["provider"] == "gemini"
 
 
 def test_usage_without_thoughts_or_metadata():
@@ -267,7 +270,7 @@ def test_an_unpriced_gemini_model_is_refused_before_any_http_call(monkeypatch, b
     with pytest.raises(llm.LLMError) as e:
         gemini.ask_json("hi", {}, client=t)
     assert t.calls == []
-    assert str(e.value) == (f"No price is known for Gemini model '{bad}', so the monthly limit can't be enforced. "
+    assert str(e.value) == (f"No price is known for Gemini model 'gemini:{bad}', so the monthly limit can't be enforced. "
                             f"Use one of: {', '.join(sorted(spend.PRICES))}.")
 
 

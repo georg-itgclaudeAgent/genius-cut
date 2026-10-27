@@ -11,12 +11,16 @@
   refused run never reaches the API. Gate, prices and ledger use the catalog id `gemini:<model>`.
   Usage is recorded after every reply, even one that then fails (a cut-off reply is still billed).
 - `client` is an injectable transport `client(url, body, headers) -> dict` for tests.
+- The agent's GeminiAdapter (adapters.py) sends its own generateContent bodies through `Client` +
+  `generate()`: the key read once per run, the same HTTP error mapping as Analyse.
 """
 
 import json
 import os
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
+from typing import Callable
 
 from geniuscut import secrets, spend
 from geniuscut.errors import LLMError
@@ -70,13 +74,48 @@ def _error_message(e: urllib.error.HTTPError) -> str:
     return msg or raw.strip()[:300] or str(e.reason or e)
 
 
+class KeyRejected(LLMError):
+    """Google refused the Gemini API key: the user fixes the secret."""
+
+
 def _http_error(e: urllib.error.HTTPError, key: str) -> LLMError:
     msg = _error_message(e).replace(key, "[redacted]")
     if e.code in (400, 403) and "api key" in msg.lower():
-        return LLMError(f"The Gemini API key was rejected: {msg}")
+        return KeyRejected(f"The Gemini API key was rejected: {msg}")
     if e.code == 429:
         return LLMError(f"Gemini is rate-limiting requests; try again shortly. {msg}")
     return LLMError(f"Gemini API error {e.code}: {msg}")
+
+
+@dataclass(frozen=True)
+class Client:
+    """The key (read once) and the transport `post(url, body, headers) -> dict`."""
+    key: str
+    post: Callable = _post
+
+    def __repr__(self) -> str:  # never the key
+        return "gemini.Client(key=[redacted])"
+
+
+def make_client(post: Callable | None = None) -> Client:
+    """Reads the key (env, cache or GSM); raises secrets.MissingKeyError when there is none."""
+    return Client(secrets.gemini_api_key(), post or _post)
+
+
+def generate(client: Client, model: str, body: dict) -> dict:
+    """POST one generateContent request; the reply as a dict, or LLMError (KeyRejected) with a plain message."""
+    headers = {"Content-Type": "application/json", "x-goog-api-key": client.key}
+    try:
+        response = client.post(f"{API_ROOT}/{model}:generateContent", body, headers)
+    except urllib.error.HTTPError as e:
+        raise _http_error(e, client.key) from None  # `from None`: the request (and its key header) stays out of tracebacks
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise LLMError("Couldn't reach the Gemini API. Check the internet connection.") from e
+    except ValueError as e:  # a 200 that isn't JSON (a proxy page, a truncated body)
+        raise LLMError("Gemini returned an unreadable response.") from e
+    if not isinstance(response, dict):
+        raise LLMError("Gemini returned an unreadable response.")
+    return response
 
 
 def _usage(response: dict) -> tuple[int, int]:
@@ -103,18 +142,7 @@ def _call(prompt: str, *, system: str | None, client, effort: str, max_tokens: i
     if system:
         body["systemInstruction"] = {"parts": [{"text": system}]}
 
-    key = secrets.gemini_api_key()
-    headers = {"Content-Type": "application/json", "x-goog-api-key": key}
-    try:
-        response = (client or _post)(f"{API_ROOT}/{name}:generateContent", body, headers)
-    except urllib.error.HTTPError as e:
-        raise _http_error(e, key) from None  # `from None`: the request (and its key header) stays out of tracebacks
-    except (urllib.error.URLError, TimeoutError, OSError) as e:
-        raise LLMError("Couldn't reach the Gemini API. Check the internet connection.") from e
-    except ValueError as e:  # a 200 that isn't JSON (a proxy page, a truncated body)
-        raise LLMError("Gemini returned an unreadable response.") from e
-    if not isinstance(response, dict):
-        raise LLMError("Gemini returned an unreadable response.")
+    response = generate(Client(secrets.gemini_api_key(), client or _post), name, body)
 
     spend.record(cid, *_usage(response), price_as=cid)
     block = (response.get("promptFeedback") or {}).get("blockReason")

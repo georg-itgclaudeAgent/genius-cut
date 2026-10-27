@@ -48,8 +48,7 @@ contract in adapters.py; the adapter owns the conversation (append-only, model t
 thinking included; never edited) and the id → tool name map. A refusal or a reply cut off at max_tokens
 ends the run and is not appended or executed; at most 25 model calls per run; every step goes through the
 spend gate, estimated from the previous step's actual usage plus the new content; the client (and so the
-key read) is made once per run. Texts name the model by its catalog label. A Gemini model stops an agent
-run at once until plan Task 3 (adapters.GEMINI_SOON); Analyse on Gemini works. Runs live in memory: a
+key read) is made once per run. Texts name the model by its catalog label. Runs live in memory: a
 backend restart loses them.
 
 B-roll markers: Envato Elements search rides along on every step (ClaudeAdapter.step(envato=True)) unless
@@ -70,7 +69,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable
 
-from geniuscut import adapters, catalog, claude, graphics, llm, secrets, spend
+from geniuscut import adapters, catalog, claude, gemini, graphics, llm, secrets, spend
 from geniuscut.errors import LLMError
 
 MAX_STEPS = 25
@@ -723,8 +722,6 @@ class Runs:
         bare = Run(id=run_id, client=None, model_id=entry.id)
         try:
             client = (self.make_client or adapter.make_client)()  # reads the key once for the whole run
-        except NotImplementedError as e:  # GeminiAdapter until plan Task 3
-            return self._stopped(bare, "error", str(e) or adapters.GEMINI_SOON)
         except secrets.MissingKeyError as e:
             return self._stopped(bare, "key", str(e))
         except LLMError as e:
@@ -742,10 +739,7 @@ class Runs:
                  f"Sequence summary:\n{json.dumps(sequence)}")
         if any(ctx.get(k) not in (None, "") for k in ("projectPath", "fps", "timebase", "width", "height")):
             first += "\n\nFor graphics: " + _graphics_context(run)
-        try:
-            adapter.add_user_text(first)
-        except NotImplementedError as e:
-            return self._stopped(run, "error", str(e) or adapters.GEMINI_SOON)
+        adapter.add_user_text(first)
         with self._lock:
             self._runs[run_id] = run
         with run.lock:
@@ -831,11 +825,9 @@ class Runs:
         except adapters.OutOfSteps:
             run.steps = MAX_STEPS
             return self._step_cap(run)
-        except NotImplementedError as e:  # GeminiAdapter until plan Task 3
-            return self._stopped(run, "error", str(e) or adapters.GEMINI_SOON)
         except spend.BudgetExceeded as e:
             return self._stopped(run, "limit", str(e))
-        except (secrets.MissingKeyError, claude.KeyRejected) as e:
+        except (secrets.MissingKeyError, claude.KeyRejected, gemini.KeyRejected) as e:
             return self._stopped(run, "key", str(e))
         except LLMError as e:
             return self._stopped(run, "error", str(e))

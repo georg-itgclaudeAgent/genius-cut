@@ -1,7 +1,7 @@
 """Provider adapters for the agent loop (agent.py): the loop speaks one neutral step contract and each
 adapter turns it into its provider's requests and replies (spec "Neutral reply and stops", plan Task 2/3).
 
-The contract (what agent.py relies on; GeminiAdapter, plan Task 3, implements the same):
+The contract (what agent.py relies on; ClaudeAdapter and GeminiAdapter implement it):
 
     adapter = adapters.for_entry(entry)        # one per run, from the run's catalog entry
     client = adapter.make_client()            # once per run (reads the key / ADC); may raise
@@ -22,7 +22,8 @@ The contract (what agent.py relies on; GeminiAdapter, plan Task 3, implements th
   the adapter keeps an id → name map so results can be sent back however the provider needs.
 - `Step.usage` is normalised: `input` = every prompt token incl. cache writes and reads, `output` = all
   output incl. thinking; `requests` = how many model calls the step made (they all count toward the cap).
-- API errors raise LLMError subclasses (claude.KeyRejected, spend.BudgetExceeded, claude.EnvatoUnavailable…);
+- API errors raise LLMError subclasses (claude.KeyRejected, gemini.KeyRejected, spend.BudgetExceeded,
+  claude.EnvatoUnavailable…);
   a step that would need more than `max_requests` calls raises OutOfSteps.
 """
 
@@ -32,7 +33,7 @@ from dataclasses import dataclass, field
 
 import anthropic
 
-from geniuscut import catalog, claude, spend
+from geniuscut import catalog, claude, gemini, spend
 from geniuscut.errors import LLMError
 
 STOPS = ("end", "tool_use", "max_tokens", "refusal", "error")
@@ -168,34 +169,141 @@ class ClaudeAdapter:
                         "tool_use" if stop == "tool_use" and calls else "end", usage, model, requests=requests)
 
 
-GEMINI_SOON = "Gemini support for the assistant is coming in the next build."
-
-
 class GeminiAdapter:
-    """Gemini function calling over gemini.py's REST client: plan Task 3 builds it (whole-content history
-    incl. thought signatures, synthetic ids `g<step>_<index>`, functionResponse per call in order, schema
-    conversion, stop/refusal/empty-reply mapping, agent thinking level from the catalog). Until then an agent
-    run on a Gemini model stops at once with GEMINI_SOON; Analyse on Gemini works (llm.py → gemini.py)."""
+    """Gemini over REST `generateContent` with function calling (gemini.py's Client + generate()).
+
+    Docs checked 2026-10-27 (the guides now lead with the Interactions API; this uses generateContent):
+    - https://ai.google.dev/api/generate-content : Part.thought / Part.thoughtSignature ("an opaque signature
+      for the thought so it can be reused in subsequent requests"), FunctionCall.id (optional),
+      FunctionResponse {id?, name, response}, FunctionDeclaration.parametersJsonSchema (JSON Schema, mutually
+      exclusive with `parameters`), the FinishReason list (MALFORMED_FUNCTION_CALL, UNEXPECTED_TOOL_CALL, ...).
+    - https://ai.google.dev/gemini-api/docs/thinking#signatures : in generateContent "signatures are metadata
+      that can be attached to any part", e.g. inside functionCall parts or the final part, so the model's
+      whole `content` is kept and sent back unchanged.
+    - https://ai.google.dev/gemini-api/docs/function-calling and https://ai.google.dev/api/caching
+      (FunctionCallingConfig mode AUTO).
+    A live call to gemini-3.8-flash (2026-10-27) accepted `parametersJsonSchema` with additionalProperties,
+    type arrays, pattern and minLength, returned parallel calls with ids (`call_...`) and the signature on the
+    first functionCall part; so tools go in as JSON Schema unchanged and `variables` keeps its schema.
+
+    - History: `contents`: user turns {"role": "user", "parts": [...]} and each usable model `content` whole.
+    - Ids: Gemini's own functionCall.id when it gives one, else `g<turn>_<index>` (turn = this model turn's
+      number in the run, index = the call's place in the reply). Results go back as one `functionResponse`
+      part per call, in call order, with the call's name (and Gemini's id when it gave one) and response
+      {"result": text} or {"error": text}.
+    - Stops: functionCall parts -> tool_use; promptFeedback.blockReason or a declined finish -> refusal;
+      MAX_TOKENS -> max_tokens; MALFORMED_FUNCTION_CALL / UNEXPECTED_TOOL_CALL / an empty reply (no text, no
+      call) -> error, retried once inside the step (each retry is a request). `thought` parts never reach text.
+    - Params: the entry's max output; thinkingConfig.thinkingLevel = entry.params.thinking ("medium") on
+      gemini-3* models (Analyse keeps gemini.py's "low"). Caching is Gemini's implicit caching (nothing sent).
+    - Usage: input = promptTokenCount (cached included), output = candidates + thoughts; spend is recorded
+      per call under the catalog id, cached tokens at the cache-read rate, long-prompt tiers by prompt size.
+    - `envato` is ignored (the Anthropic MCP connector; plan Task 4 makes search_envato a backend tool)."""
+
+    RETRY = ("MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL")
+    DECLINED = (*sorted(gemini.DECLINED), "LANGUAGE", "IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT", "ESCALATION",
+                "PUP_LIMITED_DISABLED")
+    OK = (None, "STOP", "FINISH_REASON_UNSPECIFIED")
 
     def __init__(self, entry: catalog.Entry):
         self.entry = entry
+        self.contents: list[dict] = []
+        self.calls: dict[str, tuple[str, str | None]] = {}  # call id -> (tool name, Gemini's own id or None)
+        self.turns = 0  # model turns appended
 
     @property
     def history(self) -> list:
-        raise NotImplementedError(GEMINI_SOON)
+        return self.contents
 
     def make_client(self):
-        raise NotImplementedError(GEMINI_SOON)
+        return gemini.make_client()
 
     def add_user_text(self, text: str) -> None:
-        raise NotImplementedError(GEMINI_SOON)
+        self.contents.append({"role": "user", "parts": [{"text": text}]})
 
     def add_tool_results(self, results: list[ToolResult]) -> None:
-        raise NotImplementedError(GEMINI_SOON)
+        parts = []
+        for r in results:
+            if r.id not in self.calls:
+                raise LLMError(f"No Gemini function call has the id {r.id!r}.")
+            name, own = self.calls[r.id]
+            response = {"error": r.content} if r.is_error else {"result": r.content}
+            parts.append({"functionResponse": {**({"id": own} if own else {}), "name": name, "response": response}})
+        self.contents.append({"role": "user", "parts": parts})
+
+    def _body(self, system: str, tools: list[dict]) -> dict:
+        e, p = self.entry, self.entry.params
+        config: dict = {"maxOutputTokens": p.max_output}
+        if p.thinking and e.model.startswith("gemini-3"):
+            config["thinkingConfig"] = {"thinkingLevel": p.thinking}
+        body = {"contents": self.contents, "generationConfig": config}
+        if system:
+            body["systemInstruction"] = {"parts": [{"text": system}]}
+        if tools:
+            body["tools"] = [{"functionDeclarations": [declaration(t) for t in tools]}]
+            body["toolConfig"] = {"functionCallingConfig": {"mode": "AUTO"}}
+        return body
+
+    def _call(self, client, system: str, tools: list[dict], input_tokens: int) -> dict:
+        cid = self.entry.id
+        if spend.price(cid) is None:  # an unpriced model would skip the gate: unlimited spend
+            raise LLMError(f"No price is known for Gemini model '{cid}', so the monthly limit can't be "
+                           f"enforced. Use one of: {', '.join(sorted(spend.PRICES))}.")
+        spend.check_tokens(cid, input_tokens, self.entry.params.max_output)
+        response = gemini.generate(client, self.entry.model, self._body(system, tools))
+        u = response.get("usageMetadata") or {}
+        prompt, out = gemini._usage(response)
+        cached = min(int(u.get("cachedContentTokenCount") or 0), prompt)
+        spend.record(cid, prompt - cached, out, cache_read=cached, price_as=cid)
+        return response
 
     def step(self, system: str, tools: list[dict], *, client, input_tokens: int, max_requests: int = 1,
              envato: bool = False) -> Step:
-        raise NotImplementedError(GEMINI_SOON)
+        requests, cid = 0, self.entry.id
+        while True:
+            if requests >= max_requests:
+                raise OutOfSteps()
+            response = self._call(client, system, tools, input_tokens)
+            requests += 1
+            usage = Usage(*gemini._usage(response))
+            block = (response.get("promptFeedback") or {}).get("blockReason")
+            if block:  # nothing is appended on a refusal, max_tokens or error: the run ends there
+                return Step("", stop="refusal", usage=usage, model=cid, detail=block, requests=requests)
+            candidate = (response.get("candidates") or [{}])[0] or {}
+            finish = candidate.get("finishReason")
+            if finish in self.DECLINED:
+                return Step("", stop="refusal", usage=usage, model=cid, detail=finish, requests=requests)
+            if finish in ("MAX_TOKENS", "CONTINUATION"):  # a cut-off call must never run
+                return Step("", stop="max_tokens", usage=usage, model=cid, requests=requests)
+            content = candidate.get("content") or {}
+            parts = content.get("parts") or []
+            text = "".join(p.get("text") or "" for p in parts if not p.get("thought"))
+            fcalls = [p["functionCall"] for p in parts if isinstance(p.get("functionCall"), dict)]
+            if finish in self.RETRY or (finish in self.OK and not fcalls and not text.strip()):
+                if requests == 1:
+                    continue  # retried once with the same request; never taken as a plan
+                what = finish if finish in self.RETRY else "an empty reply"
+                return Step("", stop="error", usage=usage, model=cid, requests=requests,
+                            detail=f"Gemini sent {what} twice")
+            if finish not in self.OK:
+                return Step("", stop="error", usage=usage, model=cid, requests=requests,
+                            detail=f"Gemini stopped with {finish}")
+            self.turns += 1
+            self.contents.append(content if content.get("role") else {"role": "model", **content})  # whole
+            calls = []
+            for i, f in enumerate(fcalls):
+                own = f.get("id") if isinstance(f.get("id"), str) and f.get("id") else None
+                call_id = own or f"g{self.turns}_{i}"
+                self.calls[call_id] = (f.get("name", ""), own)
+                calls.append({"id": call_id, "name": f.get("name", ""), "input": f.get("args") or {}})
+            return Step(text, calls, "tool_use" if calls else "end", usage, cid, requests=requests)
+
+
+def declaration(tool: dict) -> dict:
+    """A neutral tool ({name, description, input_schema}) as a Gemini function declaration: the JSON Schema
+    goes in whole as `parametersJsonSchema` (see GeminiAdapter's docs note), so nothing is converted or lost."""
+    return {"name": tool["name"], "description": tool.get("description", ""),
+            "parametersJsonSchema": tool["input_schema"]}
 
 
 ADAPTERS = {"anthropic": ClaudeAdapter, "vertex": ClaudeAdapter, "gemini": GeminiAdapter}

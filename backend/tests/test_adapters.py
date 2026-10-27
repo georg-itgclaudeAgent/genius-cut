@@ -1,5 +1,5 @@
 """The provider-neutral agent loop (model picker plan Task 2): adapters, Claude on Anthropic or Vertex, a run
-keeps its model after a switch, Gemini agent runs wait for Task 3."""
+keeps its model after a switch (Gemini: test_gemini_adapter.py)."""
 
 from types import SimpleNamespace
 
@@ -158,22 +158,3 @@ def test_the_refusal_message_names_the_model_by_its_label():
     fake = FakeClient(reply(text("no"), stop="refusal", details=SimpleNamespace(category="cyber")))
     r = agent.Runs(make_client=lambda: fake).start("x", SELECTION, SEQUENCE)
     assert r["reason"] == "refusal" and r["message"] == "Claude Opus 5.5 (Anthropic) declined this instruction (cyber)."
-
-
-# ── Gemini until plan Task 3 ───────────────────────────────────────
-
-def test_a_gemini_agent_run_stops_with_the_coming_soon_message():
-    select("gemini:gemini-3.8-flash")
-    r = agent.Runs().start("x", SELECTION, SEQUENCE)
-    assert r["state"] == "stopped" and r["reason"] == "error"
-    assert r["message"] == adapters.GEMINI_SOON == "Gemini support for the assistant is coming in the next build."
-    assert r["cost"]["model"] == "gemini:gemini-3.8-flash" and r["cost"]["label"] == "Gemini 3.8 Flash"
-
-
-def test_the_gemini_adapter_is_a_stub_for_task_3():
-    a = adapters.for_entry(catalog.get("gemini:gemini-3.8-flash"))
-    assert isinstance(a, adapters.GeminiAdapter)
-    for call in (a.make_client, lambda: a.add_user_text("x"), lambda: a.add_tool_results([]),
-                 lambda: a.step("s", [], client=None, input_tokens=1)):
-        with pytest.raises(NotImplementedError):
-            call()

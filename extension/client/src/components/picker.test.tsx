@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
-import { ModelPickerView, optionText, switchModel } from "./ModelPicker";
+import { ModelPickerFailed, ModelPickerView, optionText, switchModel } from "./ModelPicker";
 import { modelGardenUrl, runVertexLogin, VertexView } from "./Settings";
 import { runStages } from "./CutTab";
 import { BackendError, createBackend } from "../api/backend";
@@ -58,6 +58,13 @@ describe("the model picker", () => {
     expect(html).toMatch(/<select[^>]*disabled=""/);
     expect(html).toMatch(/<button[^>]*disabled=""[^>]*>↻<\/button>/);
     expect(html).toContain("No route");
+  });
+
+  it("when the list couldn't be read at all, the reason shows with ↻ to try again (no panel reload needed)", () => {
+    const html = renderToStaticMarkup(<ModelPickerFailed error="The backend took too long to answer." busy={false} onRetry={() => {}} />);
+    expect(html).toContain("The backend took too long to answer.");
+    expect(html).toMatch(/<button[^>]*aria-label="Check the models again"[^>]*>↻<\/button>/);
+    expect(renderToStaticMarkup(<ModelPickerFailed error="x" busy onRetry={() => {}} />)).toMatch(/<button[^>]*disabled=""/);
   });
 
   it("switching saves the model, then re-reads the list and the health (so the cost line follows)", async () => {

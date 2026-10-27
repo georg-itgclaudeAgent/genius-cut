@@ -57,6 +57,20 @@ export function ModelPickerView({ listing, busy, error, onPick, onRefresh }: {
   );
 }
 
+/** The list couldn't be read (live 2026-10-27: an expired gcloud login made the first check time out): the
+ *  reason and ↻ to try again, so the panel never needs a reload. */
+export function ModelPickerFailed({ error, busy, onRetry }: { error: string; busy: boolean; onRetry: () => void }) {
+  return (
+    <div className="model-pick">
+      <div className="model-row">
+        <div className="model-why bad" role="alert">{error}</div>
+        <button className="btn btn-g model-ref" type="button" title="Check the models again" aria-label="Check the models again"
+          disabled={busy} onClick={onRetry}>↻</button>
+      </div>
+    </div>
+  );
+}
+
 /** Loads the list once; nothing shows until it's read. `onSwitched` re-reads /health. */
 export function ModelPicker({ api, onSwitched }: { api: PickerApi; onSwitched: () => Promise<void> }) {
   const [listing, setListing] = useState<ModelListing | null>(null);
@@ -74,7 +88,7 @@ export function ModelPicker({ api, onSwitched }: { api: PickerApi; onSwitched: (
     }
   }, []);
   useEffect(() => { void work(() => api.models()); }, [api, work]);
-  if (!listing) return error ? <div className="model-pick"><div className="model-why bad" role="alert">{error}</div></div> : null;
+  if (!listing) return error ? <ModelPickerFailed error={error} busy={busy} onRetry={() => void work(() => api.models(true))} /> : null;
   return <ModelPickerView listing={listing} busy={busy} error={error}
     onPick={(id) => { if (id !== listing.selected) void work(() => switchModel(api, id, onSwitched)); }}
     onRefresh={() => void work(() => api.models(true))} />;

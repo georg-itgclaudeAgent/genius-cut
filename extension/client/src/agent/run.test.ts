@@ -15,7 +15,7 @@ const BASE = {
   sequenceId: "seq-1", name: "Main", fps: 25, durationS: 200, tracks: [{ kind: "video", index: 1, name: "", muted: false }], markers: [] as any[],
   selection: [V1, A1], clips: [clip(V1, "V1", 100, 110, true), clip(A1, "A1", 100, 110, true), clip(OTHER, "V2", 120, 130)],
 };
-const COST: RunCost = { model: "claude-opus-5-5", input_tokens: 1000, output_tokens: 200, usd: 0.05, month_usd: 1.2, limit_usd: 20 };
+const COST: RunCost = { model: "anthropic:claude-opus-5-5", label: "Claude Opus 5.5 (Anthropic)", provider: "anthropic", input_tokens: 1000, output_tokens: 200, usd: 0.05, month_usd: 1.2, limit_usd: 20 };
 const SNAP = { found: true, sequenceId: "seq-1", startTicks: "0", endTicks: "1", startS: 100, durationS: 10, fps: 25, video: [], audio: [], problems: [] } as Snapshot;
 
 const memoryStore = (): TurnStore => { let text: string | null = null; return { read: () => text, write: (t) => { text = t; } }; };

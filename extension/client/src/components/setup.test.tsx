@@ -166,8 +166,8 @@ describe("Settings: Graphics (AI key tab)", () => {
 
 describe("Settings: Usage & limit tab", () => {
   const USAGE: Usage = { month_usd: 4.5, limit_usd: 20, limit_tier: 20, resets_on: "2026-11-01", run_count: 12, runs: [
-    { at: "2026-10-14T05:00:00+00:00", kind: "agent", model: "claude-opus-5-5", usd: 0.42 },
-    { at: "2026-10-13T05:00:00+00:00", kind: "trim", model: "claude-opus-5-5", usd: null },
+    { at: "2026-10-14T05:00:00+00:00", kind: "agent", model: "anthropic:claude-opus-5-5", label: "Claude Opus 5.5 (Anthropic)", provider: "anthropic", usd: 0.42 },
+    { at: "2026-10-13T05:00:00+00:00", kind: "trim", model: "vertex:claude-opus-5-5", label: "Claude Opus 5.5 (Google Cloud)", provider: "vertex", usd: null },
   ] };
   const usage = (u: Usage, tier: 20 | 100 = 20) => renderToStaticMarkup(<UsageView usage={u} tier={tier} saving={false} error={null} onTier={() => {}} />);
 
@@ -178,7 +178,11 @@ describe("Settings: Usage & limit tab", () => {
     expect(html).toContain("width:22.5%");
     expect(html).toContain("12 runs this month");
     expect(html).toContain("Instruction");
-    expect(html).toContain("Claude Opus 5.5");
+    expect(html).toContain("Instruction · Claude Opus 5.5 (Anthropic)");
+    expect(html).toContain("Trim · Claude Opus 5.5 (Google Cloud)");
+    expect(html).toMatch(/class="pv">Anthropic</);
+    expect(html).toMatch(/class="pv">Google Cloud</);
+    expect(html).toContain("Anthropic&#x27;s console and Google Cloud billing are the bills of record");
     expect(html).toContain("$0.42");
     expect(html).toContain("cost unknown");
     expect(html).toMatch(/aria-pressed="true"[^>]*>\$20/);
@@ -192,8 +196,8 @@ describe("Settings: Usage & limit tab", () => {
 
   it("formats the reset day and a run line", () => {
     expect(resetLine("2027-01-01")).toBe("Resets on 1 January 2027");
-    expect(runLine({ at: "2026-10-14T05:00:00+00:00", kind: "summarize", model: "gemini-3-7-flash", usd: 0.004 }))
-      .toEqual({ when: expect.stringMatching(/14 Oct/), what: "Style summary · Gemini 3.7 Flash", usd: "<$0.01" });
+    expect(runLine({ at: "2026-10-14T05:00:00+00:00", kind: "summarize", model: "gemini:gemini-3.7-flash", label: "Gemini 3.7 Flash", provider: "gemini", usd: 0.004 }))
+      .toEqual({ when: expect.stringMatching(/14 Oct/), what: "Style summary · Gemini 3.7 Flash", provider: "Gemini API", usd: "<$0.01" });
   });
 });
 

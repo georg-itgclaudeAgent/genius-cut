@@ -3,7 +3,7 @@ import { afterTrimRefresh, watchAiStatus } from "./aiStatus";
 import type { AiStatus, Health } from "../api/types";
 
 const ai = (month_usd: number, limit_usd = 2): AiStatus =>
-  ({ provider: "gemini", model: "gemini-3.7-flash", month_usd, limit_usd, usd_per_minute: 0.002 });
+  ({ provider: "gemini", model_id: "gemini:gemini-3.7-flash", label: "Gemini 3.7 Flash", month_usd, limit_usd, usd_per_minute: 0.002 });
 const health = (a?: AiStatus): Health => ({ status: "ok", version: "0.1.0", stt_device: "cuda", ai: a });
 const flush = () => new Promise((r) => setTimeout(r, 0));
 

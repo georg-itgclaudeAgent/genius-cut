@@ -86,7 +86,8 @@ def run_trim(
 ) -> TrimResponse:
     duration = req.duration_s
     words, env = transcribe_range(req, transcriber, extract=extract, place=place, mix=mix)
-    with spend.meter(kind="trim", run=req.run_id) as m:
+    entry = llm.selected_entry()  # once per Analyse: the whole proposal uses this model
+    with spend.meter(kind="trim", run=req.run_id) as m, llm.using(entry):
         cut_spans = propose(words, library.build_fewshot(library_dir), req.prompt)
     cut_spans = refine(cut_spans, words, duration, env=env)
     if req.cut_pauses:
@@ -113,5 +114,5 @@ def run_trim(
         stt_device=transcriber.device,
         cut_fraction=round(cut_fraction, 4),
         warning=warning,
-        cost=llm.run_cost(m),
+        cost=llm.run_cost(m, default=entry.id),
     )

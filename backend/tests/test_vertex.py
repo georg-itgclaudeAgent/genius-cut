@@ -29,8 +29,9 @@ def test_vertex_calls_the_plain_messages_api_without_api_only_params(monkeypatch
     assert claude.ask_json("hi", {"type": "object"}, client=fake) == {"ok": True}
     req = fake.requests[0]
     assert req["model"] == "claude-opus-5-5"  # bare ID on Vertex, no prefix or @date
-    assert req["output_config"]["format"]["type"] == "json_schema"
-    assert "effort" in req["output_config"]
+    # output_config (effort, JSON format) stays off on Vertex until a real call verifies it (catalog
+    # VERTEX_PARAMS): the schema rides in the prompt instead.
+    assert "output_config" not in req and '{"type": "object"}' in req["messages"][0]["content"]
     # Server-side refusal fallback is Claude-API-only.
     assert "fallbacks" not in req and "betas" not in req
 

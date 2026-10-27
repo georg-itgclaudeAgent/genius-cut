@@ -63,7 +63,8 @@ Per-model agent parameters (`Params`) are what adapters send (plan Task 2/3): ma
 the request, Claude effort, Gemini agent thinking level, caching style, structured outputs, and whether the
 Anthropic API's server-side refusal fallback is on (refusals-and-fallback docs, 2026-10-23: Fable 5.1, Opus 5.5
 and Sonnet 5.5 have it, Haiku 5.5 doesn't; never on Vertex). Vertex `cache_control` / `output_config` support
-is unverified until the first real Vertex call (no ADC on the laptop on 2026-10-23).
+is unverified until the first real Vertex call (no ADC on the laptop on 2026-10-23), so both are off there
+(VERTEX_PARAMS).
 
 This module imports nothing from Genius Cut at load time (settings and spend import it).
 """
@@ -126,8 +127,9 @@ class Params:
     effort: str | None = None       # Claude output_config.effort for agent steps
     thinking: str | None = None     # Gemini thinkingConfig.thinkingLevel for agent steps (Analyse keeps "low")
     caching: str = "none"           # "auto": top-level cache_control (Claude); "implicit": Gemini's own
-    structured_output: bool = True  # JSON schema output (Analyse)
+    structured_output: bool = True  # JSON schema output (Analyse); off: the schema goes in the prompt instead
     fallbacks: bool = False         # Anthropic API server-side refusal fallback (`fallbacks="default"`)
+    output_config: bool = True      # Claude: the request may carry `output_config` (effort, JSON format)
 
 
 @dataclass(frozen=True)
@@ -146,21 +148,31 @@ class Entry:
         return GROUPS[self.provider]
 
 
+ANTHROPIC_PARAMS = Params(max_output=32000, effort="high", caching="auto", fallbacks=True)
+# Vertex: AnthropicVertex (anthropic SDK 1.9.0) forwards the request body unchanged to rawPredict /
+# streamRawPredict, so the SDK says nothing about what Vertex accepts. Top-level `cache_control` (automatic
+# caching), `output_config` (effort, JSON-schema format) and fallbacks stay OFF on Vertex until the first real
+# call shows they're served (plan Task 6); Analyse then puts the JSON schema in the prompt and the model's
+# own default effort applies. Turning them on is this one line.
+VERTEX_PARAMS = Params(max_output=32000, effort=None, caching="none", structured_output=False, fallbacks=False,
+                       output_config=False)
+GEMINI_PARAMS = Params(max_output=32000, thinking="medium", caching="implicit")
+PARAMS = {"anthropic": ANTHROPIC_PARAMS, "vertex": VERTEX_PARAMS, "gemini": GEMINI_PARAMS}
+
+
 def _claude(model: str, name: str, base: Rate, *, long: Rate | None = None, long_above: int = 0,
             fallbacks: bool = True) -> list[Entry]:
     price = (Price(date.min, base, long, long_above),)
     return [
         Entry(f"anthropic:{model}", "anthropic", model, f"{name} (Anthropic)", price,
               Params(max_output=32000, effort="high", caching="auto", fallbacks=fallbacks), ANTHROPIC_PRICING),
-        Entry(f"vertex:{model}", "vertex", model, f"{name} (Google Cloud)", price,
-              Params(max_output=32000, effort="high", caching="auto", fallbacks=False), VERTEX_PRICING,
-              notes="Vertex cache_control/output_config unverified until the first real call."),
+        Entry(f"vertex:{model}", "vertex", model, f"{name} (Google Cloud)", price, VERTEX_PARAMS, VERTEX_PRICING,
+              notes="Vertex cache_control/output_config off until the first real call shows they're served."),
     ]
 
 
 def _gemini(model: str, name: str, prices: tuple[Price, ...], source: str, notes: str = "") -> Entry:
-    return Entry(f"gemini:{model}", "gemini", model, name, prices,
-                 Params(max_output=32000, thinking="medium", caching="implicit"), source, notes)
+    return Entry(f"gemini:{model}", "gemini", model, name, prices, GEMINI_PARAMS, source, notes)
 
 
 _FLASH_PROMO = (Price(date.min, Rate(0.75, 3.75, 0.75, 0.075)),
@@ -193,6 +205,20 @@ BY_ID: dict[str, Entry] = {e.id: e for e in ENTRIES}
 
 def get(model_id: str) -> Entry | None:
     return BY_ID.get(model_id)
+
+
+def entry_for(model_id: str) -> Entry:
+    """The catalog entry for an id; an id outside the catalog (a dev env override such as
+    GENIUSCUT_CLAUDE_MODEL=claude-x) gets an unpriced stand-in with its provider's default params, so the
+    call is refused by the price check with the usual message instead of failing here."""
+    e = BY_ID.get(model_id)
+    if e is not None:
+        return e
+    provider, _, model = str(model_id).partition(":")
+    if provider not in PROVIDERS or not model:
+        provider, model = provider_of(model_id), str(model_id)
+    return Entry(f"{provider}:{model}", provider, model, model, (), PARAMS.get(provider, ANTHROPIC_PARAMS),
+                 source="not in the catalog")
 
 
 def is_known(model_id) -> bool:

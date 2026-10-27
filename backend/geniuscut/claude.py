@@ -1,37 +1,35 @@
-"""One place that talks to Claude.
+"""One place that talks to Claude for Analyse (ask_json / ask_text), plus the client and error code the
+agent's ClaudeAdapter (adapters.py) shares.
 
-- Model `claude-opus-5-5` (override with GENIUSCUT_CLAUDE_MODEL).
-- Provider: the Anthropic API (key from env/GSM) or Google Cloud Vertex AI
-  (GENIUSCUT_LLM_PROVIDER or GENIUSCUT_CLAUDE_PROVIDER = vertex; bills the GCP project,
-  uses the gcloud login). Reached through `llm.py`, whose default is this module on the
-  Anthropic API; the key comes from the editor's own Secret Manager (`settings.json`).
-- JSON comes back through structured outputs (`output_config.format`). Forced
-  `tool_choice` returns a 400 on this model.
-- Effort is always set explicitly; this model's default is `medium`. Thinking can't be
-  turned off on Opus 5.5; it's billed as output, which `usage.output_tokens` includes.
-- On the Anthropic API, server-side refusal fallback is on (`fallbacks="default"`), so a
-  policy decline is retried on a fallback model inside the same call. Vertex doesn't offer it.
+- The model is a catalog entry (`catalog.Entry`), passed per call by `llm.py` from the panel's picker.
+  Called without one, this module uses its own dev default, read per call: `<provider()>:<model()>`,
+  i.e. GENIUSCUT_LLM_PROVIDER / GENIUSCUT_CLAUDE_PROVIDER (anthropic | vertex) and GENIUSCUT_CLAUDE_MODEL
+  (default `claude-opus-5-5`).
+- Provider: the Anthropic API (key from the editor's Secret Manager, `settings.json`) or Google Cloud Vertex
+  AI (`AnthropicVertex`, the gcloud application-default login, project/region from `settings.vertex`;
+  GENIUSCUT_VERTEX_PROJECT / GENIUSCUT_VERTEX_REGION are dev overrides). Bills the GCP project.
+- The request carries only what the entry's `Params` allow: `output_config` (effort, JSON-schema format) only
+  where `output_config` is on; with structured output off, the JSON schema goes in the prompt and the reply
+  is parsed leniently (a ```json fence is stripped). Forced `tool_choice` returns a 400 on these models.
+- Effort is set explicitly where allowed; Opus 5.5's default is `medium`. Thinking can't be turned off on
+  Opus 5.5; it's billed as output, which `usage.output_tokens` includes.
+- Server-side refusal fallback (`fallbacks="default"`) only on the Anthropic API and only for models whose
+  params say so (catalog). Vertex never gets it.
 - A refusal or a truncated reply raises instead of being silently parsed.
-- `agent_step` is one step of the panel's agent loop (agent.py): streamed, tools offered with
-  `tool_choice` auto, effort high, adaptive thinking (the default: no `thinking` param), prompt
-  caching on (`cache_control` auto), recorded under `response.model` with cache tokens.
-- Envato Elements search (B-roll): on the Anthropic API, `agent_step(envato=True)` adds Envato's MCP
-  server (https://mcp.envato.com/mcp, no auth) through Anthropic's MCP connector, with only
-  `search_stock_video` and `search_photos` allowlisted. Anthropic runs those calls: they come back as
-  mcp_tool_use / mcp_tool_result blocks, never as tool calls for the panel. GENIUSCUT_ENVATO=0 turns it
-  off (`envato_enabled`); Vertex never gets it. An API error naming the MCP server raises EnvatoUnavailable,
-  so the caller can retry the step without it. The ledger prices tokens only (MCP results arrive as input
-  tokens); `usage.server_tool_use` isn't priced.
-- Before every call the spend gate checks the worst case against the monthly limit, so a
-  refused run never reaches the API; an unpriced model is refused. Usage is recorded in the
-  spend ledger after every reply. Gate, prices and ledger use the catalog id (`model_id()`:
-  `anthropic:claude-opus-5-5` or `vertex:claude-opus-5-5`); a reply is recorded under the id of the
-  model that answered, priced as the id asked for when that one has no price. An API error also
-  updates the model picker's cached state (catalog.observe), e.g. the workspace cap.
+- Envato Elements search (B-roll, until plan Task 4 replaces it): on the Anthropic API the agent adds Envato's
+  MCP server (https://mcp.envato.com/mcp, no auth) through Anthropic's MCP connector, with only
+  `search_stock_video` and `search_photos` allowlisted (ENVATO_SERVER / ENVATO_TOOLSET / MCP_BETA here,
+  used by adapters.ClaudeAdapter). GENIUSCUT_ENVATO=0 turns it off (`envato_enabled`); other providers never
+  get it. An API error naming the MCP server raises EnvatoUnavailable, so the caller can retry without it.
+- Before every call the spend gate checks the worst case against the monthly limit, so a refused run never
+  reaches the API; an unpriced model is refused. Usage is recorded in the spend ledger after every reply
+  under the catalog id of the model that answered, priced as the id asked for when that one has no price.
+  An API error also updates the model picker's cached state (catalog.observe), e.g. the workspace cap.
 """
 
 import json
 import os
+import re
 import subprocess
 from contextlib import contextmanager
 
@@ -40,9 +38,8 @@ import anthropic
 from geniuscut import catalog, secrets, spend
 from geniuscut.errors import LLMError
 
-MODEL = os.environ.get("GENIUSCUT_CLAUDE_MODEL", "claude-opus-5-5")
+MODEL = "claude-opus-5-5"  # the dev default; GENIUSCUT_CLAUDE_MODEL overrides it (read per call)
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
-AGENT_MAX_TOKENS = 32000  # a whole explainer composition plus thinking fits in one reply
 MCP_BETA = "mcp-client-2025-11-20"
 ENVATO_SERVER = {"type": "url", "url": "https://mcp.envato.com/mcp", "name": "envato"}
 # Search only: every other Envato tool (downloads, licences…) stays off.
@@ -69,52 +66,74 @@ class EnvatoUnavailable(ClaudeError):
 
 
 def envato_enabled() -> bool:
-    """Envato search rides along unless GENIUSCUT_ENVATO is 0/false/off/no, and only on the Anthropic API."""
-    off = (os.environ.get("GENIUSCUT_ENVATO") or "").strip().lower() in ("0", "false", "off", "no")
-    return not off and provider() == "anthropic"
+    """Envato search rides along unless GENIUSCUT_ENVATO is 0/false/off/no. The caller adds it only on the
+    Anthropic API (agent.py checks the run's provider)."""
+    return (os.environ.get("GENIUSCUT_ENVATO") or "").strip().lower() not in ("0", "false", "off", "no")
 
 
-def _mcp_failure(e) -> bool:
+def mcp_failure(e) -> bool:
     msg = _api_message(e).lower()
     return "mcp" in msg or ENVATO_SERVER["name"] in msg
 
 
 def provider() -> str:
-    """Which Claude endpoint: `anthropic` or `vertex`. GENIUSCUT_LLM_PROVIDER wins when it names one."""
+    """The dev default Claude endpoint: `anthropic` or `vertex`. GENIUSCUT_LLM_PROVIDER wins when it names one."""
     chosen = (os.environ.get("GENIUSCUT_LLM_PROVIDER") or "").strip().lower()
     if chosen in ("anthropic", "vertex"):
         return chosen
     return (os.environ.get("GENIUSCUT_CLAUDE_PROVIDER") or "anthropic").strip().lower()
 
 
+def model() -> str:
+    """The dev default model name: GENIUSCUT_CLAUDE_MODEL, else MODEL (read per call)."""
+    return (os.environ.get("GENIUSCUT_CLAUDE_MODEL") or "").strip() or MODEL
+
+
 def model_id() -> str:
-    """The catalog id of the model this module calls: `<provider()>:<MODEL>`."""
-    return f"{provider()}:{MODEL}"
+    """The catalog id of the dev default: `<provider()>:<model()>`."""
+    return f"{provider()}:{model()}"
 
 
-def _answered(response, asked: str) -> str:
+def default_entry() -> catalog.Entry:
+    return catalog.entry_for(model_id())
+
+
+def answered(response, asked: str) -> str:
     """The catalog id of the model that answered (a server-side fallback may differ)."""
     name = getattr(response, "model", None)
     return f"{asked.partition(':')[0]}:{name}" if isinstance(name, str) and name else asked
 
 
-def _require_price(cid: str) -> None:
+def require_price(cid: str) -> None:
     if spend.price(cid) is None:  # an unpriced model would skip the gate: unlimited spend
         raise ClaudeError(f"No price is known for Claude model '{cid}', so the monthly limit can't be "
                           f"enforced. Use one of: {', '.join(sorted(spend.PRICES))}.")
 
 
-def default_client():
-    p = provider()
-    if p == "anthropic":
+def _vertex_location() -> tuple[str, str]:
+    from geniuscut import settings
+    v = settings.load().vertex
+    return (os.environ.get("GENIUSCUT_VERTEX_PROJECT") or v.project,
+            os.environ.get("GENIUSCUT_VERTEX_REGION") or v.region)
+
+
+def make_client(entry: catalog.Entry):
+    """The SDK client for a Claude entry: Anthropic (reads the key) or AnthropicVertex (ADC)."""
+    if entry.provider == "anthropic":
         return anthropic.Anthropic(api_key=secrets.anthropic_api_key())
-    if p == "vertex":
+    if entry.provider == "vertex":
         # Bare model IDs on Vertex; auth is the machine's gcloud application-default login.
-        return anthropic.AnthropicVertex(
-            project_id=os.environ.get("GENIUSCUT_VERTEX_PROJECT", "agent-georg"),
-            region=os.environ.get("GENIUSCUT_VERTEX_REGION", "global"),
-        )
-    raise ClaudeError(f"Unknown GENIUSCUT_CLAUDE_PROVIDER {p!r}: use 'anthropic' or 'vertex'.")
+        project, region = _vertex_location()
+        return anthropic.AnthropicVertex(project_id=project, region=region)
+    raise ClaudeError(f"{entry.id} isn't a Claude model.")
+
+
+def default_client():
+    """The client for the dev default (env) provider."""
+    p = provider()
+    if p not in ("anthropic", "vertex"):
+        raise ClaudeError(f"Unknown GENIUSCUT_CLAUDE_PROVIDER {p!r}: use 'anthropic' or 'vertex'.")
+    return make_client(default_entry())
 
 
 def _api_message(e) -> str:
@@ -126,29 +145,39 @@ def _api_message(e) -> str:
     return str(e)
 
 
-def _call(prompt: str, *, system: str | None, client, output_config: dict, max_tokens: int):
-    cid = model_id()
-    _require_price(cid)
+def _schema_prompt(prompt: str, schema: dict) -> str:
+    return (f"{prompt}\n\nReply with only one JSON object that matches this JSON Schema, and no other text:\n"
+            f"{json.dumps(schema)}")
+
+
+def _call(prompt: str, *, entry: catalog.Entry | None, system: str | None, client, effort: str,
+          max_tokens: int, schema: dict | None):
+    entry = entry or default_entry()
+    cid, p = entry.id, entry.params
+    require_price(cid)
+    if schema is not None and not (p.output_config and p.structured_output):
+        prompt = _schema_prompt(prompt, schema)
     spend.check_budget(cid, (system or "") + prompt, max_tokens)
-    client = client or default_client()
-    kwargs = dict(
-        model=MODEL,
-        max_tokens=max_tokens,
-        output_config=output_config,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    client = client or make_client(entry)
+    kwargs = dict(model=entry.model, max_tokens=max_tokens, messages=[{"role": "user", "content": prompt}])
+    if p.output_config:
+        output_config = {"effort": effort}
+        if schema is not None and p.structured_output:
+            output_config = {"format": {"type": "json_schema", "schema": schema}, "effort": effort}
+        kwargs["output_config"] = output_config
     if system:
         kwargs["system"] = system
-    if provider() == "vertex":
+    if entry.provider == "vertex":
         create = client.messages.create
     else:
-        kwargs.update(betas=[FALLBACK_BETA], fallbacks="default")
+        if p.fallbacks:
+            kwargs.update(betas=[FALLBACK_BETA], fallbacks="default")
         create = client.beta.messages.create
-    with _api_errors(cid):
+    with api_errors(cid):
         response = create(**kwargs)
     usage = getattr(response, "usage", None)
     if usage is not None:
-        spend.record(_answered(response, cid), int(getattr(usage, "input_tokens", 0) or 0),
+        spend.record(answered(response, cid), int(getattr(usage, "input_tokens", 0) or 0),
                      int(getattr(usage, "output_tokens", 0) or 0), price_as=cid)
     if response.stop_reason == "refusal":
         details = getattr(response, "stop_details", None)
@@ -167,7 +196,7 @@ def _note(cid: str | None, e: Exception) -> None:
 
 
 @contextmanager
-def _api_errors(cid: str | None = None):
+def api_errors(cid: str | None = None):
     """Anthropic SDK errors as ClaudeError with a plain message; `cid`'s picker state notes the error."""
     try:
         yield
@@ -189,53 +218,20 @@ def _api_errors(cid: str | None = None):
         raise
 
 
-def _tokens(usage, name: str) -> int:
-    return int(getattr(usage, name, 0) or 0)
+_FENCE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.S)
 
 
-def agent_step(messages: list, tools: list[dict], system: str, *, client, input_tokens: int,
-               envato: bool = False):
-    """One agent step: gate on `input_tokens` (the caller's estimate) plus AGENT_MAX_TOKENS,
-    stream, return the final message. The caller handles stop_reason (refusal, max_tokens,
-    tool_use, end_turn) and appends `response.content` whole. Spend is recorded under the catalog id of the
-    model that answered (an unpriced fallback is priced as `model_id()`), cache tokens included. `envato` adds the
-    Envato MCP server and its search toolset (Anthropic API only); an API error about it raises
-    EnvatoUnavailable."""
-    cid = model_id()
-    _require_price(cid)
-    spend.check_tokens(cid, input_tokens, AGENT_MAX_TOKENS)
-    kwargs = dict(model=MODEL, max_tokens=AGENT_MAX_TOKENS, system=system, tools=tools,
-                  tool_choice={"type": "auto"}, messages=messages, output_config={"effort": "high"},
-                  cache_control={"type": "ephemeral"})
-    if provider() == "vertex":
-        stream = client.messages.stream
-    else:
-        kwargs.update(betas=[FALLBACK_BETA], fallbacks="default")
-        if envato:
-            kwargs.update(betas=[FALLBACK_BETA, MCP_BETA], mcp_servers=[ENVATO_SERVER], tools=[*tools, ENVATO_TOOLSET])
-        stream = client.beta.messages.stream
-    with _api_errors(cid):
-        try:
-            with stream(**kwargs) as s:
-                response = s.get_final_message()
-        except anthropic.APIStatusError as e:
-            if envato and "mcp_servers" in kwargs and e.status_code not in (401, 429) and _mcp_failure(e):
-                raise EnvatoUnavailable(f"Envato search is unavailable: {_api_message(e)}") from e
-            raise
-    usage = getattr(response, "usage", None)
-    if usage is not None:
-        spend.record(_answered(response, cid), _tokens(usage, "input_tokens"),
-                     _tokens(usage, "output_tokens"), cache_write=_tokens(usage, "cache_creation_input_tokens"),
-                     cache_read=_tokens(usage, "cache_read_input_tokens"), price_as=cid)
-    return response
+def _parse_json(text: str):
+    m = _FENCE.match(text)
+    return json.loads(m.group(1) if m else text)
 
 
-def ask_json(prompt: str, schema: dict, *, system: str | None = None, client=None,
-             effort: str = "high", max_tokens: int = 16000) -> dict:
-    text = _call(prompt, system=system, client=client, max_tokens=max_tokens,
-                 output_config={"format": {"type": "json_schema", "schema": schema}, "effort": effort})
+def ask_json(prompt: str, schema: dict, *, entry: catalog.Entry | None = None, system: str | None = None,
+             client=None, effort: str = "high", max_tokens: int = 16000) -> dict:
+    text = _call(prompt, entry=entry, system=system, client=client, effort=effort, max_tokens=max_tokens,
+                 schema=schema)
     try:
-        return json.loads(text)
+        return _parse_json(text)
     except json.JSONDecodeError as e:
         raise ClaudeError(f"Claude returned invalid JSON: {e}") from e
 
@@ -261,7 +257,7 @@ def check_key(source, *, run=subprocess.run, gcloud: str | None = None, make_cli
     return {"ok": False, "message": message.replace(key, "[redacted]")}
 
 
-def ask_text(prompt: str, *, system: str | None = None, client=None,
+def ask_text(prompt: str, *, entry: catalog.Entry | None = None, system: str | None = None, client=None,
              effort: str = "medium", max_tokens: int = 16000) -> str:
-    return _call(prompt, system=system, client=client, max_tokens=max_tokens,
-                 output_config={"effort": effort})
+    return _call(prompt, entry=entry, system=system, client=client, effort=effort, max_tokens=max_tokens,
+                 schema=None)

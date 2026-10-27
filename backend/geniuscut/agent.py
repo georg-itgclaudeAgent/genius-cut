@@ -1,4 +1,4 @@
-"""The Claude side of an instruction run: the panel drives the tools, the backend owns Claude.
+"""One instruction run on the selected AI model: the panel drives the tools, the backend owns the model.
 
 HTTP routes (all need `Authorization: Bearer <token>`; errors are `{"detail": "..."}`):
 - `POST /agent/runs` `{"instruction": str (not blank), "selection": object, "sequence": object,
@@ -41,18 +41,25 @@ Step reply (HTTP 200):
   backend. The panel runs today's Analyse with its `instructions` and opens the review; it posts no
   results.
 
-Rules (spec "Run rules → Agent loop"): the conversation is append-only (responses appended whole,
-thinking included; never edited); a refusal or a reply cut off at max_tokens ends the run and is not
-appended or executed; at most 25 Claude steps per run; every step goes through the spend gate,
-estimated from the previous step's actual usage plus the new content; the Anthropic client (and so
-the key read) is made once per run. Runs live in memory: a backend restart loses them.
+Rules (spec "Run rules → Agent loop" and "Runs"): a run resolves the selected model ONCE at its start (the
+picker's settings.model, or a dev env override, see llm.selected_id) and keeps its catalog id, adapter and
+client to the end: a switch in the picker applies to the next run only. The loop speaks the neutral step
+contract in adapters.py; the adapter owns the conversation (append-only, model turns appended whole,
+thinking included; never edited) and the id → tool name map. A refusal or a reply cut off at max_tokens
+ends the run and is not appended or executed; at most 25 model calls per run; every step goes through the
+spend gate, estimated from the previous step's actual usage plus the new content; the client (and so the
+key read) is made once per run. Texts name the model by its catalog label. A Gemini model stops an agent
+run at once until plan Task 3 (adapters.GEMINI_SOON); Analyse on Gemini works. Runs live in memory: a
+backend restart loses them.
 
-B-roll markers: Envato Elements search rides along on every step (claude.agent_step(envato=True)) unless
-GENIUSCUT_ENVATO=0 or the provider is Vertex. Anthropic runs those searches server-side; their mcp_tool_use /
+B-roll markers: Envato Elements search rides along on every step (ClaudeAdapter.step(envato=True)) unless
+GENIUSCUT_ENVATO=0 or the run's provider isn't the Anthropic API (until plan Task 4 replaces the connector).
+Anthropic runs those searches server-side; their mcp_tool_use /
 mcp_tool_result blocks are appended with the rest of the reply and never sent to the panel. A step that
 fails because of the Envato server is retried once without it, and Envato stays off for the rest of the run;
 Claude is told (ENVATO_DOWN / ENVATO_OFF in the system prompt) to give search terms only. A `pause_turn`
-reply (a long server-side tool loop) is appended unchanged and continued as the next step.
+reply (a long server-side tool loop) is appended unchanged and continued inside ClaudeAdapter; each
+continuation counts as a step.
 """
 
 import json
@@ -63,7 +70,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable
 
-from geniuscut import claude, graphics, llm, secrets, spend
+from geniuscut import adapters, catalog, claude, graphics, llm, secrets, spend
 from geniuscut.errors import LLMError
 
 MAX_STEPS = 25
@@ -651,7 +658,8 @@ class RunError(Exception):
 class Run:
     id: str
     client: object
-    messages: list = field(default_factory=list)
+    model_id: str = catalog.DEFAULT_MODEL  # the catalog id this run uses from start to end
+    adapter: object = None                 # adapters.for_entry(...): owns the conversation history
     approved: bool = False
     steps: int = 0
     waiting: list[str] = field(default_factory=list)  # tool_use ids the panel must answer
@@ -669,27 +677,34 @@ class Run:
     height: int | None = None
     graphics: dict = field(default_factory=dict)  # slug → {slug, version, preview, path, duration_s} (newest)
     failures: dict = field(default_factory=dict)  # slug → failed make_graphic calls
-    order: list[str] = field(default_factory=list)  # every tool_use id of the last reply, in order
-    pending: dict = field(default_factory=dict)  # tool_use id → backend tool_result block, until the panel posts
+    order: list[str] = field(default_factory=list)  # every tool call id of the last reply, in order
+    pending: dict = field(default_factory=dict)  # tool call id → backend ToolResult, until the panel posts
     cancelled: bool = False
     cancel_event: threading.Event = field(default_factory=threading.Event)
+
+    @property
+    def messages(self) -> list:
+        """The conversation as the adapter keeps it (provider-shaped; read-only here)."""
+        return self.adapter.history if self.adapter is not None else []
+
+    @property
+    def label(self) -> str:
+        return catalog.label(self.model_id) or self.model_id
 
 
 class GraphicsStop(Exception):
     """A graphic failed MAX_GRAPHIC_FAILURES times: the run ends with this message."""
 
 
-def _input_total(usage) -> int:
-    return sum(int(getattr(usage, n, 0) or 0)
-               for n in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
-
-
 class Runs:
-    """Agent runs in memory, keyed by id."""
+    """Agent runs in memory, keyed by id. Each run resolves the selected model once at its start
+    (`selected()`, default llm.selected_id: the picker or a dev override) and keeps it, its adapter and its
+    client to the end. `make_client` (tests) replaces the adapter's own client factory."""
 
-    def __init__(self, make_client: Callable = claude.default_client, step: Callable = claude.agent_step,
-                 engine: graphics.Engine | None = None):
-        self.make_client, self.step = make_client, step
+    def __init__(self, make_client: Callable | None = None, engine: graphics.Engine | None = None, *,
+                 selected: Callable[[], str] | None = None, adapter_for: Callable = adapters.for_entry):
+        self.make_client, self.adapter_for = make_client, adapter_for
+        self.selected = selected or llm.selected_id
         self.engine = engine or graphics.Engine()
         self._runs: dict[str, Run] = {}
         self._lock = threading.Lock()
@@ -701,14 +716,24 @@ class Runs:
         used only by make_graphic."""
         run_id = uuid.uuid4().hex
         try:
-            client = self.make_client()  # reads the key once for the whole run
-        except secrets.MissingKeyError as e:
-            return self._stopped(Run(id=run_id, client=None), "key", str(e))
+            entry = catalog.entry_for(self.selected())  # the run's model, kept to the end
+            adapter = self.adapter_for(entry)
         except LLMError as e:
             return self._stopped(Run(id=run_id, client=None), "error", str(e))
-        envato = claude.envato_enabled()
+        bare = Run(id=run_id, client=None, model_id=entry.id)
+        try:
+            client = (self.make_client or adapter.make_client)()  # reads the key once for the whole run
+        except NotImplementedError as e:  # GeminiAdapter until plan Task 3
+            return self._stopped(bare, "error", str(e) or adapters.GEMINI_SOON)
+        except secrets.MissingKeyError as e:
+            return self._stopped(bare, "key", str(e))
+        except LLMError as e:
+            return self._stopped(bare, "error", str(e))
+        # the Anthropic MCP connector only on the Anthropic API (plan Task 4 replaces it with a backend tool)
+        envato = claude.envato_enabled() and entry.provider == "anthropic"
         ctx = context or {}
-        run = Run(id=run_id, client=client, envato=envato, envato_note="" if envato else ENVATO_OFF,
+        run = Run(id=run_id, client=client, model_id=entry.id, adapter=adapter, envato=envato,
+                  envato_note="" if envato else ENVATO_OFF,
                   project_path=str(ctx.get("projectPath") or ""), fps=ctx.get("fps"),
                   timebase=str(ctx["timebase"]) if ctx.get("timebase") not in (None, "") else None,
                   width=ctx.get("width"), height=ctx.get("height"))
@@ -717,7 +742,10 @@ class Runs:
                  f"Sequence summary:\n{json.dumps(sequence)}")
         if any(ctx.get(k) not in (None, "") for k in ("projectPath", "fps", "timebase", "width", "height")):
             first += "\n\nFor graphics: " + _graphics_context(run)
-        run.messages.append({"role": "user", "content": first})
+        try:
+            adapter.add_user_text(first)
+        except NotImplementedError as e:
+            return self._stopped(run, "error", str(e) or adapters.GEMINI_SOON)
         with self._lock:
             self._runs[run_id] = run
         with run.lock:
@@ -738,14 +766,14 @@ class Runs:
                                                        f"unknown: {', '.join(extra)}" if extra else "",
                                                        f"repeated: {', '.join(dupes)}" if dupes else "") if p))
             by_id = {r["tool_use_id"]: r for r in results}
-            panel = {i: {"type": "tool_result", "tool_use_id": i, "content": by_id[i]["content"],
-                         "is_error": bool(by_id[i].get("is_error", False))} for i in run.waiting}
-            # one user message with every result, in the reply's tool_use order (backend ones ran already)
+            panel = {i: adapters.ToolResult(i, by_id[i]["content"], bool(by_id[i].get("is_error", False)))
+                     for i in run.waiting}
+            # one turn with every result, in the reply's tool call order (backend ones ran already)
             done = {**run.pending, **panel}
-            blocks = [done[i] for i in run.order if i in done]
-            run.messages.append({"role": "user", "content": blocks})
+            ordered = [done[i] for i in run.order if i in done]
+            run.adapter.add_tool_results(ordered)
             run.waiting, run.pending, run.order = [], {}, []
-            return self._step(run, sum(len(b["content"]) for b in blocks))
+            return self._step(run, sum(len(r.content) for r in ordered))
 
     def approve(self, run_id: str) -> dict:
         run = self._get(run_id)
@@ -753,7 +781,7 @@ class Runs:
             if not run.plan_ready or run.approved:
                 raise RunError(409, "There is no plan waiting for Go in this run.")
             run.approved, run.plan_ready = True, False
-            run.messages.append({"role": "user", "content": APPROVED})
+            run.adapter.add_user_text(APPROVED)
             return self._step(run, len(APPROVED))
 
     def cancel(self, run_id: str) -> None:
@@ -793,40 +821,38 @@ class Runs:
         if run.cancelled:
             return self._reply(run, "stopped", message="Cancelled.", reason="cancelled")
         if run.steps >= MAX_STEPS:
-            return self._stopped(run, "step_cap", f"Stopped after {MAX_STEPS} Claude steps without finishing. "
-                                                  "What ran so far can be undone; try a smaller instruction.")
+            return self._step_cap(run)
         try:
             try:
-                response = self._call(run, new_chars)
+                step = self._call(run, new_chars)
             except claude.EnvatoUnavailable:  # once per run: Envato stays off from here on
                 run.envato, run.envato_note = False, ENVATO_DOWN
-                response = self._call(run, new_chars)
+                step = self._call(run, new_chars)
+        except adapters.OutOfSteps:
+            run.steps = MAX_STEPS
+            return self._step_cap(run)
+        except NotImplementedError as e:  # GeminiAdapter until plan Task 3
+            return self._stopped(run, "error", str(e) or adapters.GEMINI_SOON)
         except spend.BudgetExceeded as e:
             return self._stopped(run, "limit", str(e))
         except (secrets.MissingKeyError, claude.KeyRejected) as e:
             return self._stopped(run, "key", str(e))
         except LLMError as e:
             return self._stopped(run, "error", str(e))
-        run.steps += 1
-        usage = getattr(response, "usage", None)
-        if usage is not None:
-            run.last_usage = (_input_total(usage), int(getattr(usage, "output_tokens", 0) or 0))
-        stop = getattr(response, "stop_reason", None)
-        if stop == "refusal":  # not appended: the run ends here
-            details = getattr(response, "stop_details", None)
-            category = getattr(details, "category", None)
-            return self._stopped(run, "refusal", "Claude declined this instruction"
-                                 + (f" ({category})." if category else "."))
-        if stop == "max_tokens":  # a cut-off tool call must never run
-            return self._stopped(run, "max_tokens", "Claude's reply was cut off, so nothing from it was run. "
+        run.steps += step.requests
+        if step.usage is not None:
+            run.last_usage = (step.usage.input, step.usage.output)
+        if step.stop == "refusal":  # not appended (the adapter keeps refused replies out): the run ends here
+            return self._stopped(run, "refusal", f"{run.label} declined this instruction"
+                                 + (f" ({step.detail})." if step.detail else "."))
+        if step.stop == "max_tokens":  # a cut-off tool call must never run
+            return self._stopped(run, "max_tokens", f"{run.label}'s reply was cut off, so nothing from it was run. "
                                                     "Try a smaller instruction.")
-        run.messages.append({"role": "assistant", "content": response.content})  # whole, never edited
-        if stop == "pause_turn":  # a server-side tool loop paused (Envato searches): let Claude go on
-            return self._step(run, 0)
-        text = "".join(getattr(b, "text", "") for b in response.content if getattr(b, "type", None) == "text")
-        calls = [{"id": b.id, "name": b.name, "input": b.input}
-                 for b in response.content if getattr(b, "type", None) == "tool_use"]
-        if stop == "tool_use" and calls:
+        if step.stop not in ("end", "tool_use"):
+            return self._stopped(run, "error", f"{run.label} returned no usable reply"
+                                 + (f": {step.detail}" if step.detail else "."))
+        text, calls = step.text, step.tool_calls
+        if step.stop == "tool_use" and calls:
             backend = [c for c in calls if TOOL_KINDS.get(c["name"]) == "backend"]
             panel = [c for c in calls if TOOL_KINDS.get(c["name"]) != "backend"]
             if backend:
@@ -839,8 +865,8 @@ class Runs:
                 if run.cancelled:
                     return self._reply(run, "stopped", message="Cancelled.", reason="cancelled")
                 if not panel:  # only backend tools: step again, no panel round trip
-                    run.messages.append({"role": "user", "content": [done[c["id"]] for c in backend]})
-                    return self._step(run, sum(len(b["content"]) for b in done.values()))
+                    run.adapter.add_tool_results([done[c["id"]] for c in backend])
+                    return self._step(run, sum(len(r.content) for r in done.values()))
                 run.pending = done
             run.order = [c["id"] for c in calls]
             run.waiting = [c["id"] for c in panel]
@@ -854,7 +880,7 @@ class Runs:
         return self._reply(run, "plan", text=text)
 
     def _run_backend(self, run: Run, calls: list[dict]) -> dict:
-        """Run make_graphic / read_graphic in order; {tool_use id: tool_result block}."""
+        """Run make_graphic / read_graphic in order; {tool call id: ToolResult}."""
         done, made = {}, False
         for c in calls:
             if run.cancelled:
@@ -867,7 +893,7 @@ class Runs:
                     content, err = self._make_graphic(run, c["input"] or {})
             else:
                 content, err = self._read_graphic(run, c["input"] or {})
-            done[c["id"]] = {"type": "tool_result", "tool_use_id": c["id"], "content": content, "is_error": err}
+            done[c["id"]] = adapters.ToolResult(c["id"], content, err)
         return done
 
     def _make_graphic(self, run: Run, inp: dict) -> tuple[str, bool]:
@@ -906,11 +932,15 @@ class Runs:
         except OSError as e:
             return f"The graphic couldn't be read: {e}", True
 
-    def _call(self, run: Run, new_chars: int):
+    def _call(self, run: Run, new_chars: int) -> adapters.Step:
         system = SYSTEM + ("\n\n" + run.envato_note if run.envato_note else "")
         with spend.meter(kind="agent", run=run.id, m=run.meter):
-            return self.step(run.messages, TOOLS, system, client=run.client,
-                             input_tokens=self._estimate(run, new_chars), envato=run.envato)
+            return run.adapter.step(system, TOOLS, client=run.client, input_tokens=self._estimate(run, new_chars),
+                                    max_requests=MAX_STEPS - run.steps, envato=run.envato)
+
+    def _step_cap(self, run: Run) -> dict:
+        return self._stopped(run, "step_cap", f"Stopped after {MAX_STEPS} {run.label} steps without finishing. "
+                                              "What ran so far can be undone; try a smaller instruction.")
 
     def _stopped(self, run: Run, reason: str, message: str) -> dict:
         self.cancel(run.id)
@@ -919,7 +949,7 @@ class Runs:
     def _reply(self, run: Run, state: str, *, text: str = "", tool_calls: list | None = None,
                message: str | None = None, reason: str | None = None) -> dict:
         return {"run_id": run.id, "state": state, "tool_calls": tool_calls or [], "text": text,
-                "message": message, "reason": reason, "cost": llm.run_cost(run.meter).model_dump(),
+                "message": message, "reason": reason, "cost": llm.run_cost(run.meter, default=run.model_id).model_dump(),
                 "graphics": list(run.graphics.values())}
 
 

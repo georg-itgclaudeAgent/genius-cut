@@ -1,4 +1,4 @@
-"""The AI (Claude Opus 5.5 by default, see `llm.py`) proposes which words to cut, in the editor's style.
+"""The AI (the model picked in the panel, see `llm.py`) proposes which words to cut, in the editor's style.
 
 The model returns inclusive *word index* ranges, never timecodes. It's reliable at indices
 and unreliable at arithmetic on times, so indices are resolved to times here, and any
@@ -112,15 +112,17 @@ def chunk_bounds(words: list[Word], size: int = CHUNK_WORDS, slack: int | None =
     return bounds
 
 
-def propose_cuts(words: list[Word], fewshot: FewShot, instruction: str = "", client=None,
+def propose_cuts(words: list[Word], fewshot: FewShot, instruction: str = "", client=None, entry=None,
                  chunk_words: int = CHUNK_WORDS) -> list[CutSpan]:
     if not words:
         return []
+    entry = entry or llm.current_entry()  # one model for every chunk (run_trim resolved it once)
     ranges = []
     for a, b in chunk_bounds(words, chunk_words):
         part = words[a:b]
         with spend.tagged("trim"):  # also when called outside run_trim, and when the call raises
-            reply = llm.ask_json(build_prompt(part, fewshot, instruction), SCHEMA, system=SYSTEM, client=client)
+            reply = llm.ask_json(build_prompt(part, fewshot, instruction), SCHEMA, entry=entry, system=SYSTEM,
+                                 client=client)
         ranges += [(s + a, e + a, reason) for s, e, reason in validate_ranges(reply.get("cuts", []), len(part))]
     return [
         CutSpan(start=words[s].start, end=words[e].end,

@@ -1,34 +1,41 @@
-"""The provider switch: every AI call in Genius Cut goes through here.
+"""The model switch: every Analyse call in Genius Cut goes through here.
 
-GENIUSCUT_LLM_PROVIDER (falling back to the older GENIUSCUT_CLAUDE_PROVIDER) picks:
-- `anthropic` (default): Claude Opus 5.5 on the Anthropic API, see `claude.py`;
-- `gemini`: the Gemini API, see `gemini.py`;
-- `vertex`: Claude on Google Cloud Vertex AI.
-`LLMError` is the one error type callers catch; `claude.ClaudeError` and
-`spend.BudgetExceeded` are both subclasses.
+The panel's model picker (`settings.model`, a catalog id) decides: `selected_id()` / `selected_entry()`.
+`ask_json` / `ask_text` take the catalog entry to use (`entry=`) and route by its provider:
+- `anthropic`: Claude on the Anthropic API, see `claude.py`;
+- `vertex`: Claude on Google Cloud Vertex AI, also `claude.py`;
+- `gemini`: the Gemini API, see `gemini.py` (the model is passed per call).
+Without `entry`, the entry of the enclosing `using(entry)` block is used (trim.run_trim resolves the selection
+once per Analyse and wraps its whole proposal in it), else the selection read now.
 
-The panel's model picker (`settings.model`, a catalog id) is `selected_id()`; /health and the cost estimate
-read it. The env vars above, GENIUSCUT_CLAUDE_MODEL and GENIUSCUT_GEMINI_MODEL are dev-only overrides: when
-any is set, `selected_id()` is the model they name. (Until plan Task 2, Analyse and agent runs still route
-by `model_id()`, the env switch, whose default is the picker's default.)
+GENIUSCUT_LLM_PROVIDER (falling back to the older GENIUSCUT_CLAUDE_PROVIDER), GENIUSCUT_CLAUDE_MODEL and
+GENIUSCUT_GEMINI_MODEL are dev-only overrides, read per call: when any is set, `selected_id()` is the model
+they name (`model_id()`) instead of the picker's.
+`LLMError` is the one error type callers catch; `claude.ClaudeError` and `spend.BudgetExceeded` are both
+subclasses.
 """
 
 import os
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 from geniuscut import catalog, claude, gemini, settings, spend
 from geniuscut.errors import LLMError
 from geniuscut.models import RunCost
 
-__all__ = ["LLMError", "PROVIDERS", "provider", "model", "model_id", "selected_id", "ask_json", "ask_text",
-           "run_cost"]
+__all__ = ["LLMError", "PROVIDERS", "provider", "model", "model_id", "selected_id", "selected_entry", "using",
+           "current_entry", "ask_json", "ask_text", "run_cost"]
 
 DEV_OVERRIDES = ("GENIUSCUT_LLM_PROVIDER", "GENIUSCUT_CLAUDE_PROVIDER", "GENIUSCUT_CLAUDE_MODEL",
                  "GENIUSCUT_GEMINI_MODEL")
 
 PROVIDERS = ("gemini", "anthropic", "vertex")
 
+_using: ContextVar[catalog.Entry | None] = ContextVar("geniuscut_llm_entry", default=None)
+
 
 def provider() -> str:
+    """The dev override's provider (GENIUSCUT_LLM_PROVIDER / GENIUSCUT_CLAUDE_PROVIDER), default anthropic."""
     for var in ("GENIUSCUT_LLM_PROVIDER", "GENIUSCUT_CLAUDE_PROVIDER"):
         raw = (os.environ.get(var) or "").strip().lower()
         if raw:
@@ -38,16 +45,12 @@ def provider() -> str:
     return "anthropic"
 
 
-def _backend():
-    return gemini if provider() == "gemini" else claude
-
-
 def model() -> str:
-    return gemini.model() if provider() == "gemini" else claude.MODEL
+    return gemini.model() if provider() == "gemini" else claude.model()
 
 
 def model_id() -> str:
-    """The catalog id the env switch routes to (`anthropic:claude-opus-5-5` by default)."""
+    """The catalog id the dev env override names (`anthropic:claude-opus-5-5` when none is set)."""
     return gemini.model_id() if provider() == "gemini" else claude.model_id()
 
 
@@ -58,22 +61,55 @@ def selected_id() -> str:
     return settings.load().model
 
 
-def ask_json(prompt: str, schema: dict, *, system: str | None = None, client=None,
-             effort: str = "high", max_tokens: int = 16000) -> dict:
-    return _backend().ask_json(prompt, schema, system=system, client=client, effort=effort, max_tokens=max_tokens)
+def selected_entry() -> catalog.Entry:
+    """The selected model's catalog entry (an id outside the catalog gets an unpriced stand-in, refused
+    at the price check)."""
+    return catalog.entry_for(selected_id())
 
 
-def ask_text(prompt: str, *, system: str | None = None, client=None,
+@contextmanager
+def using(entry: catalog.Entry):
+    """Calls inside without an explicit `entry` use this one (one Analyse = one model)."""
+    token = _using.set(entry)
+    try:
+        yield entry
+    finally:
+        _using.reset(token)
+
+
+def current_entry() -> catalog.Entry:
+    return _using.get() or selected_entry()
+
+
+def _route(entry: catalog.Entry | None):
+    e = entry or current_entry()
+    if e.provider == "gemini":
+        return e, gemini, {"model": e.model}
+    if e.provider in ("anthropic", "vertex"):
+        return e, claude, {"entry": e}
+    raise LLMError(f"Unknown AI model {e.id!r}: pick one from the list.")
+
+
+def ask_json(prompt: str, schema: dict, *, entry: catalog.Entry | None = None, system: str | None = None,
+             client=None, effort: str = "high", max_tokens: int = 16000) -> dict:
+    _, backend, which = _route(entry)
+    return backend.ask_json(prompt, schema, system=system, client=client, effort=effort, max_tokens=max_tokens,
+                            **which)
+
+
+def ask_text(prompt: str, *, entry: catalog.Entry | None = None, system: str | None = None, client=None,
              effort: str = "medium", max_tokens: int = 16000) -> str:
-    return _backend().ask_text(prompt, system=system, client=client, effort=effort, max_tokens=max_tokens)
+    _, backend, which = _route(entry)
+    return backend.ask_text(prompt, system=system, client=client, effort=effort, max_tokens=max_tokens, **which)
 
 
-def run_cost(m: spend.Meter) -> RunCost:
-    """What one metered run cost, plus the month so far (read after the run's own calls)."""
-    name = m.model
-    if name is None:  # no AI call ran (e.g. a pause-only run): name the configured model
+def run_cost(m: spend.Meter, default: str | None = None) -> RunCost:
+    """What one metered run cost, plus the month so far (read after the run's own calls). `default` names the
+    run's model when no AI call ran (e.g. a pause-only Analyse, an agent run stopped before its first call)."""
+    name = m.model or default
+    if name is None:
         try:
-            name = model_id()
+            name = selected_id()
         except LLMError:
             name = "unknown"
     return RunCost(model=name, label=catalog.label(name) or name, provider=catalog.provider_of(name),

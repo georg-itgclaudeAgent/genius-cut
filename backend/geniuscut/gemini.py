@@ -1,6 +1,7 @@
 """One place that talks to Gemini, over the REST API with the standard library.
 
-- Model `gemini-3.7-flash` (override with GENIUSCUT_GEMINI_MODEL, read on every call).
+- The model is passed per call (`model=`, from the picker via `llm.py`); without one, the dev default
+  `gemini-3.7-flash` (GENIUSCUT_GEMINI_MODEL overrides it, read on every call).
 - Key from `secrets.gemini_api_key()`, sent as the `x-goog-api-key` header, never in the
   URL, a log line or an error message.
 - JSON comes back through `responseMimeType` + `responseJsonSchema`.
@@ -32,6 +33,11 @@ DEFAULT_THINKING = "low"
 
 
 def model() -> str:
+    """The dev default model name (GENIUSCUT_GEMINI_MODEL, else DEFAULT_MODEL), read per call."""
+    return _default_model()
+
+
+def _default_model() -> str:
     return (os.environ.get("GENIUSCUT_GEMINI_MODEL") or DEFAULT_MODEL).strip()
 
 
@@ -80,10 +86,10 @@ def _usage(response: dict) -> tuple[int, int]:
             int(u.get("candidatesTokenCount") or 0) + int(u.get("thoughtsTokenCount") or 0))
 
 
-def _call(prompt: str, *, system: str | None, client, effort: str, max_tokens: int,
+def _call(prompt: str, *, system: str | None, client, effort: str, max_tokens: int, model: str | None = None,
           schema: dict | None) -> str:
-    name = model()
-    cid = model_id()
+    name = model or _default_model()
+    cid = f"gemini:{name}"
     if spend.price(cid) is None:  # an unpriced model would skip the gate: unlimited spend
         raise LLMError(f"No price is known for Gemini model '{cid}', so the monthly limit can't be "
                        f"enforced. Use one of: {', '.join(sorted(spend.PRICES))}.")
@@ -127,15 +133,17 @@ def _call(prompt: str, *, system: str | None, client, effort: str, max_tokens: i
     return text
 
 
-def ask_json(prompt: str, schema: dict, *, system: str | None = None, client=None,
+def ask_json(prompt: str, schema: dict, *, model: str | None = None, system: str | None = None, client=None,
              effort: str = "high", max_tokens: int = 16000) -> dict:
-    text = _call(prompt, system=system, client=client, effort=effort, max_tokens=max_tokens, schema=schema)
+    text = _call(prompt, system=system, client=client, effort=effort, max_tokens=max_tokens, schema=schema,
+                 model=model)
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
         raise LLMError(f"Gemini returned invalid JSON: {e}") from e
 
 
-def ask_text(prompt: str, *, system: str | None = None, client=None,
+def ask_text(prompt: str, *, model: str | None = None, system: str | None = None, client=None,
              effort: str = "medium", max_tokens: int = 16000) -> str:
-    return _call(prompt, system=system, client=client, effort=effort, max_tokens=max_tokens, schema=None)
+    return _call(prompt, system=system, client=client, effort=effort, max_tokens=max_tokens, schema=None,
+                 model=model)

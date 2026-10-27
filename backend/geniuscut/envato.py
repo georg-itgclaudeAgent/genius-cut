@@ -24,12 +24,14 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 
 URL = "https://mcp.envato.com/mcp"
 PROTOCOL = "2025-06-18"
 TIMEOUT_S = 15
+RETRY_PAUSE_S = 1  # before the one retry of a dropped connection or timeout (never an HTTP error)
 PER_PAGE = 6
 KINDS = {"stock-video": "search_stock_video", "photos": "search_photos"}
 ORIENTATIONS = ("horizontal", "vertical")
@@ -66,6 +68,15 @@ class Client:
             headers["Mcp-Session-Id"] = self.session
         request = urllib.request.Request(self.url, data=json.dumps(payload).encode("utf-8"), headers=headers,
                                          method="POST")
+        try:
+            return self._send(request, payload)
+        except EnvatoError as e:
+            if not isinstance(e.__cause__, (TimeoutError, OSError)) or isinstance(e.__cause__, urllib.error.HTTPError):
+                raise
+        time.sleep(RETRY_PAUSE_S)  # one retry: a wobbly connection drops a request now and then (live 2026-10-27)
+        return self._send(request, payload)
+
+    def _send(self, request, payload: dict) -> dict | None:
         try:
             with self.opener(request, timeout=self.timeout) as response:
                 sid = response.headers.get("Mcp-Session-Id")

@@ -183,6 +183,43 @@ def test_an_unreachable_server_raises_envato_error_after_the_timeout():
         envato.Client("http://127.0.0.1:9/mcp", opener=real_opener, timeout=2).search("stock-video", "x")
 
 
+def test_one_dropped_connection_is_retried_once(mcp, monkeypatch):
+    """Live 2026-10-27 on a wobbly connection: a reset (WinError 10054) or read timeout, then fine."""
+    monkeypatch.setattr(envato, "RETRY_PAUSE_S", 0)
+    server = mcp()
+    drops = []
+
+    def flaky(request, timeout):
+        if len(drops) < 1:
+            drops.append(1)
+            raise ConnectionResetError(10054, "An existing connection was forcibly closed by the remote host")
+        return real_opener(request, timeout)
+
+    client = envato.Client(server.url, opener=flaky)
+    assert len(client.search("stock-video", "city at night")) == 2
+    assert drops == [1]
+
+
+def test_a_connection_that_keeps_dropping_still_fails(mcp, monkeypatch):
+    monkeypatch.setattr(envato, "RETRY_PAUSE_S", 0)
+    calls = []
+
+    def dead(request, timeout):
+        calls.append(1)
+        raise TimeoutError("The read operation timed out")
+
+    with pytest.raises(envato.EnvatoError, match="couldn't reach"):
+        envato.Client(mcp().url, opener=dead).search("stock-video", "x")
+    assert len(calls) == 2  # the first try and one retry, no more
+
+
+def test_an_http_error_is_not_retried(mcp):
+    server = mcp(fail="http")
+    with pytest.raises(envato.EnvatoError, match="HTTP"):
+        server.search("stock-video", "city at night")
+    assert [r["method"] for r in server.requests].count("tools/call") == 1  # the 500 came once, no retry
+
+
 def test_bad_items_are_dropped_and_at_most_six_kept(mcp):
     junk = [{"title": "", "item_url": "https://elements.envato.com/a"}, {"title": "No url"},
             {"title": "Http", "item_url": "http://elements.envato.com/b"}, "nope"]

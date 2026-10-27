@@ -130,12 +130,6 @@ export function App() {
       {/* Hidden, not unmounted, while Settings is open: a review in progress stays as it was. */}
       {gate === "open" && (
         <div className="main" hidden={settingsOpen}>
-          <div className="tabs" role="tablist">
-            <button className="tab" role="tab" aria-selected="true">Cut</button>
-            <button className="tab" role="tab" aria-selected="false" disabled>Generate</button>
-            <button className="tab" role="tab" aria-selected="false" disabled>Sound</button>
-          </div>
-
           <BackendStatus state={state} onRetry={retry} />
 
           <CutTab health={health} ready={ready} agent={kit.agent}

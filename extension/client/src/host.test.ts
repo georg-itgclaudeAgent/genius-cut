@@ -318,6 +318,9 @@ class FakeQE {
   razorNoop = false;
   /** Every razor call, as [track label, timecode]. */
   razors: [string, string][] = [];
+  /** Every slip call, as [track label, timecode]; `slipNoop` models Premiere taking one and doing nothing. */
+  slips: [string, string][] = [];
+  slipNoop = false;
   constructor(public seq: Seq) {}
   project: any = {
     getActiveSequence: () => ({
@@ -364,6 +367,18 @@ class FakeQE {
         // its linked partner is unchanged.
         setSpeed: (speed: number) => { if (!this.speedNoop) c.speed = speed; return true; },
         getSpeed: () => c.speed,
+        // Measured 2026-10-28: slip("HH:MM:SS:FF", false) keeps the clip's place and length and moves its in point that many
+        // sequence frames earlier; "-HH:MM:SS:FF" later.
+        slip: (tc: string) => {
+          this.slips.push([(t.kind === "video" ? "V" : "A") + (t.index + 1), tc]);
+          if (this.slipNoop) return true;
+          const m = /^(-?)(\d\d):(\d\d):(\d\d):(\d\d)$/.exec(tc);
+          if (!m) throw new Error("bad timecode");
+          const tpf = Number(this.seq.timebase), nominal = Math.round(TICKS / tpf);
+          const frames = (((+m[2] * 60 + +m[3]) * 60 + +m[4]) * nominal + +m[5]) * (m[1] ? -1 : 1);
+          c.trueIn = Time.s(c.trueIn.seconds - (frames * tpf) / TICKS);
+          return true;
+        },
       });
       cursor = c.end.t;
     }
@@ -2194,15 +2209,47 @@ describe("measured in Premiere 26.5.2: a file's picture and sound land together,
     expect(everything(s.seq)).toEqual(before);
   });
 
-  it.each([["starts before it (a J cut)", 99, 9], ["has slipped out of sync", 100, 10.5]])(
-    "refuses a camera's own sound that %s, changing nothing", (_, startS, inS) => {
+  it.each([["starts before it (a J cut)", 99, 9, "doesn't start with it"], ["is slipped by part of a frame", 100, 10.5, "is slipped against it by part of a frame"]])(
+    "refuses a camera's own sound that %s, changing nothing", (_, startS, inS, why) => {
       const s = scene();
       s.a.start = Time.s(startS); s.a.inPoint = Time.s(inS);
       const before = everything(s.seq);
-      expect(() => applyCuts(s)).toThrow("A1's audio comes from the same file as V1's video but doesn't start with it in sync, so Genius Cut " +
-        "can't place both on these tracks. Line them up, or put the audio on a track number with no selected video.");
+      expect(() => applyCuts(s)).toThrow(`A1's audio comes from the same file as V1's video but ${why}, so Genius Cut ` +
+        "can't place both on these tracks without changing your sync. Put the audio on a track number with no selected video.");
       expect(everything(s.seq)).toEqual(before);
     });
+
+  // Georg 2026-10-28: he syncs a file's picture and its own sound by hand (Restream's picture 3 frames after its sound,
+  // unlinked). Each video piece drops its sound in sync; QE's slip puts each sound piece back on his offset.
+  it.each([["3 frames earlier", -3, "00:00:00:03"], ["2 frames later", 2, "-00:00:00:02"]])(
+    "keeps a camera's own sound hand-slipped %s than its picture: each sound piece is slipped back; Restore is exact", (_, frames, tc) => {
+      const s = scene(), off = frames / 25;
+      s.v.linked = []; s.a.linked = [];
+      s.a.inPoint = Time.s(10 + off);
+      expect(applyCuts(s)).toMatchObject({ ok: true });
+      expect(span(s.seq.videoTracks[0]).map((x: number[]) => x[2])).toEqual([10, 13, 18]);
+      expect(span(s.seq.audioTracks[0]).map((x: number[]) => +(x[2] - off).toFixed(6))).toEqual([10, 13, 18]);
+      expect(s.host.qe.slips).toEqual([["A1", tc], ["A1", tc], ["A1", tc]]);
+      expect(restore(s)).toEqual({ ok: true });
+      expect(everything(s.seq)).toEqual([[[100, 110]], [], [[100, 110]], [], []]);
+      expect(+s.seq.audioTracks[0].clips[0].inPoint.seconds.toFixed(6)).toBe(+(10 + off).toFixed(6));
+      expect(s.seq.videoTracks[0].clips[0].inPoint.seconds).toBe(10);
+    });
+
+  it("an in-sync camera sound is never slipped", () => {
+    const s = scene();
+    expect(applyCuts(s)).toMatchObject({ ok: true });
+    expect(s.host.qe.slips).toEqual([]);
+  });
+
+  it("refuses a hand-slipped camera sound without QE, changing nothing", () => {
+    const s = scene();
+    s.a.inPoint = Time.s(10 - 3 / 25);
+    s.host = load(s.seq, { qe: false });
+    const before = everything(s.seq);
+    expect(() => applyCuts(s)).toThrow("Premiere's QE interface isn't available here. Nothing was changed; do it by hand.");
+    expect(everything(s.seq)).toEqual(before);
+  });
 
   it.each([["fitting", 25], ["loose (24 fps in 25)", 24]])("%s: a camera's own sound running past its picture (an L cut) keeps its tail; Restore is exact", (_, fps) => {
     const s = scene();

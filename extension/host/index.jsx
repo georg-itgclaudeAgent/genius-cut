@@ -575,10 +575,28 @@ function gcutCovers(seq, found, cutsT, clock) {
     }
 }
 
-/** True if `a` (audio from a video file) is video item `v`'s own sound: the same file, starting with it, in sync. */
+/** How far `a`'s source runs ahead of `v`'s at the same timeline moment, in seconds (0 when in sync). */
+function gcutSyncOffsetS(a, v) { return (a.inS - a.startT / GCUT_TICKS) - (v.inS - v.startT / GCUT_TICKS); }
+
+/** True if `a` (audio from a video file) is in sync with video item `v`: the same source time at every moment. */
+function gcutInSync(a, v, clock) { return Math.abs(gcutSyncOffsetS(a, v)) <= clock.frameS / 2 + gcutSlackS(a); }
+
+/**
+ * True if `a` (audio from a video file) is video item `v`'s own sound: the same file, starting with it, either
+ * in sync or slipped against it by whole sequence frames. The editor syncs picture and sound by hand (Georg,
+ * 2026-10-28: Restream's picture 3 frames after its own sound, unlinked); that offset is kept exactly
+ * (gcutSlipTo puts each sound piece back on it after its video drops it in sync).
+ */
 function gcutOwnSound(a, v, clock) {
-    return a.node === v.node && gcutNear(a.startT, v.startT, clock.half) &&
-        gcutNear(a.inS - a.startT / GCUT_TICKS, v.inS - v.startT / GCUT_TICKS, clock.frameS / 2 + gcutSlackS(a));
+    if (a.node !== v.node || !gcutNear(a.startT, v.startT, clock.half)) return false;
+    if (gcutInSync(a, v, clock)) return true;
+    var off = gcutSyncOffsetS(a, v);
+    return Math.abs(off - Math.round(off / clock.frameS) * clock.frameS) <= clock.frameS / 20 + gcutSlackS(a) + gcutSlackS(v);
+}
+
+/** Why same-file audio `a` isn't gcutOwnSound of video `v`, for a refusal. */
+function gcutOffsetWhy(a, v, clock) {
+    return gcutNear(a.startT, v.startT, clock.half) ? "is slipped against it by part of a frame" : "doesn't start with it";
 }
 
 /**
@@ -622,9 +640,10 @@ function gcutDropsCheck(seq, found, cutsT, clock) {
                     "Put the audio on a track number with no selected video.");
             }
             if (!gcutOwnSound(x, rec, clock)) {
-                throw new Error(x.label + "'s audio comes from the same file as " + there + "'s video but doesn't start with it in sync, so Genius Cut " +
-                    "can't place both on these tracks. Line them up, or put the audio on a track number with no selected video.");
+                throw new Error(x.label + "'s audio comes from the same file as " + there + "'s video but " + gcutOffsetWhy(x, rec, clock) +
+                    ", so Genius Cut can't place both on these tracks without changing your sync. Put the audio on a track number with no selected video.");
             }
+            if (!gcutInSync(x, rec, clock)) gcutQeTrack("audio", x.trackIndex); // slipping it back needs QE: refuse here, before anything changes
         }
     }
 }
@@ -728,7 +747,24 @@ function gcutLayItem(seq, f, pieces, clock, sound) {
             gcutLayPiece(track, f, pieces[p], below, 0, tolS, clock);
         }
         if (sound && sound.ends[p] !== null) gcutTrimTo(soundTrack, sound.f, pieces[p].atT, sound.ends[p], clock);
+        if (sound && sound.slip && sound.ins[p] !== null) gcutSlipTo(soundTrack, sound.f, pieces[p].atT, sound.ins[p], clock);
     }
+}
+
+/**
+ * Put the sound piece just dropped at atT (in sync with its video) back on the editor's own sync: slip it, with
+ * QE, by the whole sequence frames between its in point and inS. Measured 2026-10-28 (Premiere 26.5.2):
+ * qeItem.slip("HH:MM:SS:FF", false) keeps the clip's place and length and moves its in point that much
+ * EARLIER; "-HH:MM:SS:FF" moves it later. A piece that isn't there is left to gcutVerifyItems.
+ */
+function gcutSlipTo(track, f, atT, inS, clock) {
+    var it = gcutLaidAt(track, f, atT, clock);
+    if (!it) return;
+    var frames = Math.round((it.inPoint.seconds - inS) / clock.frameS);
+    if (!frames) return;
+    var qi = gcutQeClipAt(gcutQeTrack(f.kind, f.trackIndex), atT, clock), done = false;
+    try { done = !!qi && qi.slip((frames < 0 ? "-" : "") + gcutTimecode(Math.abs(frames) * clock.tpf, clock), false); } catch (e) { done = false; }
+    if (!done) throw new Error("Premiere wouldn't slip " + f.label + "'s piece back onto your sync with " + gcutLabel("video", f.trackIndex) + ".");
 }
 
 /**
@@ -858,7 +894,8 @@ function gcutHome(found, n, track) {
  * under it). A piece of that audio starting with a video piece is made by that piece's dropped sound;
  * the rest (past the video's end) are laid on their own. Returns, per item i:
  *   sound[i]: for a video item with its own sound recorded, { f: that audio item, ends: each video
- *             piece's sound end (the audio piece starting with it), or null where none does }; else null;
+ *             piece's sound end (the audio piece starting with it), or null where none does, ins: that audio
+ *             piece's in point, slip: true when the sound is hand-slipped against the video (gcutSlipTo) }; else null;
  *   own[i]:   the pieces of found[i] to lay with overwriteClip (all of them, except for such audio).
  */
 function gcutSounds(found, plan, clock) {
@@ -869,16 +906,16 @@ function gcutSounds(found, plan, clock) {
         for (j = 0; j < found.length; j++) {
             var a = found[j];
             if (a.kind !== "audio" || !a.av || a.trackIndex !== found[i].trackIndex || !gcutOwnSound(a, found[i], clock)) continue;
-            var ends = [], rest = [];
-            for (q = 0; q < plan[i].length; q++) ends.push(null);
+            var ends = [], ins = [], rest = [];
+            for (q = 0; q < plan[i].length; q++) { ends.push(null); ins.push(null); }
             for (p = 0; p < plan[j].length; p++) {
                 var made = false;
                 for (q = 0; q < plan[i].length; q++) {
-                    if (gcutNear(plan[i][q].atT, plan[j][p].atT, clock.half)) { ends[q] = plan[j][p].atT + plan[j][p].durT; made = true; }
+                    if (gcutNear(plan[i][q].atT, plan[j][p].atT, clock.half)) { ends[q] = plan[j][p].atT + plan[j][p].durT; ins[q] = plan[j][p].srcIn; made = true; }
                 }
                 if (!made) rest.push(plan[j][p]);
             }
-            sound[i] = { f: a, ends: ends };
+            sound[i] = { f: a, ends: ends, ins: ins, slip: !gcutInSync(a, found[i], clock) };
             own[j] = rest;
             break;
         }
@@ -2061,9 +2098,10 @@ function gcutMoveDropsCheck(seq, found, clock, advice, tail) {
                     there + " there. " + tail);
             }
             if (!gcutOwnSound(x, rec, clock)) {
-                throw new Error(x.label + "'s audio comes from the same file as " + there + "'s video but doesn't start with it in sync, so Genius Cut " +
-                    "can't lay both again on these tracks. " + tail);
+                throw new Error(x.label + "'s audio comes from the same file as " + there + "'s video but " + gcutOffsetWhy(x, rec, clock) +
+                    ", so Genius Cut can't lay both again on these tracks without changing your sync. " + tail);
             }
+            if (!gcutInSync(x, rec, clock)) gcutQeTrack("audio", x.trackIndex);
         }
     }
 }

@@ -124,7 +124,7 @@ export function App() {
         <SetupPage api={runtime.backend} openUrl={openExternal} onDone={() => setSetupComplete(true)} />
       )}
       {gate === "open" && settingsOpen && (
-        <SettingsPage api={runtime.backend} keyFromCache={!!health?.ai?.key_from_cache} onClose={() => setSettingsOpen(false)} />
+        <SettingsPage api={runtime.backend} keyFromCache={!!health?.ai?.key_from_cache} openUrl={openExternal} onClose={() => setSettingsOpen(false)} />
       )}
 
       {/* Hidden, not unmounted, while Settings is open: a review in progress stays as it was. */}

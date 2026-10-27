@@ -1,19 +1,19 @@
 import { describe, it, expect } from "vitest";
 import { createSetup, filterProjects, setupGate, steps, tested, type SetupApi } from "./setup";
 import { BackendError } from "../api/backend";
-import type { GcloudStatus, KeySource, LoginStatus, Settings } from "../api/types";
+import type { GcloudStatus, KeySource, LoginStatus, Settings, SettingsPatch } from "../api/types";
 
 const SIGNED_IN: GcloudStatus = { installed: true, path: "C:/gcloud.cmd", version: "520.0.0", account: "ed@itgenius.com" };
 const DEFAULTS: Settings = { anthropic_key: { project: "", secret: "ANTHROPIC_API_KEY", version: "latest" }, monthly_limit_usd: 20,
-  setup_complete: false };
+  setup_complete: false, model: "anthropic:claude-opus-5-5", vertex: { project: "agent-georg", region: "global" } };
 
 function fakeApi(o: { gcloud?: GcloudStatus[]; logins?: LoginStatus[]; settings?: Settings; startLogin?: () => Promise<LoginStatus>;
   test?: (s: KeySource) => { ok: boolean; message: string }; secretsFail?: string } = {}) {
-  const calls: string[] = [], saved: Settings[] = [], tests: KeySource[] = [];
+  const calls: string[] = [], saved: SettingsPatch[] = [], tests: KeySource[] = [];
   const gcloud = [...(o.gcloud ?? [SIGNED_IN])], logins = [...(o.logins ?? [{ state: "done", message: "Signed in." }])];
   const api: SetupApi = {
     settings: async () => { calls.push("settings"); return o.settings ?? DEFAULTS; },
-    saveSettings: async (s) => { calls.push("save"); saved.push(s); return s; },
+    saveSettings: async (s) => { calls.push("save"); saved.push(s); return { ...(o.settings ?? DEFAULTS), ...s } as Settings; },
     testKey: async (s) => { calls.push("test"); tests.push(s); return (o.test ?? (() => ({ ok: true, message: "Connected." })))(s); },
     gcloud: async () => { calls.push("gcloud"); return gcloud.length > 1 ? gcloud.shift()! : gcloud[0]; },
     startLogin: o.startLogin ?? (async () => { calls.push("login"); return { state: "running", message: "Opening the browser." }; }),

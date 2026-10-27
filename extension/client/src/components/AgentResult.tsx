@@ -1,4 +1,4 @@
-/** The instruction run's screens in the Result area: Claude's plan (Go / Cancel) and the result (Undo). */
+/** The instruction run's screens in the Result area: the model's plan (Go / Cancel) and the result (Undo). */
 import type { Outcome } from "../agent/run";
 import type { AgentGraphic, RunCost } from "../api/types";
 import { RunCostLine } from "./Cost";
@@ -30,7 +30,8 @@ export function PlanView({ text, cost, graphics = [], onGo, onCancel }: {
   return (
     <>
       <div className="sec">
-        <div className="sec-hd"><span className="lbl">Claude's plan</span></div>
+        <div className="sec-hd"><span className="lbl">Plan</span>
+          {cost?.label && <><span className="spacer" /><span className="muted">{cost.label}</span></>}</div>
         <GraphicPreviews graphics={graphics} />
         <pre className="plan-text">{text}</pre>
         <div className="actions-row">

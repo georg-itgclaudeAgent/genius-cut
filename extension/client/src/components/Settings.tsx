@@ -1,12 +1,13 @@
 /**
  * Settings (the gear): "AI key" (the same fields as Setup, re-test, a notice when the cached key
- * is in use, and Graphics: what a render needs and the one-time "Set up graphics") and "Usage & limit" (this month against the limit, the runs, the $20 / $100 choice and
+ * is in use, Claude via Google Cloud (Vertex): sign-in, project, region and each model's state, and Graphics: what a
+ * render needs and the one-time "Set up graphics") and "Usage & limit" (this month against the limit, the runs, the $20 / $100 choice and
  * the reset date). Costs are estimates from token usage at list prices.
  */
 import { useCallback, useEffect, useState } from "react";
 import { BackendError, type Backend } from "../api/backend";
-import type { GraphicsStatus, Settings as SettingsData, Usage, UsageRun } from "../api/types";
-import { formatUsd, METER_HOT, meterFraction, modelLabel } from "../lib/cost";
+import type { GraphicsStatus, LoginStatus, ModelListing, Settings as SettingsData, Usage, UsageRun } from "../api/types";
+import { formatUsd, METER_HOT, meterFraction } from "../lib/cost";
 import type { Setup, SetupState } from "../lib/setup";
 import { KeyFields, LimitChoice, SignIn, TestRow, useSetup } from "./Setup";
 
@@ -20,13 +21,16 @@ export function resetLine(resetsOn: string): string {
 
 const KINDS: Record<string, string> = { agent: "Instruction", trim: "Trim", summarize: "Style summary" };
 
-/** One run in the list: local day and time, what it was, its cost. */
-export function runLine(r: UsageRun): { when: string; what: string; usd: string } {
+const PROVIDERS: Record<string, string> = { anthropic: "Anthropic", vertex: "Google Cloud", gemini: "Gemini API" };
+
+/** One run in the list: local day and time, what it was (with the model's label), who bills it, its cost. */
+export function runLine(r: UsageRun): { when: string; what: string; provider: string; usd: string } {
   const d = new Date(r.at);
   const when = Number.isNaN(d.getTime()) ? r.at
     : `${d.getDate()} ${MONTHS[d.getMonth()].slice(0, 3)} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
   const kind = KINDS[r.kind] ?? "Other";
-  return { when, what: r.model ? `${kind} · ${modelLabel(r.model)}` : kind, usd: formatUsd(r.usd) };
+  const label = r.label || r.model;
+  return { when, what: label ? `${kind} · ${label}` : kind, provider: PROVIDERS[r.provider] ?? "", usd: formatUsd(r.usd) };
 }
 
 export function KeyTab({ s, setup, keyFromCache }: { s: SetupState; setup: Setup; keyFromCache: boolean }) {
@@ -60,7 +64,7 @@ export function UsageView({ usage, tier, saving, error, onTier }: {
           <span style={{ width: `${+(f * 100).toFixed(1)}%` }} />
         </div>
         <div className="step-line" style={{ marginTop: 6 }}>{resetLine(usage.resets_on)} · estimates from token use at list prices;
-          Anthropic's console is the bill of record.</div>
+          Anthropic's console and Google Cloud billing are the bills of record.</div>
       </div>
       <div className="sec">
         <div className="sec-hd"><span className="lbl">Monthly limit</span></div>
@@ -77,7 +81,7 @@ export function UsageView({ usage, tier, saving, error, onTier }: {
           {usage.runs.map((r, i) => {
             const l = runLine(r);
             return <div className="lib-item" key={`${r.at}-${i}`}><span className="tc muted">{l.when}</span><span className="nm">{l.what}</span>
-              <span className="ct">{l.usd}</span></div>;
+              {l.provider && <span className="pv">{l.provider}</span>}<span className="ct">{l.usd}</span></div>;
           })}
         </div>
       )}
@@ -199,13 +203,127 @@ function GraphicsSection({ api }: { api: Backend }) {
   return <GraphicsView status={status} busy={busy} error={error} onSetup={() => void onSetup()} />;
 }
 
-function AiKeyTab({ api, keyFromCache }: { api: Backend; keyFromCache: boolean }) {
-  const [s, setup] = useSetup(api);
-  if (!setup) return <div className="sec"><div className="muted">Loading…</div></div>;
-  return <><KeyTab s={s} setup={setup} keyFromCache={keyFromCache} /><GraphicsSection api={api} /></>;
+export const modelGardenUrl = (project: string) =>
+  `https://console.cloud.google.com/vertex-ai/model-garden?project=${encodeURIComponent(project)}`;
+
+/**
+ * "Sign in" for Vertex: start the gcloud Application Default Credentials sign-in for `project` (one already running,
+ * 409, is just watched), then read its status every 2 s, showing each, until it's no longer running.
+ */
+export async function runVertexLogin(api: Pick<Backend, "vertexLogin" | "vertexLoginStatus">, project: string,
+  onStatus: (s: LoginStatus) => void, sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms))): Promise<LoginStatus> {
+  try {
+    await api.vertexLogin(project);
+  } catch (e) {
+    if (!(e instanceof BackendError && e.status === 409)) throw e;
+  }
+  for (;;) {
+    await sleep(POLL_MS);
+    const st = await api.vertexLoginStatus();
+    onStatus(st);
+    if (st.state !== "running") return st;
+  }
 }
 
-export function SettingsPage({ api, keyFromCache, onClose }: { api: Backend; keyFromCache: boolean; onClose: () => void }) {
+export function VertexView({ listing, project, region, login, busy, error, saved, onProject, onRegion, onSave, onSignIn, openUrl }: {
+  listing: ModelListing | null; project: string; region: string; login: LoginStatus | null; busy: boolean; error: string | null;
+  saved: boolean; onProject: (v: string) => void; onRegion: (v: string) => void; onSave: () => void; onSignIn: () => void;
+  openUrl: (url: string) => void;
+}) {
+  const v = listing?.vertex;
+  const signingIn = login?.state === "running";
+  const signedIn = !!v?.adc && !!v.quota_project;
+  return (
+    <div className="sec">
+      <div className="sec-hd"><span className="lbl">Claude via Google Cloud (Vertex)</span></div>
+      <div className="muted">Claude billed to your Google Cloud project instead of the Anthropic key. You sign in in your browser.</div>
+      {v && (
+        <div className="gfx-status" aria-label="Vertex sign-in">
+          <Part ok={v.adc} name="Google sign-in" det={v.adc ? "Signed in (Application Default Credentials)" : "Not signed in"} />
+          <Part ok={!!v.quota_project} name="Quota project" det={v.quota_project ?? "not set"} />
+        </div>
+      )}
+      {!listing && !error && <div className="muted">Loading…</div>}
+      <div className="actions-row">
+        <button className={`btn ${signedIn ? "btn-g" : "btn-p"}`} onClick={onSignIn} disabled={signingIn || busy || !project.trim()}>
+          {signingIn ? "Signing in…" : signedIn ? "Sign in again" : "Sign in"}</button>
+      </div>
+      {signingIn && login.message && <div className="step-line">{login.message}</div>}
+      {login?.state === "failed" && <div className="note bad">{login.message}</div>}
+      <div className="key-row" style={{ marginTop: 8 }}>
+        <label style={{ flex: 2, minWidth: 0 }}>
+          <div className="lbl">Project</div>
+          <input className="field wide" value={project} aria-label="Vertex project" onChange={(e) => onProject(e.target.value)} />
+        </label>
+        <label style={{ flex: 1, minWidth: 0 }}>
+          <div className="lbl">Region</div>
+          <input className="field wide" value={region} aria-label="Vertex region" onChange={(e) => onRegion(e.target.value)} />
+        </label>
+      </div>
+      <div className="actions-row">
+        <button className="btn btn-g" onClick={onSave} disabled={busy || !project.trim() || !region.trim()}>Save</button>
+        {saved && <span className="muted">Saved.</span>}
+      </div>
+      {error && <div className="note bad">{error}</div>}
+      {listing && (
+        <div className="gfx-status" aria-label="Claude models on Vertex">
+          {listing.models.filter((m) => m.provider === "vertex").map((m) => (
+            <div className="row" key={m.id}>
+              <span className={`pip ${m.state === "ok" ? "ok" : "bad"}`} /><span>{m.label.replace(/ \(Google Cloud\)$/, "")}</span>
+              {m.state !== "ok" && /model garden/i.test(m.message)
+                ? <button className="btn-link det-link" onClick={() => openUrl(modelGardenUrl(project.trim() || v!.project))}>Enable in Model Garden</button>
+                : <span className="det">{m.state === "ok" ? "Enabled" : m.message}</span>}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function VertexSection({ api, openUrl }: { api: Backend; openUrl: (url: string) => void }) {
+  const [listing, setListing] = useState<ModelListing | null>(null);
+  const [project, setProject] = useState("");
+  const [region, setRegion] = useState("");
+  const [login, setLogin] = useState<LoginStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const show = (l: ModelListing) => { setListing(l); setProject(l.vertex.project); setRegion(l.vertex.region); };
+  useEffect(() => {
+    let live = true;
+    api.models().then((l) => { if (live) show(l); }, (e) => { if (live) setError(e instanceof Error ? e.message : String(e)); });
+    return () => { live = false; };
+  }, [api]);
+
+  async function work(job: () => Promise<void>) {
+    setBusy(true); setError(null); setSaved(false);
+    try { await job(); } catch (e) { setError(e instanceof Error ? e.message : String(e)); } finally { setBusy(false); }
+  }
+  const onSave = () => work(async () => {
+    await api.saveSettings({ vertex: { project: project.trim(), region: region.trim() } });
+    show(await api.models());
+    setSaved(true);
+  });
+  // A finished sign-in drops the backend's cached Vertex states, so the list re-checks them.
+  const onSignIn = () => work(async () => {
+    await runVertexLogin(api, project.trim(), setLogin);
+    show(await api.models());
+  });
+  return <VertexView listing={listing} project={project} region={region} login={login} busy={busy} error={error} saved={saved}
+    onProject={(x) => { setProject(x); setSaved(false); }} onRegion={(x) => { setRegion(x); setSaved(false); }}
+    onSave={() => void onSave()} onSignIn={() => void onSignIn()} openUrl={openUrl} />;
+}
+
+function AiKeyTab({ api, keyFromCache, openUrl }: { api: Backend; keyFromCache: boolean; openUrl: (url: string) => void }) {
+  const [s, setup] = useSetup(api);
+  if (!setup) return <div className="sec"><div className="muted">Loading…</div></div>;
+  return <><KeyTab s={s} setup={setup} keyFromCache={keyFromCache} /><VertexSection api={api} openUrl={openUrl} /><GraphicsSection api={api} /></>;
+}
+
+export function SettingsPage({ api, keyFromCache, openUrl, onClose }: {
+  api: Backend; keyFromCache: boolean; openUrl: (url: string) => void; onClose: () => void;
+}) {
   const [tab, setTab] = useState<"key" | "usage">("key");
   return (
     <>
@@ -217,7 +335,7 @@ export function SettingsPage({ api, keyFromCache, onClose }: { api: Backend; key
         <button className="tab" role="tab" aria-selected={tab === "key"} onClick={() => setTab("key")}>AI key</button>
         <button className="tab" role="tab" aria-selected={tab === "usage"} onClick={() => setTab("usage")}>Usage &amp; limit</button>
       </div>
-      {tab === "key" ? <AiKeyTab api={api} keyFromCache={keyFromCache} /> : <UsageTab api={api} />}
+      {tab === "key" ? <AiKeyTab api={api} keyFromCache={keyFromCache} openUrl={openUrl} /> : <UsageTab api={api} />}
     </>
   );
 }

@@ -15,17 +15,6 @@ export function formatTokens(n: number): string {
   return String(n);
 }
 
-/** `gemini-3.7-flash` → "Gemini 3.7 Flash"; `claude-opus-5-5` → "Claude Opus 5.5". */
-export function modelLabel(id: string): string {
-  const out: string[] = [];
-  for (const part of id.split("-")) {
-    const prev = out[out.length - 1];
-    if (/^\d+$/.test(part) && prev !== undefined && /^\d+$/.test(prev)) out[out.length - 1] = `${prev}.${part}`;
-    else out.push(/^\d/.test(part) ? part : part.charAt(0).toUpperCase() + part.slice(1));
-  }
-  return out.join(" ");
-}
-
 /** m:ss, whole seconds: how the estimate names a clip's length. */
 function clipLength(seconds: number): string {
   const t = Math.round(Math.max(0, seconds));
@@ -60,7 +49,7 @@ export function budgetEstimate(ai: AiStatus, clipS: number | null, monthUsd: num
 
 /** "This run: $0.03 (Gemini 3.7 Flash · 7.1k in / 4.2k out) · Month: $0.11 of $2.00" */
 export function runCostLine(c: RunCost): string {
-  return `This run: ${formatUsd(c.usd)} (${modelLabel(c.model)} · ${formatTokens(c.input_tokens)} in / ` +
+  return `This run: ${formatUsd(c.usd)} (${c.label || c.model} · ${formatTokens(c.input_tokens)} in / ` +
     `${formatTokens(c.output_tokens)} out) · Month: ${formatUsd(c.month_usd)} of ${formatUsd(c.limit_usd)}`;
 }
 
@@ -78,6 +67,8 @@ export function addCosts(run: RunCost, trim: RunCost | null | undefined): RunCos
   if (!trim) return run;
   return {
     model: trim.model,
+    label: trim.label,
+    provider: trim.provider,
     input_tokens: run.input_tokens + trim.input_tokens,
     output_tokens: run.output_tokens + trim.output_tokens,
     usd: run.usd === null || trim.usd === null ? null : run.usd + trim.usd,

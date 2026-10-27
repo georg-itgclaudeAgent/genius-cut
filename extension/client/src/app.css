@@ -183,6 +183,22 @@ textarea.field { width: 100%; min-height: 64px; resize: vertical; }
 /* AI spend: the estimate under Analyse, and the run's cost with a month meter */
 .cost-est { margin-top: 6px; font-size: 10.5px; color: var(--text-faint); font-variant-numeric: tabular-nums; }
 .cost-est.warn { color: var(--coral); font-weight: 500; }
+
+/* Under the instruction box: the cost line on the left, the AI model picker on the right */
+.cost-row { display: flex; align-items: flex-start; gap: 8px; margin-top: 6px; }
+.cost-row .cost-est { margin-top: 4px; flex: 1; min-width: 0; }
+.model-pick { flex: 0 1 auto; min-width: 0; max-width: 58%; margin-left: auto; display: flex; flex-direction: column; align-items: flex-end; }
+.model-row { display: flex; gap: 4px; width: 100%; }
+.model-sel { font-size: 11px; padding: 3px 6px; text-overflow: ellipsis; }
+select.field optgroup, select.field option { background: var(--navy-2); color: var(--text); }
+select.field optgroup { color: var(--text-faint); font-weight: 600; }
+select.field option:disabled { color: var(--text-faint); }
+.model-ref { padding: 2px 7px; font-size: 12px; letter-spacing: 0; color: var(--blue); }
+.model-why { margin-top: 3px; font-size: 10.5px; color: var(--coral); text-align: right; overflow-wrap: anywhere; }
+.model-why.bad { color: var(--rose-text); }
+.lib-item .pv { margin-left: auto; font-size: 10px; color: var(--text-faint); white-space: nowrap; }
+.lib-item .pv + .ct { margin-left: 0; }
+.gfx-status .row .det-link { margin-left: auto; font-size: 10.5px; }
 .cost-run { padding-top: 0; }
 .cost-line { font-size: 10.5px; color: var(--text-dim); font-variant-numeric: tabular-nums; }
 .meter { height: 3px; margin-top: 5px; background: var(--raise); border-radius: 2px; overflow: hidden; }

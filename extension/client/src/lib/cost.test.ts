@@ -1,8 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { addCosts, budgetEstimate, formatTokens, formatUsd, meterFraction, modelLabel, runCostLine } from "./cost";
+import { addCosts, budgetEstimate, formatTokens, formatUsd, meterFraction, runCostLine } from "./cost";
 import type { AiStatus, RunCost } from "../api/types";
 
-const AI: AiStatus = { provider: "gemini", model: "gemini-3.7-flash", month_usd: 0.08, limit_usd: 2, usd_per_minute: 0.003 };
+const AI: AiStatus = { provider: "gemini", model_id: "gemini:gemini-3.7-flash", label: "Gemini 3.7 Flash", month_usd: 0.08, limit_usd: 2, usd_per_minute: 0.003 };
 
 describe("formatUsd", () => {
   it("shows two decimals from one cent up", () => {
@@ -25,11 +25,6 @@ describe("formatUsd", () => {
 });
 
 describe("labels", () => {
-  it("names models the way people say them", () => {
-    expect(modelLabel("gemini-3.7-flash")).toBe("Gemini 3.7 Flash");
-    expect(modelLabel("gemini-2.5-flash-lite")).toBe("Gemini 2.5 Flash Lite");
-    expect(modelLabel("claude-opus-5-5")).toBe("Claude Opus 5.5");
-  });
   it("shortens token counts", () => {
     expect(formatTokens(850)).toBe("850");
     expect(formatTokens(7100)).toBe("7.1k");
@@ -59,7 +54,7 @@ describe("budgetEstimate", () => {
     expect(budgetEstimate(AI, null, 1.5).over).toBe(false);
   });
   it("can't price an unpriced model, and never blocks on one", () => {
-    const b = budgetEstimate({ ...AI, provider: "anthropic", model: "claude-opus-5-5", usd_per_minute: null }, 600, 0);
+    const b = budgetEstimate({ ...AI, provider: "anthropic", model_id: "anthropic:claude-opus-5-5", label: "Claude Opus 5.5 (Anthropic)", usd_per_minute: null }, 600, 0);
     expect(b.text).toBe("Est. cost unknown · This month $0.00 of $2.00");
     expect(b.over).toBe(false);
   });
@@ -71,13 +66,13 @@ describe("budgetEstimate", () => {
 });
 
 describe("run cost", () => {
-  const cost: RunCost = { model: "gemini-3.7-flash", input_tokens: 7100, output_tokens: 4200, usd: 0.03, month_usd: 0.11, limit_usd: 2 };
+  const cost: RunCost = { model: "gemini:gemini-3.7-flash", label: "Gemini 3.7 Flash", provider: "gemini", input_tokens: 7100, output_tokens: 4200, usd: 0.03, month_usd: 0.11, limit_usd: 2 };
   it("reads like a receipt", () => {
     expect(runCostLine(cost)).toBe("This run: $0.03 (Gemini 3.7 Flash · 7.1k in / 4.2k out) · Month: $0.11 of $2.00");
   });
-  it("says cost unknown for an unpriced model", () => {
-    expect(runCostLine({ ...cost, model: "claude-opus-5-5", usd: null }))
-      .toBe("This run: cost unknown (Claude Opus 5.5 · 7.1k in / 4.2k out) · Month: $0.11 of $2.00");
+  it("says cost unknown for an unpriced model, and names the model by the backend's label", () => {
+    expect(runCostLine({ ...cost, model: "vertex:claude-opus-5-5", label: "Claude Opus 5.5 (Google Cloud)", provider: "vertex", usd: null }))
+      .toBe("This run: cost unknown (Claude Opus 5.5 (Google Cloud) · 7.1k in / 4.2k out) · Month: $0.11 of $2.00");
   });
   it("meters the month against the limit, clamped", () => {
     expect(meterFraction(0.5, 2)).toBe(0.25);
@@ -88,10 +83,10 @@ describe("run cost", () => {
 });
 
 describe("addCosts (an instruction run that handed over to a trim)", () => {
-  const RUN: RunCost = { model: "claude-opus-5-5", input_tokens: 3000, output_tokens: 400, usd: 0.02, month_usd: 1.0, limit_usd: 20 };
-  const TRIM: RunCost = { model: "claude-opus-5-5", input_tokens: 7000, output_tokens: 1600, usd: 0.06, month_usd: 1.06, limit_usd: 20 };
+  const RUN: RunCost = { model: "anthropic:claude-opus-5-5", label: "Claude Opus 5.5 (Anthropic)", provider: "anthropic", input_tokens: 3000, output_tokens: 400, usd: 0.02, month_usd: 1.0, limit_usd: 20 };
+  const TRIM: RunCost = { model: "anthropic:claude-opus-5-5", label: "Claude Opus 5.5 (Anthropic)", provider: "anthropic", input_tokens: 7000, output_tokens: 1600, usd: 0.06, month_usd: 1.06, limit_usd: 20 };
   it("adds the trim's tokens and dollars to the run's; the month is the trim's (it came after)", () => {
-    expect(addCosts(RUN, TRIM)).toEqual({ model: "claude-opus-5-5", input_tokens: 10000, output_tokens: 2000, usd: 0.08, month_usd: 1.06, limit_usd: 20 });
+    expect(addCosts(RUN, TRIM)).toEqual({ model: "anthropic:claude-opus-5-5", label: "Claude Opus 5.5 (Anthropic)", provider: "anthropic", input_tokens: 10000, output_tokens: 2000, usd: 0.08, month_usd: 1.06, limit_usd: 20 });
   });
   it("is unknown if either cost is; the run's alone when the trim reports none", () => {
     expect(addCosts(RUN, { ...TRIM, usd: null }).usd).toBeNull();

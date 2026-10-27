@@ -72,10 +72,13 @@ export interface TranscriptJob {
 
 /** What one run's AI calls cost, and where the month stands afterwards. USD throughout. */
 export interface RunCost {
+  /** The catalog id of the model that answered last (`gemini:gemini-3.8-flash`), its picker label and provider. */
   model: string;
+  label: string;
+  provider: string;
   input_tokens: number;
   output_tokens: number;
-  usd: number | null;     // null: the model has no price (Claude)
+  usd: number | null;     // null: the model has no price
   month_usd: number;
   limit_usd: number;
 }
@@ -91,10 +94,12 @@ export interface TrimResponse {
   cost?: RunCost | null;  // absent from backends older than the spend limit
 }
 
-/** The AI provider and the month's spend, from /health. Never carries a key. */
+/** The selected model and the month's spend, from /health. Never carries a key. */
 export interface AiStatus {
   provider: string;       // "gemini" | "anthropic" | "vertex" | "unknown"
-  model: string | null;
+  /** The selected model's catalog id and its picker label ("Claude Opus 5.5 (Anthropic)"). */
+  model_id: string | null;
+  label: string | null;
   month_usd: number | null;       // null: the spend ledger couldn't be read
   limit_usd: number;
   usd_per_minute: number | null;  // null: the model has no price
@@ -140,6 +145,36 @@ export interface Settings {
   monthly_limit_usd: 20 | 100;
   /** Set only by a passing key test. */
   setup_complete: boolean;
+  /** The picker's model (catalog id) and where Claude on Vertex runs. */
+  model: string;
+  vertex: VertexSettings;
+}
+
+/** `PUT /settings` merges: only the fields sent change. */
+export type SettingsPatch = Partial<Omit<Settings, "vertex">> & { vertex?: Partial<VertexSettings> };
+
+export interface VertexSettings { project: string; region: string }
+
+// ── The AI model picker (backend/geniuscut/catalog.py, GET /models) ──
+
+export interface ModelEntry {
+  id: string;             // catalog id, "<provider>:<model>"
+  label: string;
+  provider: "anthropic" | "vertex" | "gemini";
+  group: string;          // "Claude (Anthropic key)" | "Claude (Google Cloud)" | "Gemini"
+  /** USD per 1M tokens today; null: no known price. */
+  price: { input: number; output: number } | null;
+  usd_per_minute: number | null;
+  /** ok: usable; blocked / setup: listed but not selectable, `message` says why. */
+  state: "ok" | "blocked" | "setup";
+  message: string;
+}
+
+export interface ModelListing {
+  selected: string;
+  models: ModelEntry[];
+  /** adc: Application Default Credentials found on this PC. */
+  vertex: VertexSettings & { adc: boolean; quota_project: string | null };
 }
 
 export interface KeyTest { ok: boolean; message: string }
@@ -153,7 +188,7 @@ export interface GcpProject { id: string; name: string }
 
 export interface SecretVersion { version: string; state: string }
 
-export interface UsageRun { at: string; kind: string; model: string; usd: number | null }
+export interface UsageRun { at: string; kind: string; model: string; label: string; provider: string; usd: number | null }
 
 export interface Usage {
   month_usd: number;
@@ -175,7 +210,7 @@ export interface AgentToolResult { tool_use_id: string; content: string; is_erro
 /** A graphic made in the run, its newest version: the preview PNG and the MOV are absolute paths (spaces and all). */
 export interface AgentGraphic { slug: string; version: number; preview: string; path: string; duration_s: number }
 
-/** One Claude step. tool_calls: run them and post the results; plan: show Go / Cancel; done / stopped: the run is closed. */
+/** One model step. tool_calls: run them and post the results; plan: show Go / Cancel; done / stopped: the run is closed. */
 export interface AgentStep {
   run_id: string;
   state: "tool_calls" | "plan" | "done" | "stopped";

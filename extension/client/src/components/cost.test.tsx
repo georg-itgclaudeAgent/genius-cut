@@ -9,7 +9,7 @@ import type { Health, Snapshot, TrimResponse } from "../api/types";
 
 const HEALTH: Health = {
   status: "ok", version: "0.1.0", stt_device: "cuda",
-  ai: { provider: "gemini", model: "gemini-3.7-flash", month_usd: 0.08, limit_usd: 2, usd_per_minute: 0.003 },
+  ai: { provider: "gemini", model_id: "gemini:gemini-3.7-flash", label: "Gemini 3.7 Flash", month_usd: 0.08, limit_usd: 2, usd_per_minute: 0.003 },
 };
 
 const agent = createAgent({ api: {} as any, tools: {}, turns: createTurns({ read: () => null, write: () => {} }), callHost: async () => ({}),
@@ -49,7 +49,7 @@ const SNAP: Snapshot = {
 const RES: TrimResponse = {
   words: [], kept_spans_source: [], kept_spans: [], stt_device: "cuda", cut_fraction: 0.1, warning: null,
   cuts: [{ start: 1, end: 2, text: "um", reason: "filler", start_seq_s: 1, end_seq_s: 2 }],
-  cost: { model: "gemini-3.7-flash", input_tokens: 7100, output_tokens: 4200, usd: 0.03, month_usd: 0.11, limit_usd: 2 },
+  cost: { model: "gemini:gemini-3.7-flash", label: "Gemini 3.7 Flash", provider: "gemini", input_tokens: 7100, output_tokens: 4200, usd: 0.03, month_usd: 0.11, limit_usd: 2 },
 };
 const review = (res: TrimResponse) => renderToStaticMarkup(
   <CutReview snap={SNAP} res={res} checked={res.cuts.map(() => true)} busy={false}
@@ -78,11 +78,11 @@ describe("CutReview cost line", () => {
 describe("sample data", () => {
   it("reports AI spend in /health and a cost on /trim, so the preview shows the UI", async () => {
     const health = JSON.parse((await mockTransport({ method: "GET", path: "/health", headers: {} })).body) as Health;
-    expect(health.ai).toMatchObject({ provider: "gemini", model: "gemini-3.7-flash", limit_usd: 2 });
+    expect(health.ai).toMatchObject({ provider: "gemini", model_id: "gemini:gemini-3.7-flash", label: "Gemini 3.7 Flash", limit_usd: 2 });
     expect(health.ai!.usd_per_minute).toBeGreaterThan(0);
     expect(health.ai!.month_usd).toBeGreaterThan(0);
     const trim = JSON.parse((await mockTransport({ method: "POST", path: "/trim", headers: {}, body: "{}" })).body) as TrimResponse;
-    expect(trim.cost).toMatchObject({ model: "gemini-3.7-flash", limit_usd: 2 });
+    expect(trim.cost).toMatchObject({ model: "gemini:gemini-3.7-flash", label: "Gemini 3.7 Flash", provider: "gemini", limit_usd: 2 });
     expect(trim.cost!.usd).toBeGreaterThan(0);
     expect(trim.cost!.input_tokens).toBeGreaterThan(0);
     expect(trim.cost!.month_usd).toBeGreaterThan(health.ai!.month_usd!);

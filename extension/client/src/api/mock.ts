@@ -7,7 +7,7 @@ import { API_VERSION } from "../lib/lifecycle";
 import type { Transport } from "./backend";
 import type { Host } from "./host";
 import type {
-  AiStatus, GraphicsStatus, Health, Library, RunCost, SequenceCut, Settings, Snapshot, SnapshotItem, Span, StyleExample, TrimResponse, Usage, Word,
+  AiStatus, GraphicsStatus, Health, Library, ModelEntry, ModelListing, RunCost, SequenceCut, Settings, Snapshot, SnapshotItem, Span, StyleExample, TrimResponse, Usage, Word,
 } from "./types";
 
 const W = (w: string, start: number, end: number): Word => ({ w, start, end });
@@ -49,15 +49,41 @@ let library: StyleExample[] = [{
 }];
 let summary: string | null = null;
 
-// Gemini 3.7 Flash rates (0.75 / 3.75 USD per 1M tokens); the month grows with each sample run.
-const MODEL = "gemini-3.7-flash";
+// The picker's 12 models with sample states (catalog.py's list and prices): the Anthropic key is capped, Vertex isn't
+// signed in until "Sign in" (then only Haiku is enabled), Gemini works. Gemini 3.7 Flash is selected at first.
+const GROUP = { anthropic: "Claude (Anthropic key)", vertex: "Claude (Google Cloud)", gemini: "Gemini" } as const;
+const CLAUDE: [string, string, number, number][] = [["claude-opus-5-5", "Claude Opus 5.5", 4, 20], ["claude-sonnet-5-5", "Claude Sonnet 5.5", 2, 10],
+  ["claude-haiku-5-5", "Claude Haiku 5.5", 0.1, 0.5], ["claude-fable-5-1", "Claude Fable 5.1", 10, 50]];
+const GEMINI: [string, string, number, number][] = [["gemini-3.8-flash", "Gemini 3.8 Flash", 0.75, 3.75], ["gemini-3.7-flash", "Gemini 3.7 Flash", 0.75, 3.75],
+  ["gemini-3.5-flash", "Gemini 3.5 Flash", 1.5, 9], ["gemini-3.1-pro-preview", "Gemini 3.1 Pro", 2, 12]];
+let vertexSignedIn = false;
+function sampleModels(): ModelEntry[] {
+  const entry = (provider: ModelEntry["provider"], [model, name, input, output]: [string, string, number, number]): ModelEntry => {
+    const [state, message]: [ModelEntry["state"], string] = provider === "anthropic" ? ["blocked", "Workspace limit reached until 1 Nov"]
+      : provider === "gemini" ? ["ok", "Ready"]
+      : !vertexSignedIn ? ["setup", "Sign in to Google Cloud for Vertex in Settings."]
+      : model === "claude-haiku-5-5" ? ["ok", "Enabled"] : ["setup", "Enable in Model Garden"];
+    return { id: `${provider}:${model}`, provider, group: GROUP[provider], price: { input, output }, state, message,
+      label: provider === "gemini" ? name : `${name} (${provider === "anthropic" ? "Anthropic" : "Google Cloud"})`,
+      usd_per_minute: (input * 1500 + output * 230) / 1e6 };
+  };
+  return [...CLAUDE.map((c) => entry("anthropic", c)), ...CLAUDE.map((c) => entry("vertex", c)), ...GEMINI.map((g) => entry("gemini", g))];
+}
+const selectedModel = () => { const all = sampleModels(); return all.find((x) => x.id === settings.model) ?? all.find((x) => x.id === "gemini:gemini-3.7-flash")!; };
+const listing = (): ModelListing => ({ selected: settings.model, models: sampleModels(),
+  vertex: { ...settings.vertex, adc: vertexSignedIn, quota_project: vertexSignedIn ? settings.vertex.project : null } });
+
+// The month grows with each sample run, at the selected model's rates.
 let monthUsd = 0.08;
-const aiStatus = (): AiStatus =>
-  ({ provider: "gemini", model: MODEL, month_usd: monthUsd, limit_usd: 2, usd_per_minute: 0.002 });
+const aiStatus = (): AiStatus => {
+  const m = selectedModel();
+  return { provider: m.provider, model_id: m.id, label: m.label, month_usd: monthUsd, limit_usd: 2, usd_per_minute: m.usd_per_minute };
+};
 function sampleCost(input_tokens: number, output_tokens: number): RunCost {
-  const usd = (input_tokens * 0.75 + output_tokens * 3.75) / 1e6;
+  const m = selectedModel();
+  const usd = (input_tokens * m.price!.input + output_tokens * m.price!.output) / 1e6;
   monthUsd += usd;
-  return { model: MODEL, input_tokens, output_tokens, usd, month_usd: monthUsd, limit_usd: 2 };
+  return { model: m.id, label: m.label, provider: m.provider, input_tokens, output_tokens, usd, month_usd: monthUsd, limit_usd: 2 };
 }
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -101,7 +127,7 @@ export const mockTransport: Transport = async (req) => {
   }
   // Settings and the Setup page's listings (the sample panel never gates on Setup).
   const path = req.path.split("?")[0];
-  // An instruction run: the sample Claude hands every instruction to the trim review.
+  // An instruction run: the sample model hands every instruction to the trim review.
   if (path === "/agent/runs" && req.method === "POST") {
     await delay(700);
     const b = JSON.parse(req.body || "{}");
@@ -118,7 +144,23 @@ export const mockTransport: Transport = async (req) => {
       ffmpeg: { ok: false, path: null }, setup: graphicsSetupRan ? { state: "done", message: "Sample data: nothing was installed." } : { state: "idle", message: "" } };
     return ok(status);
   }
-  if (path === "/settings" && req.method === "PUT") { settings = JSON.parse(req.body || "{}"); return ok(settings); }
+  if (path === "/settings" && req.method === "PUT") {
+    const b = JSON.parse(req.body || "{}");
+    settings = { ...settings, ...b, setup_complete: settings.setup_complete, vertex: { ...settings.vertex, ...(b.vertex ?? {}) } };
+    return ok(settings);
+  }
+  if (path === "/settings/model") {
+    const id = JSON.parse(req.body || "{}").model;
+    if (!sampleModels().some((x) => x.id === id)) return { status: 422, body: JSON.stringify({ detail: `Unknown model: ${id}` }) };
+    settings = { ...settings, model: id };
+    return ok(settings);
+  }
+  if (path === "/models") { if (req.path.includes("refresh=1")) await delay(400); return ok(listing()); }
+  if (path === "/setup/vertex-login" && req.method === "POST") {
+    vertexSignedIn = true;
+    return { status: 202, body: JSON.stringify({ state: "running", message: "Sample data: nothing is signed in." }) };
+  }
+  if (path === "/setup/vertex-login") return ok({ state: vertexSignedIn ? "done" : "idle", message: vertexSignedIn ? "Sample data: nothing was signed in." : "" });
   if (path === "/settings") return ok(settings);
   if (path === "/settings/test-key") { await delay(600); return ok({ ok: true, message: "Sample data: no key was read." }); }
   if (path === "/setup/gcloud") return ok({ installed: true, path: null, version: "520.0.0", account: "editor@example.com" });
@@ -129,7 +171,7 @@ export const mockTransport: Transport = async (req) => {
   if (path === "/usage") {
     const now = new Date(), next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
     const usage: Usage = { month_usd: monthUsd, limit_usd: settings.monthly_limit_usd, limit_tier: settings.monthly_limit_usd,
-      resets_on: next.toISOString().slice(0, 10), run_count: 1, runs: [{ at: now.toISOString(), kind: "trim", model: MODEL, usd: 0.02 }] };
+      resets_on: next.toISOString().slice(0, 10), run_count: 1, runs: [{ at: now.toISOString(), kind: "trim", model: "gemini:gemini-3.7-flash", label: "Gemini 3.7 Flash", provider: "gemini", usd: 0.02 }] };
     return ok(usage);
   }
   return { status: 404, body: JSON.stringify({ detail: `No mock for ${req.path}` }) };
@@ -138,7 +180,7 @@ export const mockTransport: Transport = async (req) => {
 let graphicsSetupRan = false;
 
 let settings: Settings = { anthropic_key: { project: "sample-project", secret: "ANTHROPIC_API_KEY", version: "latest" },
-  monthly_limit_usd: 20, setup_complete: true };
+  monthly_limit_usd: 20, setup_complete: true, model: "gemini:gemini-3.7-flash", vertex: { project: "sample-project", region: "global" } };
 
 export const mockHost: Host = {
   async snapshotSelection() { await delay(300); return SNAPSHOT; },

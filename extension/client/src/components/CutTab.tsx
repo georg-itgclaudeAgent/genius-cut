@@ -14,6 +14,7 @@ import { CostEstimate } from "./Cost";
 import { AudioPicker } from "./AudioPicker";
 import { CutReview } from "./CutReview";
 import { PlanView, RunResult } from "./AgentResult";
+import { ModelPicker } from "./ModelPicker";
 
 type Phase =
   | { k: "idle" }
@@ -24,7 +25,7 @@ type Phase =
   | { k: "applying"; snap: Snapshot; res: TrimResponse; checked: boolean[] }
   | { k: "applied"; snap: Snapshot; res: TrimResponse; result: ApplyResult; gapClosed: boolean; busy: boolean }
   | { k: "error"; message: string; snap?: Snapshot; notYet?: boolean; restorable?: boolean }
-  // An instruction run (agent/run.ts): Claude reads and plans, Go, the result with Undo.
+  // An instruction run (agent/run.ts): the selected model reads and plans, Go, the result with Undo.
   | { k: "asking" }
   | { k: "plan"; text: string; cost: RunCost | null; graphics: AgentGraphic[] }
   | { k: "acting"; cancelling: boolean }
@@ -60,6 +61,12 @@ function Telemetry({ device }: { device: string }) {
       <span className="det">{gpu ? "GPU · large-v3 · fp16" : "CPU · large-v3 · int8 (slower)"}</span>
     </div>
   );
+}
+
+/** The run's stage lines, naming the selected model (its picker label; "Claude" before /health is read). */
+export function runStages(label: string | null): { plans: string; acts: string } {
+  const who = label || "Claude";
+  return { plans: `${who} reads the timeline and plans`, acts: `${who} makes the changes` };
 }
 
 function Stage({ state, label }: { state: "wait" | "run" | "done"; label: string }) {
@@ -236,6 +243,7 @@ export function CutTab({ health, ready, agent, onTrimmed }: {
   const monthUsd = ai?.month_usd ?? null;
   const clipS = snap ? snap.durationS : null;
   const overLimit = ai ? budgetEstimate(ai, clipS, monthUsd).over : false;
+  const stages = runStages(ai?.label ?? null);
   // One rule for the button and for Enter: submitting from code ignores a disabled button.
   const canAnalyse = ready && !working && !inRun && !overLimit && phase.k !== "applying" && phase.k !== "applied";
 
@@ -270,7 +278,11 @@ export function CutTab({ health, ready, agent, onTrimmed }: {
             disabled={!canAnalyse}
             title={overLimit ? "Monthly AI limit reached" : undefined}>Send</button>
         </form>
-        {ai && <CostEstimate ai={ai} clipS={clipS} monthUsd={monthUsd} />}
+        {/* Under the instruction box: the cost line, and beside it the AI model picker. */}
+        <div className="cost-row">
+          {ai && <CostEstimate ai={ai} clipS={clipS} monthUsd={monthUsd} />}
+          <ModelPicker api={runtime.backend} onSwitched={async () => { await aiWatch.current?.refresh(); }} />
+        </div>
       </div>
 
       <div className="result" aria-label="Result">
@@ -288,8 +300,8 @@ export function CutTab({ health, ready, agent, onTrimmed }: {
         {(phase.k === "asking" || phase.k === "acting") && (
           <div className="sec">
             <div className="stages">
-              <Stage state={phase.k === "asking" ? "run" : "done"} label="Claude reads the timeline and plans" />
-              {phase.k === "acting" && <Stage state="run" label={phase.cancelling ? "Cancelling after this step…" : "Claude makes the changes"} />}
+              <Stage state={phase.k === "asking" ? "run" : "done"} label={stages.plans} />
+              {phase.k === "acting" && <Stage state="run" label={phase.cancelling ? "Cancelling after this step…" : stages.acts} />}
             </div>
             {phase.k === "acting" && (
               <div className="actions-row" style={{ marginTop: 9 }}>

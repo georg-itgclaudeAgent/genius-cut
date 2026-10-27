@@ -4,7 +4,7 @@
  * sample-data mock.
  */
 import type {
-  AgentStart, AgentStep, AgentToolResult, GcloudStatus, GcpProject, GraphicsStatus, Health, KeySource, KeyTest, Library, LoginStatus, RunCost, SecretVersion, Settings, StyleExample,
+  AgentStart, AgentStep, AgentToolResult, GcloudStatus, GcpProject, GraphicsStatus, Health, KeySource, KeyTest, Library, LoginStatus, ModelListing, RunCost, SecretVersion, Settings, SettingsPatch, StyleExample,
   TranscriptJob, TranscriptRequest, TrimRequest, TrimResponse, Usage, Word,
 } from "./types";
 
@@ -74,7 +74,8 @@ export function createBackend({ transport, token }: { transport: Transport; toke
     // The Setup page and Settings. gcloud calls have a 60 s timeout on the backend; the key test
     // reads the secret through gcloud, then makes one Anthropic call.
     settings: () => call<Settings>("GET", "/settings"),
-    saveSettings: (s: Settings) => call<Settings>("PUT", "/settings", { body: s }),
+    /** Merges: only the fields sent change. */
+    saveSettings: (s: SettingsPatch) => call<Settings>("PUT", "/settings", { body: s }),
     testKey: (anthropic_key: KeySource) => call<KeyTest>("POST", "/settings/test-key", { body: { anthropic_key }, timeoutMs: GCLOUD_MS * 2 }),
     gcloud: () => call<GcloudStatus>("GET", "/setup/gcloud", { timeoutMs: GCLOUD_MS }),
     startLogin: () => call<LoginStatus>("POST", "/setup/login", { timeoutMs: GCLOUD_MS }),
@@ -86,7 +87,15 @@ export function createBackend({ transport, token }: { transport: Transport; toke
       `/setup/versions?project=${encodeURIComponent(project)}&secret=${encodeURIComponent(secret)}`, { timeoutMs: GCLOUD_MS }),
     usage: () => call<Usage>("GET", "/usage"),
 
-    // Agent runs: each call is one Claude step (15 minutes at most: a step may render graphics). An unknown run is a 404.
+    // The AI model picker: the catalog with live states (refresh re-checks every provider; probes can take a while),
+    // the switch (next Send / Analyse), and the Vertex sign-in job (202 running; 409 while one runs; poll GET).
+    models: (refresh = false) => call<ModelListing>("GET", refresh ? "/models?refresh=1" : "/models", { timeoutMs: GCLOUD_MS }),
+    setModel: (model: string) => call<Settings>("PUT", "/settings/model", { body: { model } }),
+    vertexLogin: (project?: string) =>
+      call<LoginStatus>("POST", "/setup/vertex-login", { body: project === undefined ? {} : { project }, timeoutMs: GCLOUD_MS }),
+    vertexLoginStatus: () => call<LoginStatus>("GET", "/setup/vertex-login"),
+
+    // Agent runs: each call is one model step (15 minutes at most: a step may render graphics). An unknown run is a 404.
     agentStart: (body: AgentStart) => call<AgentStep>("POST", "/agent/runs", { body, timeoutMs: STEP_MS }),
     agentResults: (runId: string, results: AgentToolResult[]) =>
       call<AgentStep>("POST", `/agent/runs/${encodeURIComponent(runId)}/results`, { body: { results }, timeoutMs: STEP_MS }),

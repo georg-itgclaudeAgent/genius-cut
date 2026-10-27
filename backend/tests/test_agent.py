@@ -111,7 +111,8 @@ PIECE_4 = ["delete_clips", "close_gaps", "split_at", "set_clip_enabled", "move_c
 def test_the_tools_offered_are_the_whole_toolbox_plus_propose_filler_cuts_never_undo():
     names = [t["name"] for t in agent.TOOLS]
     assert names == ["get_sequence", "get_transcript", "wait_transcript", "add_markers", "cut_ranges", *PIECE_4,
-                     "make_graphic", "read_graphic", "place_graphic", "replace_graphic", "propose_filler_cuts"]
+                     "search_envato", "make_graphic", "read_graphic", "place_graphic", "replace_graphic",
+                     "propose_filler_cuts"]
     assert all(t["input_schema"]["type"] == "object" and t["description"] for t in agent.TOOLS)
     assert all(t["input_schema"].get("additionalProperties") is False for t in agent.TOOLS)
     assert "undo_last_turn" not in json.dumps(agent.TOOLS)
@@ -158,10 +159,9 @@ def test_first_step_request_shape(tmp_path):
     assert kw["model"] == "claude-opus-5-5" and kw["max_tokens"] == 32000
     assert kw["output_config"] == {"effort": "high"} and kw["tool_choice"] == {"type": "auto"}
     assert kw["cache_control"] == {"type": "ephemeral"}
-    assert kw["betas"] == [claude.FALLBACK_BETA, claude.MCP_BETA] and kw["fallbacks"] == "default"
-    assert "thinking" not in kw
-    assert [t["name"] for t in kw["tools"][:-1]] == [t["name"] for t in agent.TOOLS]
-    assert kw["tools"][-1] == claude.ENVATO_TOOLSET and kw["mcp_servers"] == [claude.ENVATO_SERVER]
+    assert kw["betas"] == [claude.FALLBACK_BETA] and kw["fallbacks"] == "default"
+    assert "thinking" not in kw and "mcp_servers" not in kw  # Envato is the search_envato backend tool now
+    assert kw["tools"] == agent.TOOLS and all(t.get("type") is None for t in kw["tools"])
     assert "selected" in kw["system"].lower()
     first = kw["messages"][0]
     assert first["role"] == "user"
@@ -278,16 +278,17 @@ def test_propose_filler_cuts_is_terminal(tmp_path):
     assert results(c, auth, body["run_id"], ("t1", "review opened", False)).status_code == 404
 
 
-def test_the_25_step_cap(tmp_path):
-    fake = FakeClient(*[reply(tool(f"t{i}", "get_sequence"), stop="tool_use") for i in range(30)])
+def test_the_40_step_cap(tmp_path):
+    assert agent.MAX_STEPS == 40
+    fake = FakeClient(*[reply(tool(f"t{i}", "get_sequence"), stop="tool_use") for i in range(45)])
     c, auth = app(tmp_path, fake)
     body = start(c, auth).json()
-    for _ in range(24):
+    for _ in range(39):
         body = results(c, auth, body["run_id"], (body["tool_calls"][0]["id"], "ok", False)).json()
         assert body["state"] == "tool_calls"
     body = results(c, auth, body["run_id"], (body["tool_calls"][0]["id"], "ok", False)).json()
     assert body["state"] == "stopped" and body["reason"] == "step_cap"
-    assert len(fake.calls) == 25
+    assert len(fake.calls) == 40
 
 
 def test_the_client_is_made_once_per_run(tmp_path):

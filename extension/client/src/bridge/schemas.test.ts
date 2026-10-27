@@ -3,10 +3,10 @@
  * sees in the panel), the panel's tool table (this folder's tools.ts, which runs them) and the personal
  * terminal door's (mcp/premiere-mcp.mjs). Same names, same arguments, same read/act kinds; the backend
  * offers wait_transcript but never undo_last_turn (Undo is a button), and adds the terminal
- * propose_filler_cuts, which the panel's run handles itself. On the Anthropic API the backend also sends an
- * Envato mcp_toolset (B-roll search, run server-side by Anthropic): it is backend-only, never a panel or MCP
- * tool, so it is taken out of the comparison here, explicitly. So are the backend-run tools (TOOL_KINDS "backend":
- * make_graphic, read_graphic), which the agent loop runs itself and never sends to the panel.
+ * propose_filler_cuts, which the panel's run handles itself. The backend-run tools (TOOL_KINDS "backend":
+ * search_envato, make_graphic, read_graphic) are taken out of the comparison, explicitly: the agent loop runs
+ * them itself (search_envato calls Envato's MCP server from the backend, on every model) and never sends them
+ * to the panel.
  */
 import { describe, it, expect, beforeAll } from "vitest";
 import { execFileSync } from "node:child_process";
@@ -37,21 +37,19 @@ function shape(x: any): any {
 }
 
 let backend: { tools: { name: string; input_schema: any }[]; kinds: Record<string, string> };
-let serverOnly: { type: string; mcp_server_name: string }[];
 let backendRun: string[];
 let mcp: { name: string; inputSchema: any; annotations: { readOnlyHint: boolean } }[];
 const panel = createTools({ callHost: async () => ({}), backend: { transcript: async () => ({}) as any, transcriptJob: async () => ({}) as any },
   turns: createTurns({ read: () => null, write: () => {} }) });
 
 beforeAll(() => {
-  // What Claude is offered on the Anthropic API: the panel's tools plus the backend-only Envato toolset.
-  const dump = "import json; from geniuscut import agent, claude; "
-    + "print(json.dumps({'tools': agent.TOOLS + [claude.ENVATO_TOOLSET], 'kinds': agent.TOOL_KINDS}))";
+  // What the model is offered (every provider): the panel's tools plus the backend-run ones.
+  const dump = "import json; from geniuscut import agent; "
+    + "print(json.dumps({'tools': agent.TOOLS, 'kinds': agent.TOOL_KINDS}))";
   const all = JSON.parse(execFileSync(python(), ["-c", dump], { cwd: BACKEND, encoding: "utf8" }));
-  serverOnly = all.tools.filter((t: any) => t.type === "mcp_toolset");
   // The backend-run tools (kind "backend") are run in the agent loop, never by the panel or the MCP.
   backendRun = all.tools.filter((t: any) => all.kinds[t.name] === "backend").map((t: any) => t.name).sort();
-  backend = { ...all, tools: all.tools.filter((t: any) => t.type !== "mcp_toolset" && all.kinds[t.name] !== "backend") };
+  backend = { ...all, tools: all.tools.filter((t: any) => all.kinds[t.name] !== "backend") };
   // premiere-mcp as Claude Code runs it, asked for its list (a temp APPDATA: no bridge is read for a list).
   const appData = mkdtempSync(join(tmpdir(), "gcut-schemas-"));
   try {
@@ -64,14 +62,13 @@ beforeAll(() => {
 }, 30000);
 
 describe("the three schema copies", () => {
-  it("leave out the backend-only Envato toolset, which Anthropic runs and the panel never sees", () => {
-    expect(serverOnly.map((t) => t.mcp_server_name)).toEqual(["envato"]);
-    expect(backend.tools.every((t) => typeof t.name === "string" && t.input_schema)).toBe(true);
+  it("have no server-side tools: every backend tool is an ordinary named tool with a JSON schema", () => {
+    expect(backend.tools.every((t: any) => typeof t.name === "string" && t.input_schema && !t.type)).toBe(true);
     expect(Object.keys(backend.kinds)).not.toContain("envato");
   });
 
   it("leave out the backend-run tools (kind backend), which the agent loop runs and the panel never sees", () => {
-    expect(backendRun).toEqual(["make_graphic", "read_graphic"]);
+    expect(backendRun).toEqual(["make_graphic", "read_graphic", "search_envato"]);
     for (const n of backendRun) {
       expect(Object.keys(panel), n).not.toContain(n);
       expect(mcp.map((t) => t.name), n).not.toContain(n);

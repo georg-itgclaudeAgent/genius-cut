@@ -159,12 +159,12 @@ def test_a_backend_only_reply_steps_again_without_the_panel():
     assert [b["tool_use_id"] for b in last_user(fake, 1)] == ["t1"]
     assert [b["tool_use_id"] for b in last_user(fake, 2)] == ["t2"]
     assert body["graphics"][0]["slug"] == "mfa-lower-third"
-    assert r._runs[body["run_id"]].steps == 3  # counted toward the 25-step cap
+    assert r._runs[body["run_id"]].steps == 3  # counted toward the 40-step cap
 
 
 def test_backend_only_steps_count_toward_the_cap():
     fake = FakeClient(*[reply(tool(f"t{i}", "read_graphic", {"slug": "starter-card"}), stop="tool_use")
-                        for i in range(30)])
+                        for i in range(45)])
     body = runs(fake, FakeEngine()).start("x", SELECTION, SEQUENCE, CONTEXT)
     assert body["state"] == "stopped" and body["reason"] == "step_cap" and len(fake.calls) == agent.MAX_STEPS
 

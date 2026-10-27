@@ -31,10 +31,11 @@ Step reply (HTTP 200):
 - `plan`: Claude's plan (text) before approval; show Go / Cancel. Go = approve.
 - `done`: the approved run finished; text is Claude's summary. The run is closed.
 - `stopped`: the run is closed; show `message` (for `limit`, the exact limit message).
-- Backend tools (TOOL_KINDS "backend": make_graphic, read_graphic) run here, in order, before the reply;
+- Backend tools (TOOL_KINDS "backend": search_envato, make_graphic, read_graphic) run here before the reply;
   they never appear in `tool_calls` and the panel never answers them. A reply with only backend tools
   steps again at once (counted toward the cap); with panel tools too, `tool_calls` holds only the panel
-  ones and, when their results come, every result goes to Claude in the reply's tool_use order. One
+  ones and, when their results come, every result goes to Claude in the reply's tool_use order. Every
+  search_envato of a reply runs in that step (side by side); then make_graphic / read_graphic in order. One
   make_graphic per reply (a second gets an error result); per slug, the third failed make_graphic stops
   the run. DELETE sets the run's cancel event: a running render is killed and no Claude call follows.
 - `propose_filler_cuts` is terminal: a `tool_calls` reply containing it closes the run on the
@@ -46,33 +47,32 @@ picker's settings.model, or a dev env override, see llm.selected_id) and keeps i
 client to the end: a switch in the picker applies to the next run only. The loop speaks the neutral step
 contract in adapters.py; the adapter owns the conversation (append-only, model turns appended whole,
 thinking included; never edited) and the id → tool name map. A refusal or a reply cut off at max_tokens
-ends the run and is not appended or executed; at most 25 model calls per run; every step goes through the
+ends the run and is not appended or executed; at most MAX_STEPS (40) model calls per run, backend-only
+steps included; every step goes through the
 spend gate, estimated from the previous step's actual usage plus the new content; the client (and so the
 key read) is made once per run. Texts name the model by its catalog label. Runs live in memory: a
 backend restart loses them.
 
-B-roll markers: Envato Elements search rides along on every step (ClaudeAdapter.step(envato=True)) unless
-GENIUSCUT_ENVATO=0 or the run's provider isn't the Anthropic API (until plan Task 4 replaces the connector).
-Anthropic runs those searches server-side; their mcp_tool_use /
-mcp_tool_result blocks are appended with the rest of the reply and never sent to the panel. A step that
-fails because of the Envato server is retried once without it, and Envato stays off for the rest of the run;
-Claude is told (ENVATO_DOWN / ENVATO_OFF in the system prompt) to give search terms only. A `pause_turn`
-reply (a long server-side tool loop) is appended unchanged and continued inside ClaudeAdapter; each
-continuation counts as a step.
+B-roll markers: `search_envato {searchTerms, kind: stock-video|photos, orientation?}` is a backend tool on
+every provider: envato.py calls Envato's MCP server itself and the result text lists the titles and item_urls.
+GENIUSCUT_ENVATO=0 takes the tool out of the run (ENVATO_OFF in the system prompt). A failed search returns
+an error result and sets the run's Envato-down flag: from then on the system prompt carries ENVATO_DOWN
+(give search terms only) and further searches in the run fail at once without calling Envato.
 """
 
 import json
 import math
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable
 
-from geniuscut import adapters, catalog, claude, gemini, graphics, llm, secrets, spend
+from geniuscut import adapters, catalog, claude, envato, gemini, graphics, llm, secrets, spend
 from geniuscut.errors import LLMError
 
-MAX_STEPS = 25
+MAX_STEPS = 40  # model calls per run, backend-only steps included
 LOST = "This run was lost; send the instruction again."
 APPROVED = "Approved: do exactly this plan."
 
@@ -418,6 +418,28 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "search_envato",
+        "description": (
+            "Search Envato Elements for B-roll (runs in the backend, read-only, no approval needed): the best "
+            f"{envato.PER_PAGE} matches as title, author and item_url. kind stock-video searches Stock Footage, "
+            "photos searches photos. Make every search of the run in one reply (several search_envato calls side "
+            "by side): they all run together."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "searchTerms": {"type": "string", "minLength": 1, "maxLength": envato.MAX_TERMS,
+                                "description": "Short and visual: what would be on screen (e.g. 'typing on "
+                                               "laptop close up')."},
+                "kind": {"type": "string", "enum": list(envato.KINDS),
+                         "description": "stock-video (the default for B-roll) or photos (only when asked)."},
+                "orientation": {"type": "string", "enum": list(envato.ORIENTATIONS),
+                                "description": "horizontal unless the user asks for vertical."},
+            },
+            "required": ["searchTerms", "kind"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "make_graphic",
         "description": (
             "Write and render a motion graphic (runs in the backend, no timeline change, allowed before and after "
@@ -523,7 +545,8 @@ TOOL_KINDS = {"get_sequence": "read", "get_transcript": "read", "wait_transcript
               "add_markers": "act", "cut_ranges": "act", "delete_clips": "act", "close_gaps": "act", "split_at": "act",
               "set_clip_enabled": "act", "move_clips": "act", "switch_angle": "act", "set_volume": "act",
               "mute_track": "act", "add_transition": "act", "set_speed": "act",
-              "make_graphic": "backend", "read_graphic": "backend", "place_graphic": "act", "replace_graphic": "act",
+              "search_envato": "backend", "make_graphic": "backend", "read_graphic": "backend",
+              "place_graphic": "act", "replace_graphic": "act",
               "propose_filler_cuts": "terminal"}
 
 MAX_GRAPHIC_FAILURES = 3  # per slug per run: the third failed make_graphic ends the run
@@ -536,6 +559,9 @@ ENVATO_OFF = ("Envato search is switched off in this run: for B-roll, give the s
 ENVATO_DOWN = ("Envato search is unavailable right now (the Envato server couldn't be reached): for B-roll, give the "
                "search terms to use for each spot instead of Envato clips, and put only the search terms in the "
                "marker comments.")
+ENVATO_FAILED = ("Envato search failed ({why}). Envato is unavailable for the rest of this run: give the search "
+                 "terms only for B-roll, in the plan and in the marker comments.")
+SEARCHES_AT_ONCE = 6  # search_envato calls of one reply run side by side, this many at a time
 
 SYSTEM = """You are the assistant inside Genius Cut, a Premiere Pro panel. The user typed an instruction about \
 the clips they selected on the timeline. You edit the active sequence only through the tools.
@@ -584,11 +610,11 @@ B-roll markers ("mark B-roll spots", "where do I need B-roll?")
 - A planned edit with add_markers. Read what is said in the selected clips (get_transcript, then wait_transcript \
 if needed) and pick the spots that need B-roll: where the speaker names or describes something the viewer could \
 see, lists things, or talks to camera for long. Each spot is a time range inside the selected clips.
-- For each spot, search Envato Elements with search_stock_video: 1-3 phrasings per spot, searchTerms short and \
-visual (what would be on screen, e.g. "typing on laptop close up", under 60 characters), perPage about 5, \
-filters orientation horizontal and categories "Stock Footage" unless the user asks for vertical or motion \
-graphics. Use search_photos only when the user asks for photos. Envato search is read-only and needs no \
-approval; Anthropic runs it for you.
+- For each spot, search Envato Elements with search_envato: 1-3 phrasings per spot, searchTerms short and \
+visual (what would be on screen, e.g. "typing on laptop close up", under 60 characters), kind "stock-video" and \
+orientation "horizontal" unless the user asks for photos (kind "photos") or vertical. Make all of the run's \
+searches in ONE reply, every search_envato call side by side: they run together, and each extra reply costs a \
+step. search_envato is read-only and needs no approval.
 - The plan lists each spot: its time range (m:ss-m:ss), the short idea, and the best 2-3 Envato clips by title \
 with their item_url links.
 - After approval, one add_markers call with one range marker per spot: atS and endS = the spot, name "B-roll: \
@@ -663,8 +689,9 @@ class Run:
     steps: int = 0
     waiting: list[str] = field(default_factory=list)  # tool_use ids the panel must answer
     plan_ready: bool = False
-    envato: bool = False  # Envato search rides along on this run's steps
-    envato_note: str = ""  # what Claude is told when it doesn't (ENVATO_OFF / ENVATO_DOWN)
+    envato: bool = False  # search_envato is offered in this run (GENIUSCUT_ENVATO not 0)
+    envato_down: bool = False  # a search failed: the rest of the run gives search terms only
+    envato_note: str = ""  # what the model is told when Envato is off or down (ENVATO_OFF / ENVATO_DOWN)
     last_usage: tuple[int, int] | None = None  # (all input incl. cache, output) of the last step
     meter: spend.Meter = field(default_factory=lambda: spend.Meter(kind="agent"))
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -687,6 +714,11 @@ class Run:
         return self.adapter.history if self.adapter is not None else []
 
     @property
+    def tools(self) -> list[dict]:
+        """The tools this run offers: TOOLS, without search_envato when Envato is switched off."""
+        return TOOLS if self.envato else [t for t in TOOLS if t["name"] != "search_envato"]
+
+    @property
     def label(self) -> str:
         return catalog.label(self.model_id) or self.model_id
 
@@ -698,11 +730,13 @@ class GraphicsStop(Exception):
 class Runs:
     """Agent runs in memory, keyed by id. Each run resolves the selected model once at its start
     (`selected()`, default llm.selected_id: the picker or a dev override) and keeps it, its adapter and its
-    client to the end. `make_client` (tests) replaces the adapter's own client factory."""
+    client to the end. `make_client` (tests) replaces the adapter's own client factory; `envato_search(kind,
+    terms, orientation)` (tests) replaces envato.search."""
 
     def __init__(self, make_client: Callable | None = None, engine: graphics.Engine | None = None, *,
-                 selected: Callable[[], str] | None = None, adapter_for: Callable = adapters.for_entry):
-        self.make_client, self.adapter_for = make_client, adapter_for
+                 selected: Callable[[], str] | None = None, adapter_for: Callable = adapters.for_entry,
+                 envato_search: Callable = envato.search):
+        self.make_client, self.adapter_for, self.envato_search = make_client, adapter_for, envato_search
         self.selected = selected or llm.selected_id
         self.engine = engine or graphics.Engine()
         self._runs: dict[str, Run] = {}
@@ -726,11 +760,10 @@ class Runs:
             return self._stopped(bare, "key", str(e))
         except LLMError as e:
             return self._stopped(bare, "error", str(e))
-        # the Anthropic MCP connector only on the Anthropic API (plan Task 4 replaces it with a backend tool)
-        envato = claude.envato_enabled() and entry.provider == "anthropic"
+        on = envato.enabled()  # search_envato on every provider unless GENIUSCUT_ENVATO=0
         ctx = context or {}
-        run = Run(id=run_id, client=client, model_id=entry.id, adapter=adapter, envato=envato,
-                  envato_note="" if envato else ENVATO_OFF,
+        run = Run(id=run_id, client=client, model_id=entry.id, adapter=adapter, envato=on,
+                  envato_note="" if on else ENVATO_OFF,
                   project_path=str(ctx.get("projectPath") or ""), fps=ctx.get("fps"),
                   timebase=str(ctx["timebase"]) if ctx.get("timebase") not in (None, "") else None,
                   width=ctx.get("width"), height=ctx.get("height"))
@@ -807,7 +840,7 @@ class Runs:
 
     def _estimate(self, run: Run, new_chars: int) -> int:
         if run.last_usage is None:  # first step: everything is new
-            text = SYSTEM + json.dumps(TOOLS) + json.dumps(run.messages, default=str)
+            text = SYSTEM + json.dumps(run.tools) + json.dumps(run.messages, default=str)
             return math.ceil(len(text) / spend.CHARS_PER_TOKEN)
         return spend.estimate_step(run.last_usage[0], run.last_usage[1], new_chars)
 
@@ -817,11 +850,7 @@ class Runs:
         if run.steps >= MAX_STEPS:
             return self._step_cap(run)
         try:
-            try:
-                step = self._call(run, new_chars)
-            except claude.EnvatoUnavailable:  # once per run: Envato stays off from here on
-                run.envato, run.envato_note = False, ENVATO_DOWN
-                step = self._call(run, new_chars)
+            step = self._call(run, new_chars)
         except adapters.OutOfSteps:
             run.steps = MAX_STEPS
             return self._step_cap(run)
@@ -872,9 +901,13 @@ class Runs:
         return self._reply(run, "plan", text=text)
 
     def _run_backend(self, run: Run, calls: list[dict]) -> dict:
-        """Run make_graphic / read_graphic in order; {tool call id: ToolResult}."""
-        done, made = {}, False
+        """Every search_envato side by side, then make_graphic / read_graphic in order; {tool call id: ToolResult}."""
+        searches = [c for c in calls if c["name"] == "search_envato"]
+        done = self._search_envato(run, searches) if searches else {}
+        made = False
         for c in calls:
+            if c["name"] == "search_envato":
+                continue
             if run.cancelled:
                 raise graphics.Cancelled()
             if c["name"] == "make_graphic":
@@ -887,6 +920,34 @@ class Runs:
                 content, err = self._read_graphic(run, c["input"] or {})
             done[c["id"]] = adapters.ToolResult(c["id"], content, err)
         return done
+
+    def _search_envato(self, run: Run, calls: list[dict]) -> dict:
+        """Run a reply's searches together (at most SEARCHES_AT_ONCE at a time); a failure sets the run's
+        Envato-down flag, after which searches fail at once."""
+        def one(c) -> adapters.ToolResult:
+            inp = c["input"] if isinstance(c["input"], dict) else {}
+            if not run.envato:
+                return adapters.ToolResult(c["id"], ENVATO_OFF, True)
+            try:
+                envato.request_for(inp.get("kind"), inp.get("searchTerms"), inp.get("orientation"))
+            except ValueError as e:  # the model's mistake, not Envato's: no flag
+                return adapters.ToolResult(c["id"], f"search_envato: {e}.", True)
+            if run.envato_down:
+                return adapters.ToolResult(c["id"], ENVATO_FAILED.format(why="it failed earlier in this run"), True)
+            terms = inp["searchTerms"].strip()
+            try:
+                found = self.envato_search(inp["kind"], terms, inp.get("orientation"))
+            except Exception as e:  # noqa: BLE001 - any failure is "Envato down", never a crashed run
+                run.envato_down, run.envato_note = True, ENVATO_DOWN
+                why = str(e) if isinstance(e, envato.EnvatoError) else "an unexpected error"
+                return adapters.ToolResult(c["id"], ENVATO_FAILED.format(why=why), True)
+            return adapters.ToolResult(c["id"], _envato_text(terms, found), False)
+
+        if len(calls) == 1:
+            r = one(calls[0])
+            return {r.id: r}
+        with ThreadPoolExecutor(max_workers=min(SEARCHES_AT_ONCE, len(calls))) as pool:
+            return {r.id: r for r in pool.map(one, calls)}
 
     def _make_graphic(self, run: Run, inp: dict) -> tuple[str, bool]:
         slug = str(inp.get("slug", ""))
@@ -927,8 +988,8 @@ class Runs:
     def _call(self, run: Run, new_chars: int) -> adapters.Step:
         system = SYSTEM + ("\n\n" + run.envato_note if run.envato_note else "")
         with spend.meter(kind="agent", run=run.id, m=run.meter):
-            return run.adapter.step(system, TOOLS, client=run.client, input_tokens=self._estimate(run, new_chars),
-                                    max_requests=MAX_STEPS - run.steps, envato=run.envato)
+            return run.adapter.step(system, run.tools, client=run.client,
+                                    input_tokens=self._estimate(run, new_chars), max_requests=MAX_STEPS - run.steps)
 
     def _step_cap(self, run: Run) -> dict:
         return self._stopped(run, "step_cap", f"Stopped after {MAX_STEPS} {run.label} steps without finishing. "
@@ -943,6 +1004,16 @@ class Runs:
         return {"run_id": run.id, "state": state, "tool_calls": tool_calls or [], "text": text,
                 "message": message, "reason": reason, "cost": llm.run_cost(run.meter, default=run.model_id).model_dump(),
                 "graphics": list(run.graphics.values())}
+
+
+def _envato_text(terms: str, found: list[dict]) -> str:
+    if not found:
+        return f'No Envato results for "{terms}": try other search terms, or give the search terms only.'
+    lines = [f'Envato results for "{terms}":']
+    for i, it in enumerate(found, 1):
+        by = f" (by {it['author']})" if it.get("author") else ""
+        lines.append(f"{i}. {it['title']}{by} - {it['item_url']}")
+    return "\n".join(lines)
 
 
 def _graphics_context(run: Run) -> str:

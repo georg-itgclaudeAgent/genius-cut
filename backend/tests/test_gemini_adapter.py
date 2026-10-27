@@ -269,12 +269,12 @@ def test_a_retry_past_the_step_cap_is_out_of_steps():
         a.step("s", [], client=client(t), input_tokens=1, max_requests=1)
 
 
-def test_envato_is_ignored():
+def test_step_takes_no_envato_flag():
     t = Transport(answer(say("ok")))
     a = adapter()
     a.add_user_text("x")
-    assert a.step("s", [], client=client(t), input_tokens=1, envato=True).stop == "end"
-    assert "mcp_servers" not in t.calls[0]["body"]
+    with pytest.raises(TypeError):
+        a.step("s", [], client=client(t), input_tokens=1, envato=True)  # the MCP connector flag is gone
 
 
 # ── usage and spend ────────────────────────────────────────────────
@@ -375,6 +375,33 @@ def test_make_graphic_variables_reach_the_engine_on_gemini():
     assert done["state"] == "done" and engine.calls[0]["variables"] == {"name": "Peter", "size": 3, "dark": True}
     part = t.calls[2]["body"]["contents"][-1]["parts"][0]["functionResponse"]
     assert part["name"] == "make_graphic" and "result" in part["response"]
+
+
+def test_b_roll_on_gemini_runs_search_envato_end_to_end_through_a_fake_mcp_server():
+    from tests.test_envato import ITEMS, FakeMCP
+    server = FakeMCP(mode="sse")
+    try:
+        t = Transport(
+            answer(fc("search_envato", {"searchTerms": "typing on laptop", "kind": "stock-video",
+                                        "orientation": "horizontal"}, sig="S"),
+                   fc("search_envato", {"searchTerms": "office desk", "kind": "photos"})),
+            answer(say("1. 0:12-0:18 B-roll: typing - Typing on Laptop Close Up Shot")),
+        )
+        r = agent.Runs(make_client=lambda: client(t), engine=FakeEngine(), envato_search=server.search)
+        first = r.start("mark B-roll spots", SELECTION, SEQUENCE)
+    finally:
+        server.close()
+    assert first["state"] == "plan" and first["tool_calls"] == [] and len(t.calls) == 2
+    decls = [d["name"] for d in t.calls[0]["body"]["tools"][0]["functionDeclarations"]]
+    assert "search_envato" in decls
+    assert [q["body"]["params"]["name"] for q in server.requests if q["method"] == "tools/call"] in (
+        ["search_stock_video", "search_photos"], ["search_photos", "search_stock_video"])
+    contents = t.calls[1]["body"]["contents"]
+    assert contents[1]["parts"][0]["thoughtSignature"] == "S"  # the model turn kept whole
+    parts = contents[2]["parts"]
+    assert [p["functionResponse"]["name"] for p in parts] == ["search_envato", "search_envato"]
+    assert ITEMS[0]["item_url"] in parts[0]["functionResponse"]["response"]["result"]
+    assert "error" not in parts[1]["functionResponse"]["response"]
 
 
 def test_a_gemini_refusal_ends_the_run_with_the_label():

@@ -58,7 +58,8 @@ def test_a_vertex_run_sends_only_what_vertex_takes():
     assert kw["tool_choice"] == {"type": "auto"} and kw["tools"] == agent.TOOLS
     for k in ("betas", "fallbacks", "mcp_servers", "output_config", "cache_control", "thinking"):
         assert k not in kw
-    assert agent.ENVATO_OFF in kw["system"]  # no MCP connector off the Anthropic API
+    assert kw["system"] == agent.SYSTEM  # search_envato is offered on Vertex too (a backend tool)
+    assert "search_envato" in [t["name"] for t in kw["tools"]]
     assert (r["cost"]["model"], r["cost"]["provider"]) == ("vertex:claude-opus-5-5", "vertex")
     assert r["cost"]["label"] == "Claude Opus 5.5 (Google Cloud)"
 
@@ -80,7 +81,7 @@ def test_a_model_without_fallbacks_gets_none_on_the_anthropic_api():
     agent.Runs(make_client=lambda: fake).start("x", SELECTION, SEQUENCE)
     kw = fake.calls[0]
     assert kw["model"] == "claude-haiku-5-5" and "fallbacks" not in kw
-    assert kw["betas"] == [adapters.claude.MCP_BETA]  # only the Envato connector's
+    assert "betas" not in kw and "mcp_servers" not in kw  # no fallbacks beta, no MCP connector
     assert kw["output_config"] == {"effort": "high"} and kw["cache_control"] == {"type": "ephemeral"}
 
 

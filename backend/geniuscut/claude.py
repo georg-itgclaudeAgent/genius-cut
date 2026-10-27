@@ -16,11 +16,6 @@ agent's ClaudeAdapter (adapters.py) shares.
 - Server-side refusal fallback (`fallbacks="default"`) only on the Anthropic API and only for models whose
   params say so (catalog). Vertex never gets it.
 - A refusal or a truncated reply raises instead of being silently parsed.
-- Envato Elements search (B-roll, until plan Task 4 replaces it): on the Anthropic API the agent adds Envato's
-  MCP server (https://mcp.envato.com/mcp, no auth) through Anthropic's MCP connector, with only
-  `search_stock_video` and `search_photos` allowlisted (ENVATO_SERVER / ENVATO_TOOLSET / MCP_BETA here,
-  used by adapters.ClaudeAdapter). GENIUSCUT_ENVATO=0 turns it off (`envato_enabled`); other providers never
-  get it. An API error naming the MCP server raises EnvatoUnavailable, so the caller can retry without it.
 - Before every call the spend gate checks the worst case against the monthly limit, so a refused run never
   reaches the API; an unpriced model is refused. Usage is recorded in the spend ledger after every reply
   under the catalog id of the model that answered, priced as the id asked for when that one has no price.
@@ -40,11 +35,6 @@ from geniuscut.errors import LLMError
 
 MODEL = "claude-opus-5-5"  # the dev default; GENIUSCUT_CLAUDE_MODEL overrides it (read per call)
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
-MCP_BETA = "mcp-client-2025-11-20"
-ENVATO_SERVER = {"type": "url", "url": "https://mcp.envato.com/mcp", "name": "envato"}
-# Search only: every other Envato tool (downloads, licences…) stays off.
-ENVATO_TOOLSET = {"type": "mcp_toolset", "mcp_server_name": "envato", "default_config": {"enabled": False},
-                  "configs": {"search_stock_video": {"enabled": True}, "search_photos": {"enabled": True}}}
 
 
 class ClaudeError(LLMError):
@@ -59,21 +49,6 @@ class KeyRejected(ClaudeError):
 
     def __init__(self):
         super().__init__(KEY_REJECTED)
-
-
-class EnvatoUnavailable(ClaudeError):
-    """The step failed because Anthropic couldn't use the Envato MCP server; retry it without Envato."""
-
-
-def envato_enabled() -> bool:
-    """Envato search rides along unless GENIUSCUT_ENVATO is 0/false/off/no. The caller adds it only on the
-    Anthropic API (agent.py checks the run's provider)."""
-    return (os.environ.get("GENIUSCUT_ENVATO") or "").strip().lower() not in ("0", "false", "off", "no")
-
-
-def mcp_failure(e) -> bool:
-    msg = _api_message(e).lower()
-    return "mcp" in msg or ENVATO_SERVER["name"] in msg
 
 
 def provider() -> str:

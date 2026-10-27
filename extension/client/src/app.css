@@ -63,7 +63,7 @@ button:disabled { cursor: not-allowed; }
         font-weight: 700; font-size: 10.5px; display: grid; place-items: center; }
 .wm { font-size: 15px; font-weight: 700; }
 .wm span { color: var(--blue); }
-.ver { margin-left: auto; position: relative; z-index: 1; color: #fff; font-family: var(--mono); font-size: 9.5px; font-weight: 600; }
+.ver { margin-left: auto; position: relative; z-index: 1; color: var(--navy); font-family: var(--mono); font-size: 9.5px; font-weight: 600; }
 
 .banner { padding: 6px 12px; font-size: 11px; background: var(--well); border-bottom: 1px solid var(--line-soft); color: var(--text-dim); }
 .banner b { color: var(--coral); font-weight: 600; }

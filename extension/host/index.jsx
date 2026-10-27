@@ -1429,12 +1429,37 @@ function gcutMarkerRecord(m) {
  * speed (gcutSpeed: 1 = 100%, negative = reversed)}], markers: [{id, startS, endS, name, comments,
  * colour}], selection: [clip ids] }. Track index and clip track are 1-based, as Premiere shows them.
  */
+/** Past this many clips, get_sequence without {fromS, toS} lists only the stretch around the selection
+ *  (a 1500-clip timeline is ~250k tokens, re-read on every step). Padding in seconds either side. */
+var GCUT_LIST_CAP = 200, GCUT_LIST_PAD_S = 60;
+
+/** The selection's span padded by GCUT_LIST_PAD_S, in ticks, or null when the listing should stay whole.
+ *  A long sequence with nothing selected (cut clips come back unselected) gives {none: true}: no clips listed. */
+function gcutListWindow(tracks) {
+    var total = 0, lo = null, hi = null, t, i;
+    for (t = 0; t < tracks.length; t++) {
+        var items = gcutItems(tracks[t].track);
+        total += items.length;
+        for (i = 0; i < items.length; i++) {
+            if (!(typeof items[i].isSelected === "function" && items[i].isSelected())) continue;
+            var s = gcutT(items[i].start), e = gcutT(items[i].end);
+            if (lo === null || s < lo) lo = s;
+            if (hi === null || e > hi) hi = e;
+        }
+    }
+    if (total <= GCUT_LIST_CAP) return null;
+    if (lo === null) return { none: true, total: total };
+    return { fromT: Math.max(0, lo - GCUT_LIST_PAD_S * GCUT_TICKS), toT: hi + GCUT_LIST_PAD_S * GCUT_TICKS, total: total };
+}
+
 function gcutToolGetSequence(argsJson) {
     try {
         var args = gcutParse(argsJson) || {};
         var seq = gcutSequence(), clock = gcutClock(seq), tracks = gcutTracks(seq), t, i;
         var fromT = typeof args.fromS === "number" ? args.fromS * GCUT_TICKS : null;
         var toT = typeof args.toS === "number" ? args.toS * GCUT_TICKS : null;
+        var win = fromT === null && toT === null ? gcutListWindow(tracks) : null;
+        if (win && !win.none) { fromT = win.fromT; toT = win.toT; }
         var out = { sequenceId: gcutSeqId(seq), name: String(seq.name || ""), fps: Math.round(clock.fps * 1000) / 1000,
                     durationS: gcutSeqEndT(seq) / GCUT_TICKS, tracks: [], clips: [], markers: [], selection: [] };
         for (t = 0; t < tracks.length; t++) {
@@ -1444,7 +1469,7 @@ function gcutToolGetSequence(argsJson) {
             var items = gcutItems(tr.track);
             for (i = 0; i < items.length; i++) {
                 var it = items[i], s = gcutT(it.start), e = gcutT(it.end);
-                if ((fromT !== null && e <= fromT) || (toT !== null && s >= toT)) continue;
+                if ((win && win.none) || (fromT !== null && e <= fromT) || (toT !== null && s >= toT)) continue;
                 var id = gcutClipId(kind, tr.index, it), sel = typeof it.isSelected === "function" && !!it.isSelected();
                 out.clips.push({ id: id, track: tr.label, name: String(it.name), startS: s / GCUT_TICKS, endS: e / GCUT_TICKS,
                                  inS: gcutClipInS(kind, it, clock), source: gcutSource(it), selected: sel, enabled: it.disabled !== true,
@@ -1457,6 +1482,15 @@ function gcutToolGetSequence(argsJson) {
             var rec = gcutMarkerRecord(marks[i]);
             if ((fromT !== null && rec.endS * GCUT_TICKS < fromT) || (toT !== null && rec.startS * GCUT_TICKS >= toT)) continue;
             out.markers.push(rec);
+        }
+        if (win && win.none) {
+            out.listed = { fromS: null, toS: null, clips: 0, totalClips: win.total,
+                           note: "Nothing is selected and the sequence has " + win.total + " clips, so none are listed. " +
+                                 "Pass fromS/toS to list a stretch." };
+        } else if (win) {
+            out.listed = { fromS: win.fromT / GCUT_TICKS, toS: win.toT / GCUT_TICKS, clips: out.clips.length, totalClips: win.total,
+                           note: "Only the clips and markers within " + GCUT_LIST_PAD_S + " s of the selection are listed; the sequence has " +
+                                 win.total + " clips. Pass fromS/toS to list another stretch." };
         }
         return gcutOk(out);
     } catch (e) {

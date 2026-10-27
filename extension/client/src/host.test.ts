@@ -2384,6 +2384,40 @@ describe("gcutToolGetSequence: the active sequence for Claude", () => {
     expect(getSeq(s, { fromS: 0, toS: 99.5 }).clips.map((c: any) => c.track)).toEqual(["A1"]);
   });
 
+  it("on a long sequence without {fromS, toS}, lists only the stretch around the selection and says so", () => {
+    const s = georgScene();
+    (s.host.ctx as any).GCUT_LIST_CAP = 3; // georgScene has 5 clips; a real long sequence has ~1500
+    (s.host.ctx as any).GCUT_LIST_PAD_S = 1;
+    s.seq.markers.createMarker(50).name = "early";
+    s.seq.markers.createMarker(105).name = "inside";
+    const r = getSeq(s);
+    // selection spans 99–111 (A1 to V3), padded by 1 s: V4 at 112–115 is left out
+    expect(r.clips.map((c: any) => c.track)).toEqual(["V1", "V2", "V3", "A1"]);
+    expect(r.markers.map((x: any) => x.name)).toEqual(["inside"]);
+    expect(r.selection).toHaveLength(4);
+    expect(r.listed).toEqual({ fromS: 98, toS: 112, clips: 4, totalClips: 5,
+      note: "Only the clips and markers within 1 s of the selection are listed; the sequence has 5 clips. Pass fromS/toS to list another stretch." });
+    // an explicit range is never narrowed, and a short sequence is listed whole
+    expect(getSeq(s, { fromS: 111, toS: 120 }).listed).toBeUndefined();
+    (s.host.ctx as any).GCUT_LIST_CAP = 200;
+    expect(getSeq(s).clips).toHaveLength(5);
+    expect(getSeq(s).listed).toBeUndefined();
+  });
+
+  it("on a long sequence with nothing selected (clips come back unselected after a cut), lists no clips and says why", () => {
+    const s = georgScene();
+    (s.host.ctx as any).GCUT_LIST_CAP = 3;
+    for (const c of [s.v1, s.v2, s.v3, s.a1]) (c as any).selected = false;
+    s.seq.markers.createMarker(105).name = "kept";
+    const r = getSeq(s);
+    expect(r.clips).toEqual([]);
+    expect(r.tracks).toHaveLength(7);
+    expect(r.markers.map((x: any) => x.name)).toEqual(["kept"]);
+    expect(r.listed).toEqual({ fromS: null, toS: null, clips: 0, totalClips: 5,
+      note: "Nothing is selected and the sequence has 5 clips, so none are listed. Pass fromS/toS to list a stretch." });
+    expect(getSeq(s, { fromS: 99, toS: 111 }).clips).toHaveLength(4);
+  });
+
   it("an empty sequence has no clips and lasts 0 s", () => {
     const seq = new Seq(1, 1);
     expect(getSeq({ host: load(seq) })).toMatchObject({ durationS: 0, clips: [], markers: [], selection: [] });

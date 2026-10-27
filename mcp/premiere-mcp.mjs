@@ -50,7 +50,8 @@ const TOOLS = [
       "comments, colour}] and selection (ids of the selected clips). All times are seconds on the sequence timeline " +
       "(inS is the clip's in point in its source; effects names the clip's added effects, which cut_ranges, move_clips and close_gaps would remove; speed is 1 at 100%, and get_transcript, cut_ranges, move_clips, close_gaps and delete_clips refuse any other). Track and clip numbering is 1-based, as Premiere shows it (V1, A2). " +
       "Call this first, and again after every edit: clip ids change when clips are cut or moved. " +
-      "Optional fromS/toS list only the clips and markers overlapping that stretch.",
+      "Optional fromS/toS list only the clips and markers overlapping that stretch. On a long sequence, a call without " +
+      "fromS/toS lists only the stretch around the selection (no clips when nothing is selected) and says so in `listed`.",
     inputSchema: {
       type: "object",
       properties: {

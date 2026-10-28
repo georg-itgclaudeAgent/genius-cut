@@ -747,24 +747,32 @@ function gcutLayItem(seq, f, pieces, clock, sound) {
             gcutLayPiece(track, f, pieces[p], below, 0, tolS, clock);
         }
         if (sound && sound.ends[p] !== null) gcutTrimTo(soundTrack, sound.f, pieces[p].atT, sound.ends[p], clock);
-        if (sound && sound.slip && sound.ins[p] !== null) gcutSlipTo(soundTrack, sound.f, pieces[p].atT, sound.ins[p], clock);
+        if (sound && sound.slip && sound.ins[p] !== null) gcutSlipTo(soundTrack, sound.f, pieces[p].atT, sound.ins[p], sound.slip, f, clock);
     }
 }
 
 /**
  * Put the sound piece just dropped at atT (in sync with its video) back on the editor's own sync: slip it, with
- * QE, by the whole sequence frames between its in point and inS. Measured 2026-10-28 (Premiere 26.5.2):
+ * QE, by `frames`, the hand-made offset in whole sequence frames (gcutSounds; never worked out per piece, where
+ * the picture's own-frame rounding could tip it a frame). Measured 2026-10-28 (Premiere 26.5.2):
  * qeItem.slip("HH:MM:SS:FF", false) keeps the clip's place and length and moves its in point that much
  * EARLIER; "-HH:MM:SS:FF" moves it later. A piece that isn't there is left to gcutVerifyItems.
+ *
+ * The sound follows its picture, not its own exact time: a loose video piece `v` lands on its own nearest frame,
+ * up to half an own frame after the cut (gcutItemPieces), and its sound, slipped by whole frames, lands that much
+ * later too, still on the offset (live 2026-10-28: Restream at 29.997 fps in 30, "Kept span 21 of 63 on A1").
+ * So `piece` (the audio piece) takes the in point it landed on, if that is within the picture's own rounding of
+ * its planned one; gcutVerifyItems then checks it there.
  */
-function gcutSlipTo(track, f, atT, inS, clock) {
-    var it = gcutLaidAt(track, f, atT, clock);
-    if (!it) return;
-    var frames = Math.round((it.inPoint.seconds - inS) / clock.frameS);
-    if (!frames) return;
+function gcutSlipTo(track, f, atT, piece, frames, v, clock) {
+    if (!gcutLaidAt(track, f, atT, clock)) return;
     var qi = gcutQeClipAt(gcutQeTrack(f.kind, f.trackIndex), atT, clock), done = false;
     try { done = !!qi && qi.slip((frames < 0 ? "-" : "") + gcutTimecode(Math.abs(frames) * clock.tpf, clock), false); } catch (e) { done = false; }
     if (!done) throw new Error("Premiere wouldn't slip " + f.label + "'s piece back onto your sync with " + gcutLabel("video", f.trackIndex) + ".");
+    var it = gcutLaidAt(track, f, atT, clock); // read back afresh
+    if (!it) return;
+    var gotS = it.inPoint.seconds;
+    if (Math.abs(gotS - piece.srcIn) <= clock.frameS / 2 + gcutSlackS(v) + gcutSlackS(f)) piece.srcIn = gotS;
 }
 
 /**
@@ -895,7 +903,7 @@ function gcutHome(found, n, track) {
  * the rest (past the video's end) are laid on their own. Returns, per item i:
  *   sound[i]: for a video item with its own sound recorded, { f: that audio item, ends: each video
  *             piece's sound end (the audio piece starting with it), or null where none does, ins: that audio
- *             piece's in point, slip: true when the sound is hand-slipped against the video (gcutSlipTo) }; else null;
+ *             piece itself (gcutSlipTo sets its srcIn to where it lands), slip: true when the sound is hand-slipped against the video (gcutSlipTo) }; else null;
  *   own[i]:   the pieces of found[i] to lay with overwriteClip (all of them, except for such audio).
  */
 function gcutSounds(found, plan, clock) {
@@ -911,11 +919,12 @@ function gcutSounds(found, plan, clock) {
             for (p = 0; p < plan[j].length; p++) {
                 var made = false;
                 for (q = 0; q < plan[i].length; q++) {
-                    if (gcutNear(plan[i][q].atT, plan[j][p].atT, clock.half)) { ends[q] = plan[j][p].atT + plan[j][p].durT; ins[q] = plan[j][p].srcIn; made = true; }
+                    if (gcutNear(plan[i][q].atT, plan[j][p].atT, clock.half)) { ends[q] = plan[j][p].atT + plan[j][p].durT; ins[q] = plan[j][p]; made = true; }
                 }
                 if (!made) rest.push(plan[j][p]);
             }
-            sound[i] = { f: a, ends: ends, ins: ins, slip: !gcutInSync(a, found[i], clock) };
+            // slip: the hand-made offset in whole sequence frames (gcutOwnSound), the same for every piece; 0 in sync
+            sound[i] = { f: a, ends: ends, ins: ins, slip: gcutInSync(a, found[i], clock) ? 0 : Math.round(-gcutSyncOffsetS(a, found[i]) / clock.frameS) };
             own[j] = rest;
             break;
         }

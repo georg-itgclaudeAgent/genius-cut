@@ -2236,6 +2236,26 @@ describe("measured in Premiere 26.5.2: a file's picture and sound land together,
       expect(s.seq.videoTracks[0].clips[0].inPoint.seconds).toBe(10);
     });
 
+  // Live 2026-10-28, Georg's Restream (29.997 fps in a 30 fps sequence, loose): each picture piece lands on its own
+  // nearest frame, up to half a frame after the cut; its sound, slipped back, follows the picture, not its own exact time.
+  it("a loose camera's hand-slipped sound follows each picture piece's own frame and stays on the offset", () => {
+    // a loose camera's own audio sits on the camera's frames (measured), so a hand slip is whole own frames: 3 at 24 fps
+    // (0.125 s) is the nearest whole sequence frames, 3 at 25 fps (0.12 s), for every piece alike
+    const s = scene(), off = -3 / 25;
+    s.pi.mediaFps = 24; s.pi.floorToFrames = true;
+    s.v.linked = []; s.a.linked = [];
+    s.a.inPoint = Time.s(10 - 3 / 24);
+    const odd = [{ start: 1.37, end: 1.93 }, { start: 4.11, end: 4.62 }, { start: 6.29, end: 7.05 }, { start: 8.53, end: 8.81 }];
+    expect(applyCuts(s, odd)).toMatchObject({ ok: true });
+    const v = s.seq.videoTracks[0].clips as TrackItem[], a = s.seq.audioTracks[0].clips as TrackItem[];
+    expect(a.length).toBe(v.length);
+    v.forEach((x, i) => expect(a[i].inPoint.seconds - x.inPoint.seconds).toBeCloseTo(off, 6));
+    expect(restore(s)).toEqual({ ok: true });
+    // back on the offset to the slip's whole sequence frames: 0.005 s here (24 in 25); 16 µs for Restream (29.997 in 30)
+    expect(Math.abs(s.seq.audioTracks[0].clips[0].inPoint.seconds - (10 - 3 / 24))).toBeLessThan(1 / 25 / 2);
+    expect(s.seq.videoTracks[0].clips[0].inPoint.seconds).toBe(10);
+  });
+
   it("an in-sync camera sound is never slipped", () => {
     const s = scene();
     expect(applyCuts(s)).toMatchObject({ ok: true });

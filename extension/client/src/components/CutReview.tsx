@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { createPortal } from "react-dom";
 import type { Snapshot, TrimResponse } from "../api/types";
 import { reviewSummary } from "../lib/review";
 import { effectsByClip } from "../lib/snapshot";
@@ -14,14 +15,23 @@ interface Props {
   onApply: () => void;
   onDiscard: () => void;
   busy: boolean;
+  /** Where Discard / Apply go: under the scrolling result box, so they never scroll out of sight. Inline without one. */
+  footer?: HTMLElement | null;
 }
 
-export function CutReview({ snap, res, checked, onToggle, onToggleAll, onApply, onDiscard, busy }: Props) {
+export function CutReview({ snap, res, checked, onToggle, onToggleAll, onApply, onDiscard, busy, footer }: Props) {
   const duration = snap.durationS;
   const s = reviewSummary(res.cuts, checked, duration);
   const unticked = checked.length - s.count;
   const effects = effectsByClip(snap);
   const [ack, setAck] = useState(false);
+  const actions = (
+    <div className="actions">
+      <button className="btn btn-g" onClick={onDiscard} disabled={busy}>Discard</button>
+      <button className="btn btn-p" onClick={onApply}
+        disabled={busy || s.count === 0 || s.keepsNothing || (effects.length > 0 && !ack)}>Apply to timeline</button>
+    </div>
+  );
 
   if (res.cuts.length === 0) {
     return (
@@ -90,11 +100,7 @@ export function CutReview({ snap, res, checked, onToggle, onToggleAll, onApply, 
           )}
         </div>
       </div>
-      <div className="actions">
-        <button className="btn btn-g" onClick={onDiscard} disabled={busy}>Discard</button>
-        <button className="btn btn-p" onClick={onApply}
-          disabled={busy || s.count === 0 || s.keepsNothing || (effects.length > 0 && !ack)}>Apply to timeline</button>
-      </div>
+      {footer ? createPortal(actions, footer) : actions}
     </>
   );
 }

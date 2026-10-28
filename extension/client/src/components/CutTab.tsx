@@ -83,6 +83,8 @@ export function CutTab({ health, ready, agent, onTrimmed }: {
   const [instruction, setInstruction] = useState("trim the selected clip");
   const formRef = useRef<HTMLFormElement>(null);
   const [phase, setPhase] = useState<Phase>({ k: "idle" });
+  /** Under the scrolling result box: the review's Discard / Apply land here, always in sight. */
+  const [foot, setFoot] = useState<HTMLDivElement | null>(null);
   // /health is read once at connect; this re-reads its ai block after every trim attempt
   // and on focus/visibility, so the month and the limit (the source of truth) stay current.
   const [freshAi, setFreshAi] = useState<AiStatus | null>(null);
@@ -339,7 +341,7 @@ export function CutTab({ health, ready, agent, onTrimmed }: {
 
         {(phase.k === "review" || phase.k === "applying") && (
           <CutReview key={`${phase.snap.sequenceId}@${phase.snap.startTicks}`} snap={phase.snap} res={phase.res} checked={phase.checked} busy={phase.k === "applying"}
-            onToggle={toggle} onToggleAll={toggleAll} onApply={apply} onDiscard={() => go({ k: "idle" })} />
+            onToggle={toggle} onToggleAll={toggleAll} onApply={apply} onDiscard={() => go({ k: "idle" })} footer={foot} />
         )}
 
         {phase.k === "applied" && (
@@ -363,11 +365,15 @@ export function CutTab({ health, ready, agent, onTrimmed }: {
                 </div>
               </div>
             )}
-            <div className="actions">
-              <button className="btn btn-g" onClick={() => restore(phase.snap)} disabled={phase.busy}>Restore original</button>
-              <button className="btn btn-p" onClick={() => go({ k: "idle" })} disabled={phase.busy}>Done</button>
-            </div>
           </>
+        )}
+      </div>
+      <div className="result-foot" ref={setFoot}>
+        {phase.k === "applied" && (
+          <div className="actions">
+            <button className="btn btn-g" onClick={() => restore(phase.snap)} disabled={phase.busy}>Restore original</button>
+            <button className="btn btn-p" onClick={() => go({ k: "idle" })} disabled={phase.busy}>Done</button>
+          </div>
         )}
       </div>
     </>
